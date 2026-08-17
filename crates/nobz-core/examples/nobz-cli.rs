@@ -1,47 +1,102 @@
-//! M1 CLI harness: download an NZB from a single NNTP server.
+//! CLI harness: download an NZB using the persistent queue.
 //!
 //! Usage:
-//!   nobz-cli --nzb <path> --out <dir> --host <host> --port <port> \
-//!            [--tls] [--user <user> --pass <pass>] [--connections N]
+//!   nobz-cli download --nzb <path> --out <dir> --host <host> --port <port> \
+//!     [--tls] [--user <user> --pass <pass>] [--connections N]
+//!   nobz-cli list
+//!   nobz-cli resume --job <id> --host <host> --port <port> \
+//!     [--tls] [--user <user> --pass <pass>] [--connections N]
 //!
-//! This is a developer/testing harness, not the v1 product. The real CLI
-//! surface ships as part of the GUI binary (M5).
+//! The queue DB is stored at `--db` (default: `nobz-queue.db` in the current
+//! directory). Jobs survive restarts — run `nobz-cli resume` to continue a
+//! killed download at the article level.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
-use clap::Parser;
-use nobz_core::engine::{DownloadJob, Engine, ProgressEvent};
+use clap::{Parser, Subcommand};
+use nobz_core::engine::{Engine, ProgressEvent};
 use nobz_core::nntp::ServerConfig;
 use nobz_core::nzb;
+use nobz_core::queue::QueueManager;
 use tokio::sync::mpsc;
 
-#[derive(Debug, Parser)]
-#[command(name = "nobz-cli", about = "M1 download harness for nobz")]
-struct Args {
-    /// Path to the .nzb file to download.
-    #[arg(long)]
-    nzb: PathBuf,
-    /// Output directory for decoded files.
-    #[arg(long)]
-    out: PathBuf,
-    /// NNTP server hostname.
-    #[arg(long)]
-    host: String,
-    /// NNTP server port (563 for TLS, 119 for plaintext).
-    #[arg(long)]
-    port: u16,
-    /// Use implicit TLS (port 563).
-    #[arg(long)]
-    tls: bool,
-    /// AUTHINFO username.
-    #[arg(long)]
-    user: Option<String>,
-    /// AUTHINFO password.
-    #[arg(long)]
-    pass: Option<String>,
-    /// Number of simultaneous connections.
-    #[arg(long, default_value = "8")]
-    connections: usize,
+#[derive(Parser)]
+#[command(name = "nobz-cli", about = "Download harness for nobz")]
+struct Cli {
+    /// Path to the queue database.
+    #[arg(long, default_value = "nobz-queue.db")]
+    db: PathBuf,
+
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Add a download job to the queue and run it.
+    Download {
+        /// Path to the .nzb file.
+        #[arg(long)]
+        nzb: PathBuf,
+        /// Output directory for decoded files.
+        #[arg(long)]
+        out: PathBuf,
+        /// NNTP server hostname.
+        #[arg(long)]
+        host: String,
+        /// NNTP server port (563 for TLS, 119 for plaintext).
+        #[arg(long)]
+        port: u16,
+        /// Use implicit TLS (port 563).
+        #[arg(long)]
+        tls: bool,
+        /// AUTHINFO username.
+        #[arg(long)]
+        user: Option<String>,
+        /// AUTHINFO password.
+        #[arg(long)]
+        pass: Option<String>,
+        /// Number of simultaneous connections.
+        #[arg(long, default_value = "8")]
+        connections: usize,
+    },
+    /// List all jobs in the queue.
+    List,
+    /// Resume a paused/failed job.
+    Resume {
+        /// Job id to resume.
+        #[arg(long)]
+        job: i64,
+        /// NNTP server hostname.
+        #[arg(long)]
+        host: String,
+        /// NNTP server port.
+        #[arg(long)]
+        port: u16,
+        /// Use implicit TLS.
+        #[arg(long)]
+        tls: bool,
+        /// AUTHINFO username.
+        #[arg(long)]
+        user: Option<String>,
+        /// AUTHINFO password.
+        #[arg(long)]
+        pass: Option<String>,
+        /// Number of simultaneous connections.
+        #[arg(long, default_value = "8")]
+        connections: usize,
+    },
+    /// Pause a job.
+    Pause {
+        #[arg(long)]
+        job: i64,
+    },
+    /// Delete a job from the queue.
+    Delete {
+        #[arg(long)]
+        job: i64,
+    },
 }
 
 #[tokio::main]
@@ -53,83 +108,191 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let args = Args::parse();
+    let cli = Cli::parse();
+    let queue = Arc::new(QueueManager::open(&cli.db).await?);
 
-    let nzb_bytes = std::fs::read(&args.nzb)?;
-    let nzb = nzb::parse(&nzb_bytes)?;
-    println!(
-        "NZB: {} ({} files)",
-        nzb.title().unwrap_or("(untitled)"),
-        nzb.files.len()
-    );
-    for f in &nzb.files {
-        println!(
-            "  - {} ({} segments, {} missing)",
-            f.filename(),
-            f.segment_count,
-            f.missing_indices().len()
-        );
-    }
-
-    let job = DownloadJob::from_nzb(&nzb, &args.out);
-
-    let cfg = ServerConfig {
-        host: args.host,
-        port: args.port,
-        tls: args.tls,
-        user: args.user,
-        password: args.pass,
-        max_connections: args.connections as u32,
-        priority: 0,
-    };
-    let engine = Engine::new(vec![cfg], args.connections);
-
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    let runner = tokio::spawn(async move { engine.run(job, tx).await });
-
-    let mut started = 0u64;
-    let mut done = 0u64;
-    while let Some(ev) = rx.recv().await {
-        match ev {
-            ProgressEvent::FileStarted { filename, segments } => {
-                started += 1;
-                println!("[file] {filename} ({segments} segments)");
-            }
-            ProgressEvent::SegmentDone {
-                filename,
-                segment,
-                status,
-                bytes,
-            } => {
-                done += 1;
-                println!("[seg]  {filename} #{segment} {status:?} ({bytes} bytes)",);
-            }
-            ProgressEvent::FileCompleted {
-                filename,
-                path,
-                missing,
-                crc_mismatches,
-            } => {
+    match cli.command {
+        Command::Download {
+            nzb,
+            out,
+            host,
+            port,
+            tls,
+            user,
+            pass,
+            connections,
+        } => {
+            let nzb_bytes = std::fs::read(&nzb)?;
+            let nzb = nzb::parse(&nzb_bytes)?;
+            println!(
+                "NZB: {} ({} files)",
+                nzb.title().unwrap_or("(untitled)"),
+                nzb.files.len()
+            );
+            for f in &nzb.files {
                 println!(
-                    "[done] {filename} -> {} (missing={missing}, crc_mismatch={crc_mismatches})",
-                    path.display()
+                    "  - {} ({} segments, {} missing)",
+                    f.filename(),
+                    f.segment_count,
+                    f.missing_indices().len()
                 );
             }
-            ProgressEvent::ArticleError {
-                filename,
-                segment,
-                error,
-            } => {
-                eprintln!("[err]  {filename} #{segment}: {error}");
+
+            let job_id = queue.add_job(&nzb, &out, 0).await?;
+            println!("Job {job_id} added to queue.");
+
+            let cfg = ServerConfig {
+                host,
+                port,
+                tls,
+                user,
+                password: pass,
+                max_connections: connections as u32,
+                priority: 0,
+            };
+            let engine = Arc::new(Engine::new(vec![cfg], connections));
+
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let q = Arc::clone(&queue);
+            let runner = tokio::spawn(async move { engine.run_job(q, job_id, tx).await });
+
+            while let Some(ev) = rx.recv().await {
+                match ev {
+                    ProgressEvent::FileStarted { filename, segments } => {
+                        println!("[file] {filename} ({segments} segments)");
+                    }
+                    ProgressEvent::SegmentDone {
+                        filename,
+                        segment,
+                        status,
+                        bytes,
+                    } => {
+                        println!("[seg]  {filename} #{segment} {status:?} ({bytes} bytes)");
+                    }
+                    ProgressEvent::FileCompleted {
+                        filename,
+                        path,
+                        missing,
+                        crc_mismatches,
+                    } => {
+                        println!(
+                            "[done] {filename} -> {} (missing={missing}, crc={crc_mismatches})",
+                            path.display()
+                        );
+                    }
+                    ProgressEvent::ArticleError {
+                        filename,
+                        segment,
+                        error,
+                    } => {
+                        eprintln!("[err]  {filename} #{segment}: {error}");
+                    }
+                    ProgressEvent::JobFinished { completed, failed } => {
+                        println!("[job]  completed={completed} failed={failed}");
+                    }
+                }
             }
-            ProgressEvent::JobFinished { completed, failed } => {
+
+            runner.await??;
+        }
+        Command::List => {
+            let jobs = queue.list_jobs().await?;
+            if jobs.is_empty() {
+                println!("Queue is empty.");
+                return Ok(());
+            }
+            println!(
+                "{:<5} {:<30} {:<12} {:<10} {:<10}",
+                "ID", "Name", "State", "Files", "Segments"
+            );
+            for job in &jobs {
                 println!(
-                    "[job]  completed={completed} failed={failed} (segments: {done}/{started} files)"
+                    "{:<5} {:<30} {:<12} {}/{}       {}/{}",
+                    job.id,
+                    job.name,
+                    job.state.as_str(),
+                    job.files_done,
+                    job.file_count,
+                    job.segments_done,
+                    job.total_segments,
                 );
             }
         }
+        Command::Resume {
+            job,
+            host,
+            port,
+            tls,
+            user,
+            pass,
+            connections,
+        } => {
+            let cfg = ServerConfig {
+                host,
+                port,
+                tls,
+                user,
+                password: pass,
+                max_connections: connections as u32,
+                priority: 0,
+            };
+            let engine = Arc::new(Engine::new(vec![cfg], connections));
+
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let q = Arc::clone(&queue);
+            let runner = tokio::spawn(async move { engine.run_job(q, job, tx).await });
+
+            println!("Resuming job {job}...");
+            while let Some(ev) = rx.recv().await {
+                match ev {
+                    ProgressEvent::FileStarted { filename, segments } => {
+                        println!("[file] {filename} ({segments} pending segments)");
+                    }
+                    ProgressEvent::SegmentDone {
+                        filename,
+                        segment,
+                        status,
+                        bytes,
+                    } => {
+                        println!("[seg]  {filename} #{segment} {status:?} ({bytes} bytes)");
+                    }
+                    ProgressEvent::FileCompleted {
+                        filename,
+                        path,
+                        missing,
+                        crc_mismatches,
+                    } => {
+                        println!(
+                            "[done] {filename} -> {} (missing={missing}, crc={crc_mismatches})",
+                            path.display()
+                        );
+                    }
+                    ProgressEvent::ArticleError {
+                        filename,
+                        segment,
+                        error,
+                    } => {
+                        eprintln!("[err]  {filename} #{segment}: {error}");
+                    }
+                    ProgressEvent::JobFinished { completed, failed } => {
+                        println!("[job]  completed={completed} failed={failed}");
+                    }
+                }
+            }
+
+            runner.await??;
+        }
+        Command::Pause { job } => {
+            queue
+                .set_job_state(job, nobz_core::queue::JobState::Paused)
+                .await?;
+            println!("Job {job} paused.");
+        }
+        Command::Delete { job } => {
+            queue.delete_job(job).await?;
+            println!("Job {job} deleted.");
+        }
     }
 
-    runner.await??;
     Ok(())
 }

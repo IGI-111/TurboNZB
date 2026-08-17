@@ -11,6 +11,7 @@ pub mod engine;
 pub mod error;
 pub mod nntp;
 pub mod nzb;
+pub mod queue;
 pub mod yenc;
 
 pub use error::{CoreError, Result};

@@ -1,63 +1,25 @@
 //! Download engine: job scheduler that dispatches article fetches across a
 //! pool of NNTP connections, yEnc-decodes them, and assembles files on disk.
 //!
-//! M1 scope: a single server, multiple connections, per-article hopeless
-//! tracking, and per-file assembly. Server fallback (try server B when server
-//! A returns 430) lands in M3 alongside SQLite-backed resume.
+//! M3 scope: SQLite-backed resume. The engine loads pending segments from
+//! the queue DB, writes per-segment state after each fetch, and can resume
+//! a killed job at the article level. Server fallback tries servers in
+//! priority order; if all return 430/423, the segment is marked missing
+//! (hopeless) and not retried on restart.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use tokio::sync::{Mutex, Semaphore, mpsc};
+use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinSet;
 
 use crate::error::{CoreError, Result};
 use crate::nntp::{NntpClient, ServerConfig, StatResult};
-use crate::nzb::{Nzb, NzbFile};
+use crate::queue::{QueueFile, QueueManager, QueueSegment, SegmentState};
 use crate::yenc;
 
-/// A download job derived from a parsed NZB.
-#[derive(Debug, Clone)]
-pub struct DownloadJob {
-    /// Display name (NZB title or first-file subject).
-    pub name: String,
-    /// Where to write decoded files.
-    pub output_dir: PathBuf,
-    /// The files to fetch.
-    pub files: Vec<NzbFile>,
-}
-
-impl DownloadJob {
-    /// Build a job from an [`Nzb`] document.
-    pub fn from_nzb(nzb: &Nzb, output_dir: impl Into<PathBuf>) -> Self {
-        let name = nzb
-            .title()
-            .map(str::to_string)
-            .or_else(|| nzb.files.first().map(|f| f.filename()))
-            .unwrap_or_else(|| "nobz-download".into());
-        Self {
-            name,
-            output_dir: output_dir.into(),
-            files: nzb.files.clone(),
-        }
-    }
-}
-
-/// Per-article outcome recorded by the scheduler.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ArticleStatus {
-    /// Decoded and written successfully; CRC matched.
-    Ok,
-    /// Decoded and written, but the article's CRC didn't match (corrupt on
-    /// the server). PAR2 repair (M4) can recover this.
-    CrcMismatch,
-    /// The article was missing on every configured server.
-    Missing,
-}
-
-/// Progress events emitted by [`Engine::run`]. The CLI/GUI consumes these to
-/// render a progress bar / activity panel.
+/// Progress events emitted by [`Engine::run_job`]. The CLI/GUI consumes
+/// these to render a progress bar / activity panel.
 #[derive(Debug, Clone)]
 pub enum ProgressEvent {
     /// A file started downloading.
@@ -66,7 +28,7 @@ pub enum ProgressEvent {
     SegmentDone {
         filename: String,
         segment: u32,
-        status: ArticleStatus,
+        status: SegmentState,
         bytes: u64,
     },
     /// A file finished — all segments attempted, file assembled on disk.
@@ -104,41 +66,52 @@ impl Engine {
         }
     }
 
-    /// Run a job to completion, emitting progress events on `tx`.
+    /// Run a job to completion, reading pending segments from the queue and
+    /// writing per-segment state back. Emits progress events on `tx`.
     ///
-    /// Each file's segments are fanned out across connections; segments are
-    /// written to `<output_dir>/<filename>.partNN` and then concatenated into
-    /// `<output_dir>/<filename>` once all are present.
-    pub async fn run(
-        self,
-        job: DownloadJob,
+    /// Only segments in `Pending` state (non-missing) are fetched. Segments
+    /// already `Done`, `Missing`, `CrcMismatch`, or `Failed` are skipped —
+    /// this is what makes the engine restart-safe.
+    pub async fn run_job(
+        self: Arc<Self>,
+        queue: Arc<QueueManager>,
+        job_id: i64,
         tx: mpsc::UnboundedSender<ProgressEvent>,
     ) -> Result<()> {
+        // Mark job as downloading.
+        queue
+            .set_job_state(job_id, crate::queue::JobState::Downloading)
+            .await?;
+
+        let job = queue.get_job(job_id).await?;
         tokio::fs::create_dir_all(&job.output_dir)
             .await
             .map_err(CoreError::from)?;
 
+        // Get all files with pending segments.
+        let pending = queue.pending_segments(job_id).await?;
+
         let mut completed = 0usize;
         let mut failed = 0usize;
 
-        for file in &job.files {
+        for (file, segments) in &pending {
             let _ = tx.send(ProgressEvent::FileStarted {
-                filename: file.filename(),
-                segments: file.segment_count,
+                filename: file.filename.clone(),
+                segments: segments.len() as u32,
             });
 
-            let outcome = self.download_file(file, &job.output_dir, &tx).await;
+            let outcome = self
+                .download_file(&queue, file, segments, &job.output_dir, &tx)
+                .await;
             match outcome {
                 Ok(o) => {
                     if o.missing == 0 && o.crc_mismatches == 0 {
                         completed += 1;
                     } else {
-                        // File assembled but with holes/corruption — count as
-                        // failed for M1 reporting; M4 PAR2 repair may recover.
                         failed += 1;
                     }
                     let _ = tx.send(ProgressEvent::FileCompleted {
-                        filename: file.filename(),
+                        filename: file.filename.clone(),
                         path: o.path,
                         missing: o.missing,
                         crc_mismatches: o.crc_mismatches,
@@ -147,7 +120,7 @@ impl Engine {
                 Err(e) => {
                     failed += 1;
                     let _ = tx.send(ProgressEvent::ArticleError {
-                        filename: file.filename(),
+                        filename: file.filename.clone(),
                         segment: 0,
                         error: e.to_string(),
                     });
@@ -155,42 +128,38 @@ impl Engine {
             }
         }
 
+        // Determine final job state.
+        let final_state = if failed == 0 {
+            crate::queue::JobState::Complete
+        } else {
+            crate::queue::JobState::Failed
+        };
+        queue.set_job_state(job_id, final_state).await?;
+
         let _ = tx.send(ProgressEvent::JobFinished { completed, failed });
         Ok(())
     }
 
     async fn download_file(
-        &self,
-        file: &NzbFile,
+        self: &Arc<Self>,
+        queue: &Arc<QueueManager>,
+        file: &QueueFile,
+        pending_segments: &[QueueSegment],
         output_dir: &Path,
         tx: &mpsc::UnboundedSender<ProgressEvent>,
     ) -> Result<FileOutcome> {
-        let filename = file.filename();
+        let filename = file.filename.clone();
         let final_path = output_dir.join(&filename);
+        let parts_dir = output_dir.join(format!("{}.parts", filename));
 
-        // Per-segment results keyed by segment number.
-        let results: Arc<Mutex<HashMap<u32, SegmentResult>>> = Arc::new(Mutex::new(HashMap::new()));
+        // Create a temp dir for per-segment decoded bytes.
+        tokio::fs::create_dir_all(&parts_dir)
+            .await
+            .map_err(CoreError::from)?;
 
         let mut tasks: JoinSet<Result<()>> = JoinSet::new();
 
-        for seg in &file.segments {
-            if seg.missing {
-                // Synthesized hole from the NZB — nothing to fetch.
-                results.lock().await.insert(
-                    seg.number,
-                    SegmentResult {
-                        status: ArticleStatus::Missing,
-                        bytes: Vec::new(),
-                    },
-                );
-                let _ = tx.send(ProgressEvent::SegmentDone {
-                    filename: filename.clone(),
-                    segment: seg.number,
-                    status: ArticleStatus::Missing,
-                    bytes: 0,
-                });
-                continue;
-            }
+        for seg in pending_segments {
             let permit = self
                 .semaphore
                 .clone()
@@ -200,30 +169,32 @@ impl Engine {
             let servers = self.servers.clone();
             let msg_id = seg.message_id.clone();
             let seg_num = seg.number;
-            let results = results.clone();
+            let file_id = file.id;
+            let queue = Arc::clone(queue);
             let filename_clone = filename.clone();
+            let parts_dir = parts_dir.clone();
             let tx = tx.clone();
             tasks.spawn(async move {
                 let _permit = permit;
-                let bytes = fetch_with_fallback(&servers, &msg_id).await;
-                let status = match &bytes {
-                    Ok(b) => {
-                        // Decode yEnc.
-                        match yenc::decode_article(b) {
+                let fetch_result = fetch_with_fallback(&servers, &msg_id).await;
+                let state = match &fetch_result {
+                    Ok(body) => {
+                        match yenc::decode_article(body) {
                             Ok(decoded) => {
-                                let status = if decoded.crc_ok || decoded.crc_unknown {
-                                    ArticleStatus::Ok
+                                let seg_state = if decoded.crc_ok || decoded.crc_unknown {
+                                    SegmentState::Done
                                 } else {
-                                    ArticleStatus::CrcMismatch
+                                    SegmentState::CrcMismatch
                                 };
-                                results.lock().await.insert(
-                                    seg_num,
-                                    SegmentResult {
-                                        status: status.clone(),
-                                        bytes: decoded.data,
-                                    },
-                                );
-                                status
+                                // Write decoded bytes to a per-segment file
+                                // so they survive a restart.
+                                if seg_state == SegmentState::Done {
+                                    let part_path = parts_dir.join(format!("seg{seg_num:06}"));
+                                    tokio::fs::write(&part_path, &decoded.data)
+                                        .await
+                                        .map_err(CoreError::from)?;
+                                }
+                                seg_state
                             }
                             Err(e) => {
                                 let _ = tx.send(ProgressEvent::ArticleError {
@@ -231,48 +202,35 @@ impl Engine {
                                     segment: seg_num,
                                     error: e.to_string(),
                                 });
-                                results.lock().await.insert(
-                                    seg_num,
-                                    SegmentResult {
-                                        status: ArticleStatus::Missing,
-                                        bytes: Vec::new(),
-                                    },
-                                );
-                                ArticleStatus::Missing
+                                SegmentState::Failed
                             }
                         }
                     }
-                    Err(FetchError::Missing) => {
-                        results.lock().await.insert(
-                            seg_num,
-                            SegmentResult {
-                                status: ArticleStatus::Missing,
-                                bytes: Vec::new(),
-                            },
-                        );
-                        ArticleStatus::Missing
-                    }
+                    Err(FetchError::Missing) => SegmentState::Missing,
                     Err(FetchError::Other(e)) => {
                         let _ = tx.send(ProgressEvent::ArticleError {
                             filename: filename_clone.clone(),
                             segment: seg_num,
                             error: e.to_string(),
                         });
-                        results.lock().await.insert(
-                            seg_num,
-                            SegmentResult {
-                                status: ArticleStatus::Missing,
-                                bytes: Vec::new(),
-                            },
-                        );
-                        ArticleStatus::Missing
+                        SegmentState::Failed
                     }
+                };
+
+                // Persist the segment state to the queue DB.
+                if let Err(e) = queue.set_segment_state(file_id, seg_num, state).await {
+                    tracing::error!(error = %e, "failed to persist segment state");
+                }
+
+                let bytes = match &fetch_result {
+                    Ok(b) => b.len() as u64,
+                    Err(_) => 0,
                 };
                 let _ = tx.send(ProgressEvent::SegmentDone {
                     filename: filename_clone,
                     segment: seg_num,
-                    status,
-                    bytes: bytes.as_deref().map(|b| b.len() as u64).unwrap_or(0),
+                    status: state,
+                    bytes,
                 });
                 Ok(())
             });
@@ -283,29 +241,60 @@ impl Engine {
             res.map_err(|e| CoreError::Other(anyhow::anyhow!("task panicked: {e}")))??;
         }
 
-        // Assemble the file in segment-number order.
-        let results = results.lock().await;
+        // Assemble the file from per-segment part files.
+        let all_segments = queue.list_segments(file.id).await?;
         let mut out = tokio::fs::File::create(&final_path)
             .await
             .map_err(CoreError::from)?;
         use tokio::io::AsyncWriteExt;
         let mut missing = 0u32;
         let mut crc_mismatches = 0u32;
+
         for n in 1..=file.segment_count {
-            match results.get(&n) {
-                Some(r) => {
-                    out.write_all(&r.bytes).await.map_err(CoreError::from)?;
-                    match r.status {
-                        ArticleStatus::Missing => missing += 1,
-                        ArticleStatus::CrcMismatch => crc_mismatches += 1,
-                        ArticleStatus::Ok => {}
+            let seg = all_segments.iter().find(|s| s.number == n);
+            match seg {
+                Some(s)
+                    if s.state == SegmentState::Done
+                        || (s.state == SegmentState::Pending && s.missing) =>
+                {
+                    if s.missing {
+                        missing += 1;
+                        continue;
+                    }
+                    // Read the decoded bytes from the part file.
+                    let part_path = parts_dir.join(format!("seg{n:06}"));
+                    match tokio::fs::read(&part_path).await {
+                        Ok(data) => {
+                            out.write_all(&data).await.map_err(CoreError::from)?;
+                        }
+                        Err(_) => {
+                            // Part file missing — segment was done in a
+                            // previous run but the part file was deleted.
+                            missing += 1;
+                        }
                     }
                 }
-                None => missing += 1,
+                Some(s) if s.state == SegmentState::Missing || s.missing => {
+                    missing += 1;
+                }
+                Some(s) if s.state == SegmentState::CrcMismatch => {
+                    crc_mismatches += 1;
+                }
+                Some(s) if s.state == SegmentState::Failed => {
+                    missing += 1;
+                }
+                _ => {
+                    missing += 1;
+                }
             }
         }
         out.flush().await.map_err(CoreError::from)?;
         drop(out);
+
+        // Clean up parts dir if the file is complete (no holes).
+        if missing == 0 && crc_mismatches == 0 {
+            let _ = tokio::fs::remove_dir_all(&parts_dir).await;
+        }
 
         Ok(FileOutcome {
             path: final_path,
@@ -322,38 +311,38 @@ struct FileOutcome {
     crc_mismatches: u32,
 }
 
-#[derive(Debug, Clone)]
-struct SegmentResult {
-    status: ArticleStatus,
-    bytes: Vec<u8>,
-}
-
 #[derive(Debug)]
 enum FetchError {
+    /// Article missing on all servers (430/423 from every server).
     Missing,
     Other(CoreError),
 }
 
 /// Try each server in priority order until one returns the article body, or
-/// all report it missing. M3 will add per-article hopeless tracking and
-/// SQLite persistence; for M1 this is a stateless fan-out.
+/// all report it missing. If all servers return 430/423, the segment is
+/// hopeless and [`FetchError::Missing`] is returned — the engine marks it
+/// as `SegmentState::Missing` so it won't be retried on restart.
 async fn fetch_with_fallback(
     servers: &[ServerConfig],
     message_id: &str,
 ) -> std::result::Result<Vec<u8>, FetchError> {
-    let mut last_missing = true;
+    let mut all_missing = true;
+    let mut last_error: Option<CoreError> = None;
+
     for server in servers {
         let mut client = match NntpClient::connect(server).await {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!(server = %server.host, error = %e, "connect failed; trying next");
+                last_error = Some(e);
+                all_missing = false; // connection error ≠ missing article
                 continue;
             }
         };
         match client.body(message_id).await {
             Ok(Ok(body)) => return Ok(body.bytes),
             Ok(Err(StatResult::Missing)) => {
-                last_missing = true;
+                // 430/423 — article not on this server, try next.
                 continue;
             }
             Ok(Err(StatResult::Present)) => {
@@ -362,15 +351,18 @@ async fn fetch_with_fallback(
             }
             Err(e) => {
                 tracing::warn!(server = %server.host, error = %e, "BODY error; trying next");
+                last_error = Some(e);
+                all_missing = false;
                 continue;
             }
         }
     }
-    if last_missing {
+
+    if all_missing {
         Err(FetchError::Missing)
     } else {
-        Err(FetchError::Other(CoreError::Nntp(format!(
-            "no server could fetch {message_id}"
-        ))))
+        Err(FetchError::Other(last_error.unwrap_or_else(|| {
+            CoreError::Nntp(format!("no server could fetch {message_id}"))
+        })))
     }
 }
