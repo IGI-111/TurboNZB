@@ -1,0 +1,26 @@
+[package]
+name = "nobz-index"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Nobz Newznab search and multi-indexer aggregation"
+
+[lib]
+name = "nobz_index"
+path = "src/lib.rs"
+
+[dependencies]
+nobz-core = { path = "../nobz-core" }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+quick-xml = { workspace = true }
+tracing = { workspace = true }
+futures = { workspace = true }
+reqwest = { workspace = true }
+url = { workspace = true }
+anyhow = { workspace = true }
