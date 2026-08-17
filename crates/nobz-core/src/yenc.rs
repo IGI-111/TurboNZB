@@ -68,6 +68,9 @@ pub fn decode_article(input: &[u8]) -> Result<DecodedPart> {
     let total_size: u64 = param(ybegin_str, "size")
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
+    let line_size: usize = param(ybegin_str, "line")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
 
     let (begin, end) = if let Some(p) = ypart_str {
         let b: u64 = param(p, "begin").and_then(|s| s.parse().ok()).unwrap_or(1);
@@ -81,23 +84,22 @@ pub fn decode_article(input: &[u8]) -> Result<DecodedPart> {
     let mut crc = Hasher::new();
     // yEnc transport framing: CRLF pairs are inserted by the news transport
     // and must be removed. A single trailing space or tab *immediately before
-    // a CRLF* is also transport padding (NNTP servers strip trailing spaces,
+    // a CRLF* may be transport padding (NNTP servers strip trailing spaces,
     // so posters add a tab/space to protect lines that would otherwise end in
     // a space). Bytes that decode to space/tab *inside* a line are real data.
     //
-    // We accumulate raw (still-encoded, escape sequences included) line bytes
-    // and decode after stripping the trailing padding byte, so the padding
-    // check sees the raw transport byte (0x20/0x09) rather than the decoded
-    // value, and the escape state is handled in one place (decode_line).
+    // Padding detection: if the `line=` parameter is present, we only strip
+    // a trailing space/tab when the decoded byte count without stripping
+    // exceeds `line=`. This correctly handles both cases:
+    //   - Poster added a padding byte (line is 129 bytes for line=128) → strip
+    //   - Last data byte naturally encodes to space/tab (line is 128 bytes
+    //     for line=128) → keep, it's real data
+    // If `line=` is absent, we don't strip (safer to keep data bytes).
     let mut line_raw: Vec<u8> = Vec::new();
     for &b in payload {
         if b == b'\n' {
-            // End of transport line: strip one trailing raw space/tab
-            // (transport padding) from the accumulated raw line, then decode
-            // and commit to output + CRC.
-            if matches!(line_raw.last(), Some(b' ') | Some(b'\t')) {
-                line_raw.pop();
-            }
+            // End of transport line.
+            maybe_strip_padding(&mut line_raw, line_size);
             decode_line(&line_raw, &mut out, &mut crc)?;
             line_raw.clear();
         } else if b == b'\r' {
@@ -112,9 +114,7 @@ pub fn decode_article(input: &[u8]) -> Result<DecodedPart> {
     // Trailing bytes after the last CRLF: commit without padding stripping
     // (well-formed yEnc ends with a CRLF before =yend, so this is defensive).
     if !line_raw.is_empty() {
-        if matches!(line_raw.last(), Some(b' ') | Some(b'\t')) {
-            line_raw.pop();
-        }
+        maybe_strip_padding(&mut line_raw, line_size);
         decode_line(&line_raw, &mut out, &mut crc)?;
         line_raw.clear();
     }
@@ -141,6 +141,47 @@ pub fn decode_article(input: &[u8]) -> Result<DecodedPart> {
         crc_ok,
         crc_unknown,
     })
+}
+
+/// Conditionally strip a trailing space/tab from a raw yEnc line if it's
+/// transport padding (not real data).
+///
+/// If `line_size` is known (from `=ybegin line=N`), we count the decoded bytes
+/// in the raw line. If keeping the trailing space/tab would produce more than
+/// `line_size` decoded bytes, the trailing byte is padding and is stripped.
+/// Otherwise it's kept as real data.
+fn maybe_strip_padding(line_raw: &mut Vec<u8>, line_size: usize) {
+    if line_size == 0 {
+        // No `line=` parameter — can't tell, don't strip (safer to keep data).
+        return;
+    }
+    // Only consider stripping if the last raw byte is space or tab.
+    if !matches!(line_raw.last(), Some(b' ') | Some(b'\t')) {
+        return;
+    }
+    // Count decoded bytes including the trailing space/tab.
+    let decoded_count = count_decoded_bytes(line_raw);
+    if decoded_count > line_size {
+        // The trailing space/tab is padding — strip it.
+        line_raw.pop();
+    }
+}
+
+/// Count how many decoded bytes a raw (encoded) yEnc line produces.
+fn count_decoded_bytes(line_raw: &[u8]) -> usize {
+    let mut count = 0;
+    let mut escaped = false;
+    for &b in line_raw {
+        if escaped {
+            count += 1;
+            escaped = false;
+        } else if b == b'=' {
+            escaped = true;
+        } else {
+            count += 1;
+        }
+    }
+    count
 }
 
 /// Decode one raw (encoded) yEnc line into output bytes and update the CRC.
@@ -508,5 +549,55 @@ mod tests {
             "trailing-space padding must be stripped"
         );
         assert!(decoded.crc_ok, "CRC must match with padding stripped");
+    }
+
+    #[test]
+    fn keeps_trailing_space_that_is_data_not_padding() {
+        // Regression test: when a line's last encoded byte is naturally a
+        // space (0x20) and the line is exactly `line=` bytes long, the space
+        // is real data — not transport padding. The decoder must NOT strip it.
+        //
+        // Byte 0xfa decodes from raw 0x20 (space): 0x20 - 42 = 0xfa (wrapping).
+        // So a line of 16 data bytes ending with 0xfa will have a raw encoded
+        // line of 16 bytes ending with 0x20 (space), with NO extra padding.
+        let payload: Vec<u8> = (0..15)
+            .map(|i| i as u8)
+            .chain(std::iter::once(0xfa))
+            .collect();
+        let total = payload.len() as u64;
+
+        let mut article: Vec<u8> = Vec::new();
+        article.extend_from_slice(b"=ybegin line=16 size=");
+        article.extend_from_slice(total.to_string().as_bytes());
+        article.extend_from_slice(b" name=bin.dat\r\n");
+
+        let mut crc = Hasher::new();
+        crc.update(&payload);
+        for &b in &payload {
+            let enc = b.wrapping_add(42);
+            if enc == b'=' || enc == b'\r' || enc == b'\n' || enc == b'\0' {
+                article.push(b'=');
+                article.push(enc.wrapping_add(64));
+            } else {
+                article.push(enc);
+            }
+        }
+        // NO trailing space — the last encoded byte IS a space (0x20).
+        article.push(b'\r');
+        article.push(b'\n');
+
+        let crc_val = crc.finalize();
+        article.extend_from_slice(b"=yend size=");
+        article.extend_from_slice(total.to_string().as_bytes());
+        article.extend_from_slice(b" crc32=");
+        article.extend_from_slice(format!("{:08x}", crc_val).as_bytes());
+        article.extend_from_slice(b"\r\n");
+
+        let decoded = decode_article(&article).unwrap();
+        assert_eq!(
+            decoded.data, payload,
+            "trailing space that is real data must be kept"
+        );
+        assert!(decoded.crc_ok, "CRC must match when data-space is kept");
     }
 }

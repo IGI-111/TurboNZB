@@ -18,6 +18,7 @@ use clap::{Parser, Subcommand};
 use nobz_core::engine::{Engine, ProgressEvent};
 use nobz_core::nntp::ServerConfig;
 use nobz_core::nzb;
+use nobz_core::postprocess::{PostProcessConfig, post_process};
 use nobz_core::queue::QueueManager;
 use tokio::sync::mpsc;
 
@@ -60,6 +61,24 @@ enum Command {
         /// Number of simultaneous connections.
         #[arg(long, default_value = "8")]
         connections: usize,
+        /// Run post-processing (PAR2 verify + unpack) after download.
+        #[arg(long)]
+        post_process: bool,
+        /// Category subfolder for completed files (e.g. "tv", "movies").
+        #[arg(long)]
+        category: Option<String>,
+        /// Directory for completed/unpacked files (default: same as --out).
+        #[arg(long)]
+        completed_dir: Option<PathBuf>,
+        /// Password for encrypted archives.
+        #[arg(long)]
+        archive_password: Option<String>,
+        /// Skip PAR2 verification.
+        #[arg(long)]
+        skip_verify: bool,
+        /// Delete archive files and temp dirs after successful unpack.
+        #[arg(long, default_value = "true")]
+        cleanup: bool,
     },
     /// List all jobs in the queue.
     List,
@@ -97,6 +116,27 @@ enum Command {
         #[arg(long)]
         job: i64,
     },
+    /// Run post-processing (PAR2 verify + unpack) on a directory.
+    Postprocess {
+        /// Directory containing downloaded files.
+        #[arg(long)]
+        dir: PathBuf,
+        /// Directory for completed/unpacked files.
+        #[arg(long)]
+        completed_dir: PathBuf,
+        /// Category subfolder (e.g. "tv", "movies").
+        #[arg(long)]
+        category: Option<String>,
+        /// Password for encrypted archives.
+        #[arg(long)]
+        archive_password: Option<String>,
+        /// Skip PAR2 verification.
+        #[arg(long)]
+        skip_verify: bool,
+        /// Delete archive files and temp dirs after successful unpack.
+        #[arg(long, default_value = "true")]
+        cleanup: bool,
+    },
 }
 
 #[tokio::main]
@@ -121,6 +161,12 @@ async fn main() -> anyhow::Result<()> {
             user,
             pass,
             connections,
+            post_process: do_post_process,
+            category,
+            completed_dir,
+            archive_password,
+            skip_verify,
+            cleanup,
         } => {
             let nzb_bytes = std::fs::read(&nzb)?;
             let nzb = nzb::parse(&nzb_bytes)?;
@@ -194,6 +240,50 @@ async fn main() -> anyhow::Result<()> {
             }
 
             runner.await??;
+
+            // Post-process if requested.
+            if do_post_process {
+                let completed = completed_dir.clone().unwrap_or_else(|| out.clone());
+                // Use NZB metadata password if no explicit password was given.
+                let password =
+                    archive_password.or_else(|| nzb.passwords().first().map(|s| s.to_string()));
+                if password.is_some() {
+                    println!("Using archive password from NZB metadata");
+                }
+                println!("\n=== Post-processing ===");
+                let pp_config = PostProcessConfig {
+                    download_dir: out.clone(),
+                    completed_dir: completed,
+                    category,
+                    cleanup_archives: cleanup,
+                    archive_password: password,
+                    skip_verify,
+                };
+                match post_process(pp_config).await {
+                    Ok(report) => {
+                        if let Some(vr) = &report.verify {
+                            println!(
+                                "PAR2: {} healthy, {} damaged, {} missing, {} recovery slices",
+                                vr.healthy, vr.damaged, vr.missing, vr.recovery_slices
+                            );
+                        } else {
+                            println!("PAR2: skipped (no .par2 files)");
+                        }
+                        if let Some(ur) = &report.unpack {
+                            println!(
+                                "Unpacked: {} files (encrypted={})",
+                                ur.extracted_files.len(),
+                                ur.was_encrypted
+                            );
+                        }
+                        println!("Status: {:?}", report.status);
+                        println!("Final dir: {}", report.final_dir.display());
+                    }
+                    Err(e) => {
+                        eprintln!("Post-processing failed: {e}");
+                    }
+                }
+            }
         }
         Command::List => {
             let jobs = queue.list_jobs().await?;
@@ -291,6 +381,53 @@ async fn main() -> anyhow::Result<()> {
         Command::Delete { job } => {
             queue.delete_job(job).await?;
             println!("Job {job} deleted.");
+        }
+        Command::Postprocess {
+            dir,
+            completed_dir,
+            category,
+            archive_password,
+            skip_verify,
+            cleanup,
+        } => {
+            println!("=== Post-processing {} ===", dir.display());
+            let pp_config = PostProcessConfig {
+                download_dir: dir,
+                completed_dir,
+                category,
+                cleanup_archives: cleanup,
+                archive_password,
+                skip_verify,
+            };
+            match post_process(pp_config).await {
+                Ok(report) => {
+                    if let Some(vr) = &report.verify {
+                        println!(
+                            "PAR2: {} healthy, {} damaged, {} missing, {} recovery slices (repairable={})",
+                            vr.healthy, vr.damaged, vr.missing, vr.recovery_slices, vr.repairable
+                        );
+                        for (filename, status) in &vr.files {
+                            if status != &nobz_core::par2::VerifyStatus::Ok {
+                                println!("  {status:?}: {filename}");
+                            }
+                        }
+                    } else {
+                        println!("PAR2: skipped (no .par2 files)");
+                    }
+                    if let Some(ur) = &report.unpack {
+                        println!(
+                            "Unpacked: {} files (encrypted={})",
+                            ur.extracted_files.len(),
+                            ur.was_encrypted
+                        );
+                    }
+                    println!("Status: {:?}", report.status);
+                    println!("Final dir: {}", report.final_dir.display());
+                }
+                Err(e) => {
+                    eprintln!("Post-processing failed: {e}");
+                }
+            }
         }
     }
 

@@ -23,6 +23,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 quick-xml = { workspace = true }
 crc32fast = { workspace = true }
+md-5 = { workspace = true }
+unrar = { workspace = true }
+sevenz-rust2 = { workspace = true }
 tracing = { workspace = true }
 futures = { workspace = true }
 anyhow = { workspace = true }
