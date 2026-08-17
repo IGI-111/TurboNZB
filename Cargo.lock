@@ -2141,6 +2141,7 @@ name = "nobz-index"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "clap",
  "futures",
  "nobz-core",
  "quick-xml 0.36.2",
@@ -2150,6 +2151,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "url",
 ]
 
