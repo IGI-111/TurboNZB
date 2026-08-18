@@ -17,7 +17,18 @@ use nobz_core::queue::{JobState, QueueJob};
 
 use crate::backend::{BackendCmd, BackendEvent, BackendHandle, JobFileDetail};
 use crate::theme::Icons;
-use crate::win95_widgets::{Win95Button, Win95IconButton, Win95ProgressBar, paint_sunken_bevel};
+use crate::win95_widgets::{
+    Win95Button, Win95IconButton, Win95ProgressBar, Win95TabButton, paint_sunken_bevel,
+};
+
+/// Which sub-tab is active in the queue's bottom pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DetailsTab {
+    #[default]
+    General,
+    Files,
+    Speed,
+}
 
 /// State for the queue tab.
 #[derive(Debug, Clone, Default)]
@@ -43,6 +54,8 @@ pub struct QueueState {
     pub pp_reports: Vec<(Option<i64>, PostProcessReport)>,
     /// Jobs currently being post-processed (show "Verifying..." status).
     pub pp_in_progress: std::collections::HashSet<i64>,
+    /// Which sub-tab is active in the bottom details pane.
+    pub details_tab: DetailsTab,
 }
 
 impl QueueState {
@@ -140,6 +153,7 @@ pub fn ui(
             bottom: 4.0,
         })
         .show(ui, |ui| {
+            ui.set_max_width(ui.available_width() - 8.0);
             // Top: toolbar with Open NZB, Play/Pause, and Clear completed.
             ui.horizontal(|ui| {
                 // Open NZB file from disk.
@@ -211,11 +225,10 @@ pub fn ui(
                 return;
             }
 
-            // Split the remaining space: three panes.
+            // Two-pane layout: job list on top, tabbed details below.
             let available = ui.available_height();
-            let graph_height = 100.0;
-            let bottom_height = 180.0_f32.min((available - graph_height) * 0.35).max(80.0);
-            let top_height = (available - graph_height - bottom_height).max(120.0);
+            let bottom_height = 220.0_f32.min(available * 0.45).max(140.0);
+            let top_height = (available - bottom_height - 4.0).max(120.0);
 
             // --- Top pane: job list ---
             ui.push_id("job_list_pane", |ui| {
@@ -226,19 +239,10 @@ pub fn ui(
 
             crate::win95_widgets::etched_separator(ui, true);
 
-            // --- Middle pane: speed graph ---
-            ui.push_id("speed_graph_pane", |ui| {
-                ui.allocate_ui(egui::vec2(ui.available_width(), graph_height), |ui| {
-                    speed_graph_pane(ui, state);
-                });
-            });
-
-            crate::win95_widgets::etched_separator(ui, true);
-
-            // --- Bottom pane: job details ---
+            // --- Bottom pane: tabbed details ---
             ui.push_id("details_pane", |ui| {
                 ui.allocate_ui(egui::vec2(ui.available_width(), bottom_height), |ui| {
-                    details_pane(ui, state);
+                    details_tabbed_pane(ui, state, icons);
                 });
             });
         });
@@ -254,6 +258,7 @@ fn job_list_pane(
     let state_w = 80.0;
     let progress_w = 220.0;
     let actions_w = 90.0; // 3 icon buttons: up, down, delete
+    let name_width = (ui.available_width() - state_w - progress_w - actions_w).max(100.0);
 
     let avail_h = ui.available_height();
     let table = TableBuilder::new(ui)
@@ -262,7 +267,7 @@ fn job_list_pane(
         .auto_shrink(false)
         .vscroll(true)
         .min_scrolled_height(avail_h)
-        .column(Column::remainder().clip(true)) // Name (stretches)
+        .column(Column::exact(name_width).clip(true)) // Name (stretches)
         .column(Column::exact(state_w)) // State
         .column(Column::exact(progress_w)) // Progress
         .column(Column::exact(actions_w)); // Actions
@@ -503,8 +508,59 @@ fn speed_graph_pane(ui: &mut egui::Ui, state: &QueueState) {
     }
 }
 
-/// Bottom pane: details for the selected job.
-fn details_pane(ui: &mut egui::Ui, state: &QueueState) {
+/// Bottom pane: tabbed details (General / Files / Speed).
+fn details_tabbed_pane(ui: &mut egui::Ui, state: &mut QueueState, icons: Option<&Icons>) {
+    // Tab bar at the top of the bottom pane.
+    ui.horizontal(|ui| {
+        if ui
+            .add(Win95TabButton::new(
+                None,
+                "General",
+                state.details_tab == DetailsTab::General,
+            ))
+            .clicked()
+        {
+            state.details_tab = DetailsTab::General;
+        }
+        if ui
+            .add(Win95TabButton::new(
+                None,
+                "Files",
+                state.details_tab == DetailsTab::Files,
+            ))
+            .clicked()
+        {
+            state.details_tab = DetailsTab::Files;
+        }
+        if ui
+            .add(Win95TabButton::new(
+                None,
+                "Speed",
+                state.details_tab == DetailsTab::Speed,
+            ))
+            .clicked()
+        {
+            state.details_tab = DetailsTab::Speed;
+        }
+    });
+
+    let _ = icons;
+
+    match state.details_tab {
+        DetailsTab::General => {
+            general_pane(ui, state);
+        }
+        DetailsTab::Files => {
+            files_pane(ui, state);
+        }
+        DetailsTab::Speed => {
+            speed_graph_pane(ui, state);
+        }
+    }
+}
+
+/// General tab: job header, progress bar, post-process status.
+fn general_pane(ui: &mut egui::Ui, state: &QueueState) {
     let Some(job_id) = state.selected_job else {
         ui.label("Select a job to see details.");
         return;
@@ -541,10 +597,15 @@ fn details_pane(ui: &mut egui::Ui, state: &QueueState) {
             format_size(job.total_bytes),
             (p * 100.0) as u32
         )));
+    } else if job.total_segments > 0 {
+        let p = job.segments_done as f32 / job.total_segments as f32;
+        ui.add(Win95ProgressBar::new(p).text(format!(
+            "{} / {} segments ({} / {} files)",
+            job.segments_done, job.total_segments, job.files_done, job.file_count
+        )));
     }
 
-    // Post-process status: show "Verifying..." if in progress, otherwise
-    // show the report summary.
+    // Post-process status
     if state.pp_in_progress.contains(&job.id) {
         ui.horizontal(|ui| {
             ui.label("Post-process:");
@@ -563,9 +624,41 @@ fn details_pane(ui: &mut egui::Ui, state: &QueueState) {
         });
     }
 
-    crate::win95_widgets::etched_separator(ui, true);
+    // Segment stats
+    if !state.job_details.is_empty() {
+        let total_segs: u64 = state
+            .job_details
+            .iter()
+            .map(|f| f.segment_count as u64)
+            .sum();
+        let done_segs: u64 = state
+            .job_details
+            .iter()
+            .map(|f| f.segments_done as u64)
+            .sum();
+        let missing_segs: u64 = state
+            .job_details
+            .iter()
+            .map(|f| f.segments_missing as u64)
+            .sum();
+        ui.add_space(8.0);
+        ui.label(format!(
+            "Segments: {} done / {} total / {} missing across {} files",
+            done_segs,
+            total_segs,
+            missing_segs,
+            state.job_details.len()
+        ));
+    }
+}
 
-    // File list table with per-file segment dot grid
+/// Files tab: file list table with per-file segment dot grid.
+fn files_pane(ui: &mut egui::Ui, state: &QueueState) {
+    let Some(_job_id) = state.selected_job else {
+        ui.label("Select a job to see file details.");
+        return;
+    };
+
     if state.job_details.is_empty() {
         ui.label("No file details available.");
         return;
@@ -575,6 +668,7 @@ fn details_pane(ui: &mut egui::Ui, state: &QueueState) {
     let segs_w = 80.0;
     let size_w = 140.0;
     let grid_w = 170.0;
+    let file_width = (ui.available_width() - segs_w - size_w - grid_w).max(100.0);
 
     let avail_h = ui.available_height();
     let table = TableBuilder::new(ui)
@@ -583,10 +677,10 @@ fn details_pane(ui: &mut egui::Ui, state: &QueueState) {
         .auto_shrink(false)
         .vscroll(true)
         .min_scrolled_height(avail_h)
-        .column(Column::remainder().clip(true)) // Filename (stretches)
-        .column(Column::exact(segs_w)) // Segs
-        .column(Column::exact(size_w)) // Size
-        .column(Column::exact(grid_w)); // Segment grid
+        .column(Column::exact(file_width).clip(true))
+        .column(Column::exact(segs_w))
+        .column(Column::exact(size_w))
+        .column(Column::exact(grid_w));
 
     table
         .header(20.0, |mut header| {

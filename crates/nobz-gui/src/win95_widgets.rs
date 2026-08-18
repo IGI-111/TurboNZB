@@ -764,23 +764,32 @@ impl Widget for Win95ProgressBar {
             0.0
         };
 
-        // Optional text overlay — white text on blue fill, black on white bg.
+        // Optional text overlay — Win95 style: each character is white if
+        // it's over the blue fill, black if it's over the white background.
         if let Some(t) = &self.text {
             let galley =
                 painter.layout_no_wrap(t.clone(), FontId::proportional(14.0), colors::WINDOW_TEXT);
-            let galley_size = galley.size();
-            let pos = ui.layout().align_size_within_rect(galley_size, inner).min;
-            // Center of the text relative to the fill.
-            let text_center_x = pos.x + galley_size.x / 2.0;
+            let pos = ui.layout().align_size_within_rect(galley.size(), inner).min;
             let fill_right = inner.left() + fill_w;
-            let text_color = if text_center_x <= fill_right {
-                // Text is over the blue fill — use white.
-                Color32::WHITE
-            } else {
-                // Text is over white background — use black.
-                colors::WINDOW_TEXT
-            };
-            painter.galley(pos, galley, text_color);
+
+            // Paint each character individually with the right color.
+            for row in &galley.rows {
+                for glyph in &row.glyphs {
+                    let glyph_center_x = pos.x + glyph.pos.x + glyph.advance_width / 2.0;
+                    let color = if glyph_center_x <= fill_right && fill_w > 0.0 {
+                        Color32::WHITE
+                    } else {
+                        colors::WINDOW_TEXT
+                    };
+                    painter.text(
+                        egui::pos2(pos.x + glyph.pos.x, pos.y + row.rect.top()),
+                        egui::Align2::LEFT_TOP,
+                        glyph.chr.to_string(),
+                        FontId::proportional(14.0),
+                        color,
+                    );
+                }
+            }
         }
 
         response

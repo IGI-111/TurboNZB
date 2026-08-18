@@ -75,6 +75,7 @@ pub fn ui(
                 bottom: 4.0,
             })
             .show(ui, |ui| {
+                ui.set_max_width(ui.available_width() - 8.0);
                 // --- NNTP Servers ---
                 group(ui, Some("NNTP Servers"), |ui| {
                     ui.label("Servers are tried in priority order (lower = first).");

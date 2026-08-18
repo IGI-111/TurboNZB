@@ -140,6 +140,7 @@ pub fn ui(
             bottom: 4.0,
         })
         .show(ui, |ui| {
+            ui.set_max_width(ui.available_width() - 8.0);
             // Search bar
             ui.horizontal(|ui| {
                 ui.label("Search:");
@@ -196,6 +197,8 @@ pub fn ui(
             crate::win95_widgets::etched_separator(ui, true);
 
             // Results table
+            let other_cols: f32 = 100.0 + 80.0 + 50.0 + 80.0 + 50.0 + 36.0;
+            let title_width = (ui.available_width() - other_cols).max(150.0);
             let avail_h = ui.available_height();
             let table = TableBuilder::new(ui)
                 .striped(true)
@@ -203,7 +206,7 @@ pub fn ui(
                 .auto_shrink(false)
                 .vscroll(true)
                 .min_scrolled_height(avail_h)
-                .column(Column::remainder().clip(true))
+                .column(Column::exact(title_width).clip(true))
                 .column(Column::exact(100.0).clip(true))
                 .column(Column::exact(80.0))
                 .column(Column::exact(50.0))
