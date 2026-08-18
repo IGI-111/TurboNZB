@@ -48,6 +48,9 @@ pub struct NobzApp {
     _runtime: Arc<tokio::runtime::Runtime>,
     wizard: Option<Wizard>,
     tab: Tab,
+    /// Whether we've received the initial job list from the backend.
+    /// Used to switch to Search tab if the queue is empty on first load.
+    initial_jobs_received: bool,
     search: SearchState,
     queue: QueueState,
     settings: SettingsState,
@@ -83,7 +86,8 @@ impl NobzApp {
             backend,
             _runtime: Arc::new(runtime),
             wizard,
-            tab: Tab::Search,
+            tab: Tab::Queue,
+            initial_jobs_received: false,
             search: SearchState::default(),
             queue: QueueState::default(),
             settings: SettingsState::default(),
@@ -116,6 +120,15 @@ impl NobzApp {
                 }
                 BackendEvent::PostProcessFailed { job_id, error } => {
                     tracing::warn!("Post-process failed (job {job_id:?}): {error}");
+                }
+                BackendEvent::JobsList(jobs) => {
+                    // On first job list: switch to Search if queue is empty.
+                    if !self.initial_jobs_received && jobs.is_empty() {
+                        self.initial_jobs_received = true;
+                        self.tab = Tab::Search;
+                    } else if !self.initial_jobs_received {
+                        self.initial_jobs_received = true;
+                    }
                 }
                 _ => {}
             }

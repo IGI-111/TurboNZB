@@ -129,11 +129,9 @@ pub fn ui(
     backend: &BackendHandle,
     _icons: Option<&Icons>,
 ) {
-    // Top: toolbar with global Play/Pause.
+    // Top: toolbar with global Play/Pause and Clear completed.
     ui.horizontal(|ui| {
         // Global Play/Pause — always visible. Controls the download engine.
-        // Play = resume engine (start next queued job).
-        // Pause = stop engine (cancel active download, job goes back to queued).
         if state.engine_paused {
             if icon_button(ui, IconKind::Play, true, "Start downloads").clicked() {
                 backend.send(BackendCmd::ResumeEngine);
@@ -142,6 +140,15 @@ pub fn ui(
             if icon_button(ui, IconKind::Pause, true, "Pause downloads").clicked() {
                 backend.send(BackendCmd::PauseEngine);
             }
+        }
+
+        // Clear completed — only enabled if there are completed/failed jobs.
+        let has_completed = state
+            .jobs
+            .iter()
+            .any(|j| matches!(j.state, JobState::Complete | JobState::Failed));
+        if icon_button(ui, IconKind::Clear, has_completed, "Clear completed").clicked() {
+            backend.send(BackendCmd::ClearCompleted);
         }
     });
 
@@ -557,6 +564,7 @@ fn file_segment_grid(ui: &mut egui::Ui, file: &JobFileDetail) {
 
 fn state_color(state: &JobState) -> (Color32, &'static str) {
     match state {
+        JobState::Fetching => (Color32::from_rgb(100, 150, 220), "Fetching..."),
         JobState::Queued => (Color32::from_rgb(120, 120, 120), "Queued"),
         JobState::Downloading => (Color32::from_rgb(80, 180, 80), "Downloading"),
         JobState::Complete => (Color32::from_rgb(60, 160, 60), "Complete"),
@@ -611,6 +619,7 @@ enum IconKind {
     Delete,
     Up,
     Down,
+    Clear,
 }
 
 /// A small button with a vector-drawn icon. Uses `ui.interact` for proper
@@ -706,6 +715,35 @@ fn icon_button(ui: &mut egui::Ui, kind: IconKind, enabled: bool, tooltip: &str) 
                 icon_color,
                 egui::Stroke::NONE,
             ));
+        }
+        IconKind::Clear => {
+            // Trash can: lid + handle + trapezoid body.
+            let stroke = egui::Stroke::new(2.0_f32, icon_color);
+            // Handle: small line on top.
+            painter.line_segment(
+                [egui::pos2(cx - s * 0.3, cy - s), egui::pos2(cx + s * 0.3, cy - s)],
+                stroke,
+            );
+            // Lid: horizontal line.
+            painter.line_segment(
+                [egui::pos2(cx - s, cy - s * 0.6), egui::pos2(cx + s, cy - s * 0.6)],
+                stroke,
+            );
+            // Body: left side.
+            painter.line_segment(
+                [egui::pos2(cx - s * 0.7, cy - s * 0.6), egui::pos2(cx - s * 0.4, cy + s)],
+                stroke,
+            );
+            // Body: right side.
+            painter.line_segment(
+                [egui::pos2(cx + s * 0.7, cy - s * 0.6), egui::pos2(cx + s * 0.4, cy + s)],
+                stroke,
+            );
+            // Body: bottom.
+            painter.line_segment(
+                [egui::pos2(cx - s * 0.4, cy + s), egui::pos2(cx + s * 0.4, cy + s)],
+                stroke,
+            );
         }
     }
 

@@ -60,6 +60,8 @@ pub enum BackendCmd {
     PauseEngine,
     /// Resume the download engine — starts the next queued job.
     ResumeEngine,
+    /// Delete all completed jobs from the queue.
+    ClearCompleted,
     /// Delete a job.
     DeleteJob { job_id: i64 },
     /// Move a job up in the queue (higher priority).
@@ -381,6 +383,9 @@ impl Backend {
                 BackendCmd::ResumeEngine => {
                     self.handle_resume_engine().await;
                 }
+                BackendCmd::ClearCompleted => {
+                    self.handle_clear_completed().await;
+                }
                 BackendCmd::DeleteJob { job_id } => {
                     self.handle_delete(job_id).await;
                 }
@@ -509,57 +514,9 @@ impl Backend {
         url: String,
         title: String,
         download_dir: PathBuf,
-        category: Option<String>,
+        _category: Option<String>,
     ) {
         tracing::info!(%url, %title, "downloading NZB from URL");
-
-        // Newznab enclosure URLs from search results typically don't
-        // include the API key. We need to append it. Find the matching
-        // indexer by checking if the URL starts with the indexer's base URL.
-        let url = {
-            let config = self.config.read().expect("config lock");
-            append_api_key(&url, &config.indexers)
-        };
-
-        let client = match reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .user_agent(concat!("nobz/", env!("CARGO_PKG_VERSION")))
-            .build()
-        {
-            Ok(c) => c,
-            Err(e) => {
-                self.emit(BackendEvent::Error(format!("HTTP client error: {e}")));
-                return;
-            }
-        };
-
-        let resp = match client.get(&url).send().await {
-            Ok(r) => r,
-            Err(e) => {
-                self.emit(BackendEvent::Error(format!("NZB fetch failed: {e}")));
-                return;
-            }
-        };
-
-        let status = resp.status();
-        tracing::info!(%status, %url, "NZB fetch response");
-
-        if !status.is_success() {
-            self.emit(BackendEvent::Error(format!(
-                "NZB fetch failed: HTTP {status}"
-            )));
-            return;
-        }
-
-        let nzb_bytes = match resp.bytes().await {
-            Ok(b) => b.to_vec(),
-            Err(e) => {
-                self.emit(BackendEvent::Error(format!("NZB read failed: {e}")));
-                return;
-            }
-        };
-
-        tracing::info!(bytes = nzb_bytes.len(), "NZB downloaded");
 
         // Sanitize title for directory name.
         let safe_name: String = title
@@ -572,8 +529,176 @@ impl Backend {
             safe_name
         });
 
-        self.handle_download(nzb_bytes, job_dir, category, None, Some(&title))
-            .await;
+        // Create a placeholder job in Fetching state so it shows in the
+        // queue immediately while the NZB is being downloaded.
+        let job_id = match self.queue.create_fetching_job(&title, &job_dir, 0).await {
+            Ok(id) => id,
+            Err(e) => {
+                self.emit(BackendEvent::Error(format!("Create job error: {e}")));
+                return;
+            }
+        };
+        self.emit(BackendEvent::JobAdded { job_id });
+        self.handle_refresh_jobs().await;
+
+        // Spawn the HTTP fetch + parse + populate as a separate task so
+        // the command loop is free to process other commands (including
+        // more DownloadFromUrl requests) in parallel.
+        let queue = Arc::clone(&self.queue);
+        let config = Arc::clone(&self.config);
+        let event_tx = self.event_tx.clone();
+        let ctx = self.ctx.clone();
+        let cancel_token = Arc::clone(&self.cancel_token);
+        let selected_job = Arc::clone(&self.selected_job);
+        let speed = Arc::clone(&self.speed);
+        let engine_paused = Arc::clone(&self.engine_paused);
+
+        tokio::spawn(async move {
+            let emit = |ev: BackendEvent| {
+                let _ = event_tx.send(ev);
+                if let Some(ref ctx) = ctx {
+                    ctx.request_repaint();
+                }
+            };
+
+            // Append API key if needed.
+            let url = {
+                let config = config.read().expect("config lock");
+                append_api_key(&url, &config.indexers)
+            };
+
+            let client = match reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .user_agent(concat!("nobz/", env!("CARGO_PKG_VERSION")))
+                .build()
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    emit(BackendEvent::Error(format!("HTTP client error: {e}")));
+                    let _ = queue.delete_job(job_id).await;
+                    return;
+                }
+            };
+
+            let resp = match client.get(&url).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    emit(BackendEvent::Error(format!("NZB fetch failed: {e}")));
+                    let _ = queue.delete_job(job_id).await;
+                    return;
+                }
+            };
+
+            let status = resp.status();
+            tracing::info!(%status, %url, "NZB fetch response");
+
+            if !status.is_success() {
+                emit(BackendEvent::Error(format!(
+                    "NZB fetch failed: HTTP {status}"
+                )));
+                let _ = queue.delete_job(job_id).await;
+                return;
+            }
+
+            let nzb_bytes = match resp.bytes().await {
+                Ok(b) => b.to_vec(),
+                Err(e) => {
+                    emit(BackendEvent::Error(format!("NZB read failed: {e}")));
+                    let _ = queue.delete_job(job_id).await;
+                    return;
+                }
+            };
+
+            tracing::info!(bytes = nzb_bytes.len(), "NZB downloaded");
+
+            // Quick sanity check: NZB files are XML.
+            let head = String::from_utf8_lossy(&nzb_bytes[..nzb_bytes.len().min(200)]);
+            if !head.trim_start().starts_with("<?xml") && !head.trim_start().starts_with("<nzb") {
+                emit(BackendEvent::Error(
+                    "NZB fetch returned non-XML content (likely an error page). Check the indexer URL and API key.".into(),
+                ));
+                let _ = queue.delete_job(job_id).await;
+                return;
+            }
+
+            let nzb = match nzb::parse(&nzb_bytes) {
+                Ok(n) => n,
+                Err(e) => {
+                    emit(BackendEvent::Error(format!("NZB parse error: {e}")));
+                    let _ = queue.delete_job(job_id).await;
+                    return;
+                }
+            };
+
+            // Populate the placeholder job with real data and set state to Queued.
+            if let Err(e) = queue
+                .populate_job(job_id, &nzb, &job_dir, Some(&title))
+                .await
+            {
+                emit(BackendEvent::Error(format!("Populate job error: {e}")));
+                let _ = queue.delete_job(job_id).await;
+                return;
+            }
+
+            emit(BackendEvent::JobStateChanged {
+                job_id,
+                state: JobState::Queued,
+            });
+            if let Ok(jobs) = queue.list_jobs().await {
+                emit(BackendEvent::JobsList(jobs));
+            }
+
+            // Try to start downloading. We need to check engine_paused and
+            // cancel_token here (not in try_start_next_job) since we don't
+            // have a &self reference in this spawned task.
+            let is_paused = engine_paused.lock().map(|p| *p).unwrap_or(false);
+            let already_running = cancel_token.lock().expect("cancel_token lock").is_some();
+            let has_downloading = queue
+                .current_downloading_job()
+                .await
+                .ok()
+                .flatten()
+                .is_some();
+
+            if !is_paused && !already_running && !has_downloading {
+                if let Ok(Some(next)) = queue.next_queued_job().await {
+                    if next.id == job_id {
+                        // Claim the slot and spawn the engine.
+                        if let Ok(true) = queue.claim_download_slot(job_id).await {
+                            let servers: Vec<ServerConfig> = {
+                                let c = config.read().expect("config lock");
+                                c.server_configs()
+                            };
+                            let max_conn = {
+                                let c = config.read().expect("config lock");
+                                c.max_connections
+                            };
+                            if !servers.is_empty() {
+                                let new_cancel = CancellationToken::new();
+                                {
+                                    let mut slot = cancel_token.lock().expect("cancel_token lock");
+                                    *slot = Some(new_cancel.clone());
+                                }
+                                spawn_engine_task(
+                                    job_id,
+                                    servers,
+                                    max_conn,
+                                    Arc::clone(&queue),
+                                    Arc::clone(&config),
+                                    event_tx.clone(),
+                                    ctx.clone(),
+                                    Arc::clone(&speed),
+                                    Arc::clone(&cancel_token),
+                                    Arc::clone(&selected_job),
+                                    Arc::clone(&engine_paused),
+                                    new_cancel,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        });
     }
 
     /// Pause the download engine: cancel the active download and put its
@@ -744,6 +869,25 @@ impl Backend {
         if let Err(e) = self.queue.delete_job(job_id).await {
             self.emit(BackendEvent::Error(format!("Delete error: {e}")));
             return;
+        }
+        self.handle_refresh_jobs().await;
+    }
+
+    /// Delete all completed (and failed) jobs from the queue.
+    async fn handle_clear_completed(&self) {
+        let jobs = match self.queue.list_jobs().await {
+            Ok(j) => j,
+            Err(e) => {
+                self.emit(BackendEvent::Error(format!("List jobs error: {e}")));
+                return;
+            }
+        };
+        for job in &jobs {
+            if matches!(job.state, JobState::Complete | JobState::Failed) {
+                if let Err(e) = self.queue.delete_job(job.id).await {
+                    tracing::warn!(error = %e, job_id = job.id, "failed to delete completed job");
+                }
+            }
         }
         self.handle_refresh_jobs().await;
     }

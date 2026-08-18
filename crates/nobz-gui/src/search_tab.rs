@@ -255,16 +255,23 @@ pub fn ui(
                     });
                     row.col(|ui| {
                         if let Some(icons) = icons {
-                            let img = egui::Image::from_texture(&icons.download)
-                                .fit_to_exact_size(egui::vec2(16.0, 16.0));
+                            let (img, tooltip) = if already_downloaded {
+                                (
+                                    egui::Image::from_texture(&icons.tick)
+                                        .fit_to_exact_size(egui::vec2(16.0, 16.0)),
+                                    "Added to queue",
+                                )
+                            } else {
+                                (
+                                    egui::Image::from_texture(&icons.download)
+                                        .fit_to_exact_size(egui::vec2(16.0, 16.0)),
+                                    "Download",
+                                )
+                            };
                             let btn = egui::Button::image(img).small();
                             if ui
                                 .add_enabled(!already_downloaded, btn)
-                                .on_hover_text(if already_downloaded {
-                                    "Already queued"
-                                } else {
-                                    "Download"
-                                })
+                                .on_hover_text(tooltip)
                                 .clicked()
                             {
                                 let url = result.result.nzb_url.clone();

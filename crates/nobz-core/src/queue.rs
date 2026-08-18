@@ -20,9 +20,11 @@ pub const DB_FILENAME: &str = "nobz-queue.db";
 /// Job lifecycle states persisted in the database.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum JobState {
-    /// Waiting to be downloaded.
+    /// NZB is being fetched from the indexer (HTTP download in progress).
+    Fetching,
+    /// Waiting to be downloaded from NNTP.
     Queued,
-    /// Currently downloading.
+    /// Currently downloading from NNTP.
     Downloading,
     /// All files downloaded and assembled.
     Complete,
@@ -33,6 +35,7 @@ pub enum JobState {
 impl JobState {
     pub fn as_str(&self) -> &'static str {
         match self {
+            Self::Fetching => "fetching",
             Self::Queued => "queued",
             Self::Downloading => "downloading",
             Self::Complete => "complete",
@@ -42,11 +45,11 @@ impl JobState {
 
     pub fn from_str_lossy(s: &str) -> Self {
         match s {
+            "fetching" => Self::Fetching,
             "downloading" => Self::Downloading,
             "complete" => Self::Complete,
             "failed" => Self::Failed,
-            // "paused" is legacy — treat as queued (engine pause now puts
-            // jobs back to queued instead of a separate paused state).
+            // "paused" is legacy — treat as queued.
             _ => Self::Queued,
         }
     }
@@ -272,6 +275,127 @@ impl QueueManager {
     ///
     /// `display_name` overrides the job name (useful when the search
     /// result has a better title than the NZB's internal metadata). If
+    /// Create a placeholder job in the Fetching state before the NZB has
+    /// been downloaded. Used so the UI can show the job immediately while
+    /// the NZB is being fetched from the indexer. Call `populate_job`
+    /// once the NZB is parsed to fill in files/segments and set the state
+    /// to Queued.
+    pub async fn create_fetching_job(
+        &self,
+        name: &str,
+        output_dir: impl Into<PathBuf>,
+        priority: i64,
+    ) -> Result<i64> {
+        let output_dir = output_dir.into().to_string_lossy().to_string();
+        let job_id: i64 = sqlx::query(
+            r#"INSERT INTO jobs (name, output_dir, priority, state, file_count, total_segments, total_bytes)
+               VALUES (?1, ?2, ?3, 'fetching', 0, 0, 0)"#,
+        )
+        .bind(name)
+        .bind(&output_dir)
+        .bind(priority)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CoreError::Other(anyhow::anyhow!("create fetching job: {e}")))?
+        .last_insert_rowid();
+        Ok(job_id)
+    }
+
+    /// Populate a placeholder job with the NZB's files and segments, and
+    /// set its state from Fetching to Queued. Returns the job id.
+    pub async fn populate_job(
+        &self,
+        job_id: i64,
+        nzb: &Nzb,
+        output_dir: impl Into<PathBuf>,
+        display_name: Option<&str>,
+    ) -> Result<()> {
+        let output_dir = output_dir.into().to_string_lossy().to_string();
+        let name = display_name
+            .map(str::to_string)
+            .or_else(|| nzb.title().map(str::to_string))
+            .or_else(|| nzb.files.first().map(|f| f.filename()))
+            .unwrap_or_else(|| "nobz-download".into());
+
+        let total_segments: u32 = nzb.files.iter().map(|f| f.segment_count).sum();
+        let total_bytes: u64 = nzb
+            .files
+            .iter()
+            .flat_map(|f| &f.segments)
+            .map(|s| s.bytes)
+            .sum();
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| CoreError::Other(anyhow::anyhow!("populate tx: {e}")))?;
+
+        // Update the job row with real data.
+        sqlx::query(
+            r#"UPDATE jobs SET name = ?1, output_dir = ?2, state = 'queued',
+               file_count = ?3, total_segments = ?4, total_bytes = ?5
+               WHERE id = ?6"#,
+        )
+        .bind(&name)
+        .bind(&output_dir)
+        .bind(nzb.files.len() as i64)
+        .bind(total_segments as i64)
+        .bind(total_bytes as i64)
+        .bind(job_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| CoreError::Other(anyhow::anyhow!("populate update: {e}")))?;
+
+        for (file_index, file) in nzb.files.iter().enumerate() {
+            let file_id: i64 = sqlx::query(
+                r#"INSERT INTO files (job_id, file_index, filename, subject, poster, date, segment_count)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"#,
+            )
+            .bind(job_id)
+            .bind(file_index as i64)
+            .bind(file.filename())
+            .bind(&file.subject)
+            .bind(&file.poster)
+            .bind(file.date as i64)
+            .bind(file.segment_count as i64)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| CoreError::Other(anyhow::anyhow!("populate file: {e}")))?
+            .last_insert_rowid();
+
+            for seg in &file.segments {
+                sqlx::query(
+                    r#"INSERT INTO segments (file_id, number, message_id, bytes, missing, state)
+                       VALUES (?1, ?2, ?3, ?4, ?5, ?6)"#,
+                )
+                .bind(file_id)
+                .bind(seg.number as i64)
+                .bind(&seg.message_id)
+                .bind(seg.bytes as i64)
+                .bind(seg.missing as i64)
+                .bind(if seg.missing {
+                    SegmentState::Missing.as_str()
+                } else {
+                    SegmentState::Pending.as_str()
+                })
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| CoreError::Other(anyhow::anyhow!("populate segment: {e}")))?;
+            }
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| CoreError::Other(anyhow::anyhow!("populate commit: {e}")))?;
+
+        Ok(())
+    }
+
+    /// Add a new job to the queue. Returns the job id.
+    ///
+    /// `display_name` overrides the job name (useful when the search
+    /// result has a better title than the NZB's internal metadata). If
     /// None, falls back to the NZB's `<meta title>` or the first file's
     /// filename.
     pub async fn add_job(
@@ -488,7 +612,20 @@ impl QueueManager {
     ///
     /// Also migrates legacy 'paused' states to 'queued' — the Paused
     /// job state was removed in favor of a global engine pause.
+    /// Jobs still in 'fetching' state (NZB was being downloaded when the
+    /// app closed) are deleted since they have no files/segments.
     pub async fn recover_interrupted(&self) -> Result<u64> {
+        // Delete jobs that were still fetching (no files/segments yet).
+        let deleted = sqlx::query(r#"DELETE FROM jobs WHERE state = 'fetching'"#)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| CoreError::Other(anyhow::anyhow!("recover delete fetching: {e}")))?;
+        tracing::info!(
+            deleted = deleted.rows_affected(),
+            "deleted incomplete fetching jobs"
+        );
+
+        // Reset downloading/paused jobs to queued.
         let result = sqlx::query(
             r#"UPDATE jobs SET state = 'queued'
                WHERE state IN ('downloading', 'paused')"#,
