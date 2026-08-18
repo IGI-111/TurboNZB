@@ -38,6 +38,8 @@ use crate::settings::AppConfig;
 /// Commands the GUI sends to the backend.
 #[derive(Debug)]
 pub enum BackendCmd {
+    /// Open an NZB file from disk and queue it.
+    OpenNzbFile { path: PathBuf },
     /// Add an NZB (from bytes) to the queue and start downloading.
     DownloadNzb {
         nzb_bytes: Vec<u8>,
@@ -359,6 +361,9 @@ impl Backend {
 
         while let Some(cmd) = cmd_rx.recv().await {
             match cmd {
+                BackendCmd::OpenNzbFile { path } => {
+                    self.handle_open_nzb_file(path).await;
+                }
                 BackendCmd::DownloadNzb {
                     nzb_bytes,
                     output_dir,
@@ -442,6 +447,145 @@ impl Backend {
                 }
             }
         }
+    }
+
+    /// Open an NZB file from disk, create a fetching job, then read+parse
+    /// the file and populate the job — same flow as DownloadFromUrl but
+    /// reading from the local filesystem.
+    async fn handle_open_nzb_file(&self, path: PathBuf) {
+        let title = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "nobz-download".into());
+
+        let download_dir = {
+            let c = self.config.read().expect("config lock");
+            c.download_dir.clone()
+        };
+
+        // Sanitize title for directory name.
+        let safe_name: String = title
+            .chars()
+            .filter(|c| c.is_alphanumeric() || *c == '.' || *c == '-' || *c == '_')
+            .collect();
+        let job_dir = download_dir.join(if safe_name.is_empty() {
+            "nobz-download".to_string()
+        } else {
+            safe_name
+        });
+
+        // Create placeholder job immediately.
+        let job_id = match self.queue.create_fetching_job(&title, &job_dir, 0).await {
+            Ok(id) => id,
+            Err(e) => {
+                self.emit(BackendEvent::Error(format!("Create job error: {e}")));
+                return;
+            }
+        };
+        self.emit(BackendEvent::JobAdded { job_id });
+        self.handle_refresh_jobs().await;
+
+        // Read and parse the file in a spawned task so we don't block.
+        let queue = Arc::clone(&self.queue);
+        let config = Arc::clone(&self.config);
+        let event_tx = self.event_tx.clone();
+        let ctx = self.ctx.clone();
+        let cancel_token = Arc::clone(&self.cancel_token);
+        let selected_job = Arc::clone(&self.selected_job);
+        let speed = Arc::clone(&self.speed);
+        let engine_paused = Arc::clone(&self.engine_paused);
+
+        tokio::spawn(async move {
+            let emit = |ev: BackendEvent| {
+                let _ = event_tx.send(ev);
+                if let Some(ref ctx) = ctx {
+                    ctx.request_repaint();
+                }
+            };
+
+            let nzb_bytes = match tokio::fs::read(&path).await {
+                Ok(b) => b,
+                Err(e) => {
+                    emit(BackendEvent::Error(format!("Failed to read NZB file: {e}")));
+                    let _ = queue.delete_job(job_id).await;
+                    return;
+                }
+            };
+
+            let nzb = match nzb::parse(&nzb_bytes) {
+                Ok(n) => n,
+                Err(e) => {
+                    emit(BackendEvent::Error(format!("NZB parse error: {e}")));
+                    let _ = queue.delete_job(job_id).await;
+                    return;
+                }
+            };
+
+            if let Err(e) = queue
+                .populate_job(job_id, &nzb, &job_dir, Some(&title))
+                .await
+            {
+                emit(BackendEvent::Error(format!("Populate job error: {e}")));
+                let _ = queue.delete_job(job_id).await;
+                return;
+            }
+
+            emit(BackendEvent::JobStateChanged {
+                job_id,
+                state: JobState::Queued,
+            });
+            if let Ok(jobs) = queue.list_jobs().await {
+                emit(BackendEvent::JobsList(jobs));
+            }
+
+            // Try to start downloading.
+            let is_paused = engine_paused.lock().map(|p| *p).unwrap_or(false);
+            let already_running = cancel_token.lock().expect("cancel_token lock").is_some();
+            let has_downloading = queue
+                .current_downloading_job()
+                .await
+                .ok()
+                .flatten()
+                .is_some();
+
+            if !is_paused && !already_running && !has_downloading {
+                if let Ok(Some(next)) = queue.next_queued_job().await {
+                    if next.id == job_id {
+                        if let Ok(true) = queue.claim_download_slot(job_id).await {
+                            let servers: Vec<ServerConfig> = {
+                                let c = config.read().expect("config lock");
+                                c.server_configs()
+                            };
+                            let max_conn = {
+                                let c = config.read().expect("config lock");
+                                c.max_connections
+                            };
+                            if !servers.is_empty() {
+                                let new_cancel = CancellationToken::new();
+                                {
+                                    let mut slot = cancel_token.lock().expect("cancel_token lock");
+                                    *slot = Some(new_cancel.clone());
+                                }
+                                spawn_engine_task(
+                                    job_id,
+                                    servers,
+                                    max_conn,
+                                    Arc::clone(&queue),
+                                    Arc::clone(&config),
+                                    event_tx.clone(),
+                                    ctx.clone(),
+                                    Arc::clone(&speed),
+                                    Arc::clone(&cancel_token),
+                                    Arc::clone(&selected_job),
+                                    Arc::clone(&engine_paused),
+                                    new_cancel,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        });
     }
 
     async fn handle_download(

@@ -129,8 +129,18 @@ pub fn ui(
     backend: &BackendHandle,
     _icons: Option<&Icons>,
 ) {
-    // Top: toolbar with global Play/Pause and Clear completed.
+    // Top: toolbar with Open NZB, Play/Pause, and Clear completed.
     ui.horizontal(|ui| {
+        // Open NZB file from disk.
+        if icon_button(ui, IconKind::Open, true, "Open NZB file").clicked() {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("NZB files", &["nzb"])
+                .pick_file()
+            {
+                backend.send(BackendCmd::OpenNzbFile { path });
+            }
+        }
+
         // Global Play/Pause — always visible. Controls the download engine.
         if state.engine_paused {
             if icon_button(ui, IconKind::Play, true, "Start downloads").clicked() {
@@ -620,6 +630,7 @@ enum IconKind {
     Up,
     Down,
     Clear,
+    Open,
 }
 
 /// A small button with a vector-drawn icon. Uses `ui.interact` for proper
@@ -721,27 +732,91 @@ fn icon_button(ui: &mut egui::Ui, kind: IconKind, enabled: bool, tooltip: &str) 
             let stroke = egui::Stroke::new(2.0_f32, icon_color);
             // Handle: small line on top.
             painter.line_segment(
-                [egui::pos2(cx - s * 0.3, cy - s), egui::pos2(cx + s * 0.3, cy - s)],
+                [
+                    egui::pos2(cx - s * 0.3, cy - s),
+                    egui::pos2(cx + s * 0.3, cy - s),
+                ],
                 stroke,
             );
             // Lid: horizontal line.
             painter.line_segment(
-                [egui::pos2(cx - s, cy - s * 0.6), egui::pos2(cx + s, cy - s * 0.6)],
+                [
+                    egui::pos2(cx - s, cy - s * 0.6),
+                    egui::pos2(cx + s, cy - s * 0.6),
+                ],
                 stroke,
             );
             // Body: left side.
             painter.line_segment(
-                [egui::pos2(cx - s * 0.7, cy - s * 0.6), egui::pos2(cx - s * 0.4, cy + s)],
+                [
+                    egui::pos2(cx - s * 0.7, cy - s * 0.6),
+                    egui::pos2(cx - s * 0.4, cy + s),
+                ],
                 stroke,
             );
             // Body: right side.
             painter.line_segment(
-                [egui::pos2(cx + s * 0.7, cy - s * 0.6), egui::pos2(cx + s * 0.4, cy + s)],
+                [
+                    egui::pos2(cx + s * 0.7, cy - s * 0.6),
+                    egui::pos2(cx + s * 0.4, cy + s),
+                ],
                 stroke,
             );
             // Body: bottom.
             painter.line_segment(
-                [egui::pos2(cx - s * 0.4, cy + s), egui::pos2(cx + s * 0.4, cy + s)],
+                [
+                    egui::pos2(cx - s * 0.4, cy + s),
+                    egui::pos2(cx + s * 0.4, cy + s),
+                ],
+                stroke,
+            );
+        }
+        IconKind::Open => {
+            // Folder icon: tab on top-left + body rectangle.
+            let stroke = egui::Stroke::new(2.0_f32, icon_color);
+            // Tab (the little notch on the folder flap).
+            painter.line_segment(
+                [
+                    egui::pos2(cx - s, cy - s * 0.5),
+                    egui::pos2(cx - s * 0.3, cy - s * 0.5),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(cx - s * 0.3, cy - s * 0.5),
+                    egui::pos2(cx - s * 0.1, cy - s * 0.8),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(cx - s * 0.1, cy - s * 0.8),
+                    egui::pos2(cx + s, cy - s * 0.8),
+                ],
+                stroke,
+            );
+            // Top edge.
+            painter.line_segment(
+                [
+                    egui::pos2(cx + s, cy - s * 0.8),
+                    egui::pos2(cx + s, cy - s * 0.5),
+                ],
+                stroke,
+            );
+            // Right side.
+            painter.line_segment(
+                [egui::pos2(cx + s, cy - s * 0.5), egui::pos2(cx + s, cy + s)],
+                stroke,
+            );
+            // Bottom.
+            painter.line_segment(
+                [egui::pos2(cx - s, cy + s), egui::pos2(cx + s, cy + s)],
+                stroke,
+            );
+            // Left side.
+            painter.line_segment(
+                [egui::pos2(cx - s, cy - s * 0.5), egui::pos2(cx - s, cy + s)],
                 stroke,
             );
         }

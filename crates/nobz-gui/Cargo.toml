@@ -31,3 +31,4 @@ sqlx = { workspace = true }
 futures = { workspace = true }
 image = { version = "0.25", default-features = false, features = ["png"] }
 tokio-util = { version = "0.7", features = ["rt"] }
+rfd = "0.15"

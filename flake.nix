@@ -118,6 +118,8 @@
             cargo-watch
             cargo-edit
             nixpkgs-fmt
+            # File dialog fallback for rfd (native file picker).
+            zenity
           ];
 
           # Expose the runtime libraries (GL/X11/Wayland/fontconfig) so
