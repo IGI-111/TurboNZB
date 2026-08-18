@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use sqlx::sqlite::SqliteConnectOptions;
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 use tracing::debug;
 
@@ -107,6 +107,10 @@ pub struct QueueJob {
     pub total_segments: u32,
     /// Segments completed (done or missing or crc_mismatch).
     pub segments_done: u32,
+    /// Total bytes across all segments in the job.
+    pub total_bytes: u64,
+    /// Bytes downloaded so far (sum of done segment sizes).
+    pub downloaded_bytes: u64,
 }
 
 /// A persisted file belonging to a job.
@@ -152,9 +156,14 @@ impl QueueManager {
 
         let opts = SqliteConnectOptions::from_str(&path.to_string_lossy())
             .map_err(|e| CoreError::Other(anyhow::anyhow!("sqlite options: {e}")))?
-            .create_if_missing(true);
+            .create_if_missing(true)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .synchronous(sqlx::sqlite::SqliteSynchronous::Normal);
 
-        let pool = SqlitePool::connect_with(opts)
+        let pool = SqlitePoolOptions::new()
+            .max_connections(16)
+            .connect_with(opts)
             .await
             .map_err(|e| CoreError::Other(anyhow::anyhow!("sqlite connect: {e}")))?;
 
@@ -186,7 +195,9 @@ impl QueueManager {
                 file_count      INTEGER NOT NULL DEFAULT 0,
                 files_done      INTEGER NOT NULL DEFAULT 0,
                 total_segments  INTEGER NOT NULL DEFAULT 0,
-                segments_done   INTEGER NOT NULL DEFAULT 0
+                segments_done   INTEGER NOT NULL DEFAULT 0,
+                total_bytes     INTEGER NOT NULL DEFAULT 0,
+                downloaded_bytes INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS files (
@@ -219,7 +230,37 @@ impl QueueManager {
         .await
         .map_err(|e| CoreError::Other(anyhow::anyhow!("schema init: {e}")))?;
 
+        // Migration: add columns if they don't exist (for existing DBs
+        // created before the total_bytes/downloaded_bytes columns).
+        self.migrate_add_column("jobs", "total_bytes", "INTEGER NOT NULL DEFAULT 0")
+            .await?;
+        self.migrate_add_column("jobs", "downloaded_bytes", "INTEGER NOT NULL DEFAULT 0")
+            .await?;
+
         debug!("queue schema initialized");
+        Ok(())
+    }
+
+    /// Add a column to a table if it doesn't already exist. SQLite doesn't
+    /// support IF NOT EXISTS for ALTER TABLE ADD COLUMN, so we check
+    /// pragma_table_info first.
+    async fn migrate_add_column(&self, table: &str, column: &str, decl: &str) -> Result<()> {
+        let exists: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?")
+                .bind(table)
+                .bind(column)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| CoreError::Other(anyhow::anyhow!("pragma check: {e}")))?;
+
+        if exists == 0 {
+            let sql = format!("ALTER TABLE {table} ADD COLUMN {column} {decl}");
+            sqlx::query(&sql)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| CoreError::Other(anyhow::anyhow!("migrate {column}: {e}")))?;
+            debug!(table, column, "migration: added column");
+        }
         Ok(())
     }
 
@@ -237,24 +278,40 @@ impl QueueManager {
             .or_else(|| nzb.files.first().map(|f| f.filename()))
             .unwrap_or_else(|| "nobz-download".into());
 
-        let mut conn = self
+        let conn = self
             .pool
             .acquire()
             .await
             .map_err(|e| CoreError::Other(anyhow::anyhow!("acquire conn: {e}")))?;
 
+        // Begin a transaction — inserting 2000+ segments one-by-one
+        // without a transaction is extremely slow (each INSERT is its
+        // own implicit transaction + fsync).
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| CoreError::Other(anyhow::anyhow!("begin tx: {e}")))?;
+
         let total_segments: u32 = nzb.files.iter().map(|f| f.segment_count).sum();
+        let total_bytes: u64 = nzb
+            .files
+            .iter()
+            .flat_map(|f| &f.segments)
+            .map(|s| s.bytes)
+            .sum();
 
         let job_id: i64 = sqlx::query(
-            r#"INSERT INTO jobs (name, output_dir, priority, file_count, total_segments)
-               VALUES (?1, ?2, ?3, ?4, ?5)"#,
+            r#"INSERT INTO jobs (name, output_dir, priority, file_count, total_segments, total_bytes)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6)"#,
         )
         .bind(&name)
         .bind(&output_dir)
         .bind(priority)
         .bind(nzb.files.len() as i64)
         .bind(total_segments as i64)
-        .execute(&mut *conn)
+        .bind(total_bytes as i64)
+        .execute(&mut *tx)
         .await
         .map_err(|e| CoreError::Other(anyhow::anyhow!("insert job: {e}")))?
         .last_insert_rowid();
@@ -271,7 +328,7 @@ impl QueueManager {
             .bind(&file.poster)
             .bind(file.date as i64)
             .bind(file.segment_count as i64)
-            .execute(&mut *conn)
+            .execute(&mut *tx)
             .await
             .map_err(|e| CoreError::Other(anyhow::anyhow!("insert file: {e}")))?
             .last_insert_rowid();
@@ -291,11 +348,16 @@ impl QueueManager {
                 } else {
                     SegmentState::Pending.as_str()
                 })
-                .execute(&mut *conn)
+                .execute(&mut *tx)
                 .await
                 .map_err(|e| CoreError::Other(anyhow::anyhow!("insert segment: {e}")))?;
             }
         }
+
+        tx.commit()
+            .await
+            .map_err(|e| CoreError::Other(anyhow::anyhow!("commit tx: {e}")))?;
+        drop(conn);
 
         debug!(job_id, "job added to queue");
         Ok(job_id)
@@ -305,7 +367,7 @@ impl QueueManager {
     pub async fn list_jobs(&self) -> Result<Vec<QueueJob>> {
         let rows = sqlx::query(
             r#"SELECT id, name, output_dir, state, priority, file_count, files_done,
-                      total_segments, segments_done
+                      total_segments, segments_done, total_bytes, downloaded_bytes
                FROM jobs ORDER BY priority ASC, id ASC"#,
         )
         .fetch_all(&self.pool)
@@ -324,6 +386,8 @@ impl QueueManager {
                 files_done: r.get::<i64, _>("files_done") as u32,
                 total_segments: r.get::<i64, _>("total_segments") as u32,
                 segments_done: r.get::<i64, _>("segments_done") as u32,
+                total_bytes: r.get::<i64, _>("total_bytes") as u64,
+                downloaded_bytes: r.get::<i64, _>("downloaded_bytes") as u64,
             })
             .collect();
         Ok(jobs)
@@ -333,7 +397,7 @@ impl QueueManager {
     pub async fn get_job(&self, job_id: i64) -> Result<QueueJob> {
         let row = sqlx::query(
             r#"SELECT id, name, output_dir, state, priority, file_count, files_done,
-                      total_segments, segments_done
+                      total_segments, segments_done, total_bytes, downloaded_bytes
                FROM jobs WHERE id = ?1"#,
         )
         .bind(job_id)
@@ -351,6 +415,8 @@ impl QueueManager {
             files_done: row.get::<i64, _>("files_done") as u32,
             total_segments: row.get::<i64, _>("total_segments") as u32,
             segments_done: row.get::<i64, _>("segments_done") as u32,
+            total_bytes: row.get::<i64, _>("total_bytes") as u64,
+            downloaded_bytes: row.get::<i64, _>("downloaded_bytes") as u64,
         })
     }
 
@@ -438,6 +504,9 @@ impl QueueManager {
     }
 
     /// Update a segment's state. Called after each article fetch attempt.
+    /// Does NOT refresh job-level aggregate counters — that's expensive
+    /// (3 queries) and should only be done when a file completes or the
+    /// job finishes. Use [`refresh_job_counts`] for that.
     pub async fn set_segment_state(
         &self,
         file_id: i64,
@@ -454,9 +523,6 @@ impl QueueManager {
         .execute(&self.pool)
         .await
         .map_err(|e| CoreError::Other(anyhow::anyhow!("set segment state: {e}")))?;
-
-        // Update aggregate counters on the job.
-        self.refresh_job_counts(file_id).await?;
 
         Ok(())
     }
@@ -496,7 +562,8 @@ impl QueueManager {
     }
 
     /// Recompute the aggregate counters on the job from segment states.
-    async fn refresh_job_counts(&self, file_id: i64) -> Result<()> {
+    /// Call this after a file completes, not after every single segment.
+    pub async fn refresh_job_counts(&self, file_id: i64) -> Result<()> {
         // Get the job_id for this file.
         let job_id: i64 = sqlx::query("SELECT job_id FROM files WHERE id = ?1")
             .bind(file_id)
@@ -535,13 +602,29 @@ impl QueueManager {
         .map_err(|e| CoreError::Other(anyhow::anyhow!("count files done: {e}")))?
         .get("cnt");
 
-        sqlx::query(r#"UPDATE jobs SET segments_done = ?1, files_done = ?2 WHERE id = ?3"#)
-            .bind(segments_done)
-            .bind(files_done)
-            .bind(job_id)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| CoreError::Other(anyhow::anyhow!("update counts: {e}")))?;
+        // Sum bytes of done segments for download speed/progress.
+        let downloaded_bytes: i64 = sqlx::query(
+            r#"SELECT COALESCE(SUM(s.bytes), 0) as cnt FROM segments s
+               JOIN files f ON s.file_id = f.id
+               WHERE f.job_id = ?1
+               AND s.state = 'done'"#,
+        )
+        .bind(job_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| CoreError::Other(anyhow::anyhow!("sum downloaded bytes: {e}")))?
+        .get("cnt");
+
+        sqlx::query(
+            r#"UPDATE jobs SET segments_done = ?1, files_done = ?2, downloaded_bytes = ?3 WHERE id = ?4"#,
+        )
+        .bind(segments_done)
+        .bind(files_done)
+        .bind(downloaded_bytes)
+        .bind(job_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CoreError::Other(anyhow::anyhow!("update counts: {e}")))?;
 
         Ok(())
     }
@@ -564,7 +647,7 @@ impl QueueManager {
     pub async fn next_queued_job(&self) -> Result<Option<QueueJob>> {
         let row = sqlx::query(
             r#"SELECT id, name, output_dir, state, priority, file_count, files_done,
-                      total_segments, segments_done
+                      total_segments, segments_done, total_bytes, downloaded_bytes
                FROM jobs WHERE state = 'queued'
                ORDER BY priority ASC, id ASC LIMIT 1"#,
         )
@@ -582,6 +665,8 @@ impl QueueManager {
             files_done: r.get::<i64, _>("files_done") as u32,
             total_segments: r.get::<i64, _>("total_segments") as u32,
             segments_done: r.get::<i64, _>("segments_done") as u32,
+            total_bytes: r.get::<i64, _>("total_bytes") as u64,
+            downloaded_bytes: r.get::<i64, _>("downloaded_bytes") as u64,
         }))
     }
 

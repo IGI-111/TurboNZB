@@ -119,6 +119,13 @@
             cargo-edit
             nixpkgs-fmt
           ];
+
+          # Expose the runtime libraries (GL/X11/Wayland/fontconfig) so
+          # `cargo run` inside `nix develop` can open a window on Linux
+          # without a wrapper.
+          shellHook = pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
+            export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath commonArgs.buildInputs}:$LD_LIBRARY_PATH"
+          '';
         });
 
         # Static checks that don't need to build the whole workspace.

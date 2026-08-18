@@ -267,7 +267,16 @@ impl ItemBuilder {
 }
 
 fn attr_to_string(v: &[u8]) -> String {
-    String::from_utf8_lossy(v).into_owned()
+    decode_xml_entities(&String::from_utf8_lossy(v))
+}
+
+/// Decode the common XML entities that appear in RSS attribute values.
+fn decode_xml_entities(s: &str) -> String {
+    s.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
 }
 
 fn attr_to_u16(v: &[u8]) -> u16 {
@@ -494,5 +503,37 @@ mod tests {
 
         assert!(parse_rfc2822("").is_none());
         assert!(parse_rfc2822("not a date").is_none());
+    }
+
+    /// Regression test: enclosure URLs from Newznab indexers often contain
+    /// `&amp;` entities (e.g. `?id=123&amp;r=abc`). These must be decoded
+    /// to `&` so the NZB fetch URL is correct.
+    #[test]
+    fn test_enclosure_url_decodes_xml_entities() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>example.com API</title>
+    <link>https://example.com/</link>
+    <description>API Results</description>
+    <newznab:response offset="0" total="1"/>
+    <item>
+      <title>Some.Release</title>
+      <guid>abc123</guid>
+      <pubDate>Sun, 06 Jun 2010 17:29:23 +0100</pubDate>
+      <category>TV</category>
+      <enclosure url="https://ninjacentral.co.za/getnzb/abc.nzb&amp;i=98803&amp;r=cb74f3798cdae4bea06c0cbfe33d3a22" length="1234567890" type="application/x-nzb"/>
+      <newznab:attr name="category" value="5000"/>
+      <newznab:attr name="size" value="1234567890"/>
+    </item>
+  </channel>
+</rss>"#;
+
+        let results = parse_search_results(xml, "test_indexer").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].nzb_url,
+            "https://ninjacentral.co.za/getnzb/abc.nzb&i=98803&r=cb74f3798cdae4bea06c0cbfe33d3a22"
+        );
     }
 }

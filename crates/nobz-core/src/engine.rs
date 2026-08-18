@@ -84,12 +84,24 @@ impl Engine {
             .await?;
 
         let job = queue.get_job(job_id).await?;
+        tracing::info!(
+            job_id,
+            output_dir = %job.output_dir.display(),
+            total_segments = job.total_segments,
+            segments_done = job.segments_done,
+            total_bytes = job.total_bytes,
+            "engine: starting job"
+        );
         tokio::fs::create_dir_all(&job.output_dir)
             .await
             .map_err(CoreError::from)?;
 
         // Get all files with pending segments.
         let pending = queue.pending_segments(job_id).await?;
+        tracing::info!(
+            pending_files = pending.len(),
+            "engine: pending segments loaded"
+        );
 
         let mut completed = 0usize;
         let mut failed = 0usize;
@@ -239,6 +251,13 @@ impl Engine {
         // Wait for every segment task.
         while let Some(res) = tasks.join_next().await {
             res.map_err(|e| CoreError::Other(anyhow::anyhow!("task panicked: {e}")))??;
+        }
+
+        // Refresh job-level aggregate counters now that all segments
+        // for this file are done. We skip this during per-segment updates
+        // to avoid 3 extra queries per segment.
+        if let Err(e) = queue.refresh_job_counts(file.id).await {
+            tracing::warn!(error = %e, "failed to refresh job counts");
         }
 
         // Assemble the file from per-segment part files.
