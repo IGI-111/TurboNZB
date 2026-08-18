@@ -24,8 +24,6 @@ pub enum JobState {
     Queued,
     /// Currently downloading.
     Downloading,
-    /// User-paused; will not auto-resume.
-    Paused,
     /// All files downloaded and assembled.
     Complete,
     /// Download failed irrecoverably.
@@ -37,7 +35,6 @@ impl JobState {
         match self {
             Self::Queued => "queued",
             Self::Downloading => "downloading",
-            Self::Paused => "paused",
             Self::Complete => "complete",
             Self::Failed => "failed",
         }
@@ -46,9 +43,10 @@ impl JobState {
     pub fn from_str_lossy(s: &str) -> Self {
         match s {
             "downloading" => Self::Downloading,
-            "paused" => Self::Paused,
             "complete" => Self::Complete,
             "failed" => Self::Failed,
+            // "paused" is legacy — treat as queued (engine pause now puts
+            // jobs back to queued instead of a separate paused state).
             _ => Self::Queued,
         }
     }
@@ -271,16 +269,22 @@ impl QueueManager {
     }
 
     /// Add a new job to the queue. Returns the job id.
+    ///
+    /// `display_name` overrides the job name (useful when the search
+    /// result has a better title than the NZB's internal metadata). If
+    /// None, falls back to the NZB's `<meta title>` or the first file's
+    /// filename.
     pub async fn add_job(
         &self,
         nzb: &Nzb,
         output_dir: impl Into<PathBuf>,
         priority: i64,
+        display_name: Option<&str>,
     ) -> Result<i64> {
         let output_dir = output_dir.into().to_string_lossy().to_string();
-        let name = nzb
-            .title()
+        let name = display_name
             .map(str::to_string)
+            .or_else(|| nzb.title().map(str::to_string))
             .or_else(|| nzb.files.first().map(|f| f.filename()))
             .unwrap_or_else(|| "nobz-download".into());
 
@@ -446,7 +450,7 @@ impl QueueManager {
     pub async fn claim_download_slot(&self, job_id: i64) -> Result<bool> {
         let result = sqlx::query(
             r#"UPDATE jobs SET state = 'downloading'
-               WHERE id = ?1 AND state IN ('queued', 'paused')"#,
+               WHERE id = ?1 AND state = 'queued'"#,
         )
         .bind(job_id)
         .execute(&self.pool)
@@ -481,11 +485,17 @@ impl QueueManager {
     /// startup to recover from an unclean shutdown (crash, force-quit,
     /// power loss). After this call, the download slot is guaranteed
     /// empty and `claim_download_slot` can be used to start the next job.
+    ///
+    /// Also migrates legacy 'paused' states to 'queued' — the Paused
+    /// job state was removed in favor of a global engine pause.
     pub async fn recover_interrupted(&self) -> Result<u64> {
-        let result = sqlx::query(r#"UPDATE jobs SET state = 'queued' WHERE state = 'downloading'"#)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| CoreError::Other(anyhow::anyhow!("recover interrupted: {e}")))?;
+        let result = sqlx::query(
+            r#"UPDATE jobs SET state = 'queued'
+               WHERE state IN ('downloading', 'paused')"#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CoreError::Other(anyhow::anyhow!("recover interrupted: {e}")))?;
         Ok(result.rows_affected())
     }
 
@@ -603,24 +613,109 @@ impl QueueManager {
         Ok(())
     }
 
+    /// Batch-update multiple segment states in a single transaction.
+    /// Each entry is (file_id, segment_number, state). Much faster than
+    /// calling `set_segment_state` individually — one transaction instead
+    /// of N implicit transactions (one fsync instead of N).
+    pub async fn set_segment_states_batch(
+        &self,
+        updates: &[(i64, u32, SegmentState)],
+    ) -> Result<()> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| CoreError::Other(anyhow::anyhow!("batch tx: {e}")))?;
+
+        for (file_id, segment_number, state) in updates {
+            sqlx::query(
+                r#"UPDATE segments SET state = ?1
+                   WHERE file_id = ?2 AND number = ?3"#,
+            )
+            .bind(state.as_str())
+            .bind(file_id)
+            .bind(*segment_number as i64)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| CoreError::Other(anyhow::anyhow!("batch update: {e}")))?;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| CoreError::Other(anyhow::anyhow!("batch commit: {e}")))?;
+
+        Ok(())
+    }
+
     /// Get all pending segments for a job (across all files), grouped by file.
     /// This is used by the engine to know what still needs downloading.
+    ///
+    /// Single SQL JOIN query — no N+1. Segments are filtered in SQL to
+    /// only `Pending` (non-missing), and grouped by file in Rust.
     pub async fn pending_segments(
         &self,
         job_id: i64,
     ) -> Result<Vec<(QueueFile, Vec<QueueSegment>)>> {
-        let files = self.list_files(job_id).await?;
-        let mut result = Vec::new();
-        for file in &files {
-            let segments = self.list_segments(file.id).await?;
-            let pending: Vec<QueueSegment> = segments
-                .into_iter()
-                .filter(|s| s.state == SegmentState::Pending && !s.missing)
-                .collect();
-            if !pending.is_empty() {
-                result.push((file.clone(), pending));
+        let rows = sqlx::query(
+            r#"SELECT f.id AS file_id, f.job_id, f.file_index, f.filename,
+                      f.subject, f.poster, f.date, f.segment_count,
+                      s.id AS seg_id, s.number, s.message_id, s.bytes,
+                      s.missing, s.state
+               FROM files f
+               JOIN segments s ON s.file_id = f.id
+               WHERE f.job_id = ?1
+                 AND s.state = 'pending'
+                 AND s.missing = 0
+               ORDER BY f.file_index ASC, s.number ASC"#,
+        )
+        .bind(job_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| CoreError::Other(anyhow::anyhow!("pending segments: {e}")))?;
+
+        // Group rows by file. Since rows are ordered by file_index, we can
+        // build the groups in a single pass.
+        let mut result: Vec<(QueueFile, Vec<QueueSegment>)> = Vec::new();
+        let mut current_file_id: Option<i64> = None;
+
+        for r in &rows {
+            let file_id: i64 = r.get("file_id");
+
+            if current_file_id != Some(file_id) {
+                // Start a new file group.
+                result.push((
+                    QueueFile {
+                        id: file_id,
+                        job_id: r.get("job_id"),
+                        file_index: r.get::<i64, _>("file_index") as u32,
+                        filename: r.get("filename"),
+                        subject: r.get("subject"),
+                        poster: r.get("poster"),
+                        date: r.get::<i64, _>("date") as u64,
+                        segment_count: r.get::<i64, _>("segment_count") as u32,
+                    },
+                    Vec::new(),
+                ));
+                current_file_id = Some(file_id);
             }
+
+            // Append the segment to the current file's group.
+            let seg = QueueSegment {
+                id: r.get("seg_id"),
+                file_id,
+                number: r.get::<i64, _>("number") as u32,
+                message_id: r.get("message_id"),
+                bytes: r.get::<i64, _>("bytes") as u64,
+                missing: r.get::<i64, _>("missing") != 0,
+                state: SegmentState::from_str_lossy(r.get("state")),
+            };
+            result.last_mut().unwrap().1.push(seg);
         }
+
         Ok(result)
     }
 
@@ -648,48 +743,31 @@ impl QueueManager {
             .map_err(|e| CoreError::Other(anyhow::anyhow!("get job_id: {e}")))?
             .get("job_id");
 
-        // Count done segments across the whole job.
-        let segments_done: i64 = sqlx::query(
-            r#"SELECT COUNT(*) as cnt FROM segments s
+        // Single query to compute all three aggregates at once.
+        let row = sqlx::query(
+            r#"SELECT
+                   SUM(CASE WHEN s.state IN ('done','missing','crc_mismatch','failed') THEN 1 ELSE 0 END) AS segs_done,
+                   (SELECT COUNT(*) FROM files f2
+                    WHERE f2.job_id = ?1
+                    AND NOT EXISTS (
+                        SELECT 1 FROM segments s2
+                        WHERE s2.file_id = f2.id
+                        AND s2.state = 'pending'
+                        AND s2.missing = 0
+                    )) AS files_done,
+                   COALESCE(SUM(CASE WHEN s.state = 'done' THEN s.bytes ELSE 0 END), 0) AS dl_bytes
+               FROM segments s
                JOIN files f ON s.file_id = f.id
-               WHERE f.job_id = ?1
-               AND s.state IN ('done', 'missing', 'crc_mismatch', 'failed')"#,
+               WHERE f.job_id = ?1"#,
         )
         .bind(job_id)
         .fetch_one(&self.pool)
         .await
-        .map_err(|e| CoreError::Other(anyhow::anyhow!("count segments: {e}")))?
-        .get("cnt");
+        .map_err(|e| CoreError::Other(anyhow::anyhow!("refresh job counts: {e}")))?;
 
-        // Count files where all segments are done/missing/etc.
-        let files_done: i64 = sqlx::query(
-            r#"SELECT COUNT(*) as cnt FROM files f
-               WHERE f.job_id = ?1
-               AND NOT EXISTS (
-                   SELECT 1 FROM segments s
-                   WHERE s.file_id = f.id
-                   AND s.state = 'pending'
-                   AND s.missing = 0
-               )"#,
-        )
-        .bind(job_id)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| CoreError::Other(anyhow::anyhow!("count files done: {e}")))?
-        .get("cnt");
-
-        // Sum bytes of done segments for download speed/progress.
-        let downloaded_bytes: i64 = sqlx::query(
-            r#"SELECT COALESCE(SUM(s.bytes), 0) as cnt FROM segments s
-               JOIN files f ON s.file_id = f.id
-               WHERE f.job_id = ?1
-               AND s.state = 'done'"#,
-        )
-        .bind(job_id)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| CoreError::Other(anyhow::anyhow!("sum downloaded bytes: {e}")))?
-        .get("cnt");
+        let segments_done: i64 = row.get("segs_done");
+        let files_done: i64 = row.get("files_done");
+        let downloaded_bytes: i64 = row.get("dl_bytes");
 
         sqlx::query(
             r#"UPDATE jobs SET segments_done = ?1, files_done = ?2, downloaded_bytes = ?3 WHERE id = ?4"#,
@@ -746,8 +824,56 @@ impl QueueManager {
         }))
     }
 
+    /// Per-file statistics for a job, computed in a single SQL query.
+    /// Used by the GUI to render the details pane without N+1 queries.
+    pub async fn job_file_stats(&self, job_id: i64) -> Result<Vec<JobFileStats>> {
+        let rows = sqlx::query(
+            r#"SELECT
+                   f.id AS file_id,
+                   f.filename,
+                   f.segment_count,
+                   COUNT(s.id) AS total_segs,
+                   SUM(CASE WHEN s.state != 'pending' THEN 1 ELSE 0 END) AS segs_done,
+                   SUM(CASE WHEN s.missing = 1 OR s.state = 'missing' THEN 1 ELSE 0 END) AS segs_missing,
+                   COALESCE(SUM(s.bytes), 0) AS total_bytes,
+                   COALESCE(SUM(CASE WHEN s.state = 'done' THEN s.bytes ELSE 0 END), 0) AS dl_bytes
+               FROM files f
+               LEFT JOIN segments s ON s.file_id = f.id
+               WHERE f.job_id = ?1
+               GROUP BY f.id
+               ORDER BY f.file_index ASC"#,
+        )
+        .bind(job_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| CoreError::Other(anyhow::anyhow!("job file stats: {e}")))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| JobFileStats {
+                filename: r.get("filename"),
+                segment_count: r.get::<i64, _>("segment_count") as u32,
+                segments_done: r.get::<i64, _>("segs_done") as u32,
+                segments_missing: r.get::<i64, _>("segs_missing") as u32,
+                total_bytes: r.get::<i64, _>("total_bytes") as u64,
+                downloaded_bytes: r.get::<i64, _>("dl_bytes") as u64,
+            })
+            .collect())
+    }
+
     /// Close the database pool.
     pub async fn close(self) {
         self.pool.close().await;
     }
+}
+
+/// Per-file statistics computed by a single SQL query (for the GUI).
+#[derive(Debug, Clone)]
+pub struct JobFileStats {
+    pub filename: String,
+    pub segment_count: u32,
+    pub segments_done: u32,
+    pub segments_missing: u32,
+    pub total_bytes: u64,
+    pub downloaded_bytes: u64,
 }

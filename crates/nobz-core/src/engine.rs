@@ -1,16 +1,23 @@
-//! Download engine: job scheduler that dispatches article fetches across a
-//! pool of NNTP connections, yEnc-decodes them, and assembles files on disk.
+//! Download engine: worker pool that fetches articles across persistent
+//! NNTP connections, yEnc-decodes them, and assembles files on disk.
 //!
-//! M3 scope: SQLite-backed resume. The engine loads pending segments from
-//! the queue DB, writes per-segment state after each fetch, and can resume
-//! a killed job at the article level. Server fallback tries servers in
-//! priority order; if all return 430/423, the segment is marked missing
-//! (hopeless) and not retried on restart.
+//! The engine maintains a pool of `max_connections` workers, each owning
+//! a persistent NNTP connection that's reused across articles (no per-
+//! article TLS handshake). All pending segments across all files are
+//! flattened into a single shared work queue; workers pop segments and
+//! fetch them continuously until the queue is empty. This keeps the
+//! download pipe full with no gaps between files.
+//!
+//! Resume safety: segment state is persisted to the queue DB after each
+//! article fetch. Only `Pending` segments are fetched; `Done`, `Missing`,
+//! `CrcMismatch`, and `Failed` are skipped. On restart, `reset_failed_segments`
+//! can be called to retry transient failures.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 
 use crate::error::{CoreError, Result};
@@ -48,21 +55,21 @@ pub enum ProgressEvent {
     },
 }
 
-/// The download engine. Owns the server pool and dispatches articles.
+/// The download engine. Owns the server list and concurrency limit.
 pub struct Engine {
     servers: Vec<ServerConfig>,
-    /// Concurrency limit across the whole engine.
-    semaphore: Arc<Semaphore>,
+    /// Concurrency limit = number of worker tasks.
+    max_connections: usize,
 }
 
 impl Engine {
-    /// Create an engine for a set of servers. `total_connections` caps the
-    /// number of simultaneous NNTP connections regardless of how many servers
-    /// are configured.
+    /// Create an engine for a set of servers. `total_connections` is the
+    /// number of worker tasks to spawn — each owns a persistent NNTP
+    /// connection that's reused across articles.
     pub fn new(servers: Vec<ServerConfig>, total_connections: usize) -> Self {
         Self {
             servers,
-            semaphore: Arc::new(Semaphore::new(total_connections)),
+            max_connections: total_connections,
         }
     }
 
@@ -78,7 +85,9 @@ impl Engine {
         job_id: i64,
         tx: mpsc::UnboundedSender<ProgressEvent>,
     ) -> Result<()> {
-        // Mark job as downloading.
+        // Ensure the job is in 'downloading' state. The caller should have
+        // already claimed the download slot via claim_download_slot, but
+        // we set it here too for standalone use (CLI, tests).
         queue
             .set_job_state(job_id, crate::queue::JobState::Downloading)
             .await?;
@@ -103,24 +112,140 @@ impl Engine {
             "engine: pending segments loaded"
         );
 
-        let mut completed = 0usize;
-        let mut failed = 0usize;
+        // Flatten all segments across all files into a single work queue.
+        // Each item is (file, segment) so the worker knows which file's
+        // parts directory to write to.
+        let work_queue: Arc<Mutex<VecDeque<(QueueFile, QueueSegment)>>> =
+            Arc::new(Mutex::new(VecDeque::new()));
+        let total_segments: usize = {
+            let mut wq = work_queue.lock().await;
+            let mut count = 0usize;
+            for (file, segments) in &pending {
+                let _ = tx.send(ProgressEvent::FileStarted {
+                    filename: file.filename.clone(),
+                    segments: segments.len() as u32,
+                });
+                for seg in segments {
+                    wq.push_back((file.clone(), seg.clone()));
+                    count += 1;
+                }
+            }
+            count
+        };
+        tracing::info!(total_segments, "engine: work queue populated");
 
-        for (file, segments) in &pending {
-            let _ = tx.send(ProgressEvent::FileStarted {
-                filename: file.filename.clone(),
-                segments: segments.len() as u32,
+        // Per-server connection pool. Workers check out a connection,
+        // use it, and return it. Broken connections are dropped.
+        let pool: Arc<ConnectionPool> = Arc::new(ConnectionPool::new(&self.servers));
+
+        // Shared counters for completed/failed files.
+        let completed = Arc::new(Mutex::new(0usize));
+        let failed = Arc::new(Mutex::new(0usize));
+
+        // Write-behind buffer: workers send segment state updates to this
+        // channel instead of writing to the DB individually. A batch
+        // writer task flushes them in a single transaction periodically,
+        // drastically reducing fsync contention.
+        let (state_tx, state_rx) = mpsc::unbounded_channel::<(i64, u32, SegmentState)>();
+
+        // Spawn the batch writer task.
+        let writer_queue = Arc::clone(&queue);
+        let writer = tokio::spawn(async move {
+            let mut rx = state_rx;
+            let mut buffer: Vec<(i64, u32, SegmentState)> = Vec::with_capacity(256);
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+            loop {
+                tokio::select! {
+                    // Drain all pending updates without blocking.
+                    Some(update) = rx.recv(), if !rx.is_closed() => {
+                        buffer.push(update);
+                        // Batch-drain: try to get more without blocking.
+                        while let Ok(update) = rx.try_recv() {
+                            buffer.push(update);
+                        }
+                        // Flush immediately if buffer is large.
+                        if buffer.len() >= 200 {
+                            flush_batch(&writer_queue, &mut buffer).await;
+                        }
+                    }
+                    _ = interval.tick() => {
+                        if !buffer.is_empty() {
+                            flush_batch(&writer_queue, &mut buffer).await;
+                        }
+                    }
+                }
+
+                // If the channel is closed and buffer is drained, exit.
+                if rx.is_closed() && buffer.is_empty() {
+                    break;
+                }
+            }
+            // Final flush.
+            if !buffer.is_empty() {
+                flush_batch(&writer_queue, &mut buffer).await;
+            }
+        });
+
+        // Spawn worker tasks.
+        let mut workers: JoinSet<Result<()>> = JoinSet::new();
+        for worker_id in 0..self.max_connections {
+            let engine = Arc::clone(&self);
+            let queue = Arc::clone(&queue);
+            let pool = Arc::clone(&pool);
+            let work_queue = Arc::clone(&work_queue);
+            let tx = tx.clone();
+            let state_tx = state_tx.clone();
+            let output_dir = job.output_dir.clone();
+            workers.spawn(async move {
+                engine
+                    .run_worker(
+                        worker_id,
+                        &queue,
+                        &pool,
+                        &work_queue,
+                        &output_dir,
+                        &tx,
+                        &state_tx,
+                    )
+                    .await
             });
+        }
 
-            let outcome = self
-                .download_file(&queue, file, segments, &job.output_dir, &tx)
-                .await;
+        // Wait for all workers to finish.
+        let mut worker_errors = 0usize;
+        while let Some(res) = workers.join_next().await {
+            match res {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::error!(error = %e, "worker error");
+                    worker_errors += 1;
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "worker panic");
+                    worker_errors += 1;
+                }
+            }
+        }
+        tracing::info!(worker_errors, "engine: all workers finished");
+
+        // Drop the last state_tx sender so the writer task's channel closes
+        // and it flushes any remaining buffered updates.
+        drop(state_tx);
+        writer.await.ok();
+
+        // Assemble all files now that all segments are downloaded.
+        let mut completed_count = 0usize;
+        let mut failed_count = 0usize;
+        for (file, _segments) in &pending {
+            let outcome = assemble_file(&queue, file, &job.output_dir, &tx).await;
             match outcome {
                 Ok(o) => {
                     if o.missing == 0 && o.crc_mismatches == 0 {
-                        completed += 1;
+                        completed_count += 1;
                     } else {
-                        failed += 1;
+                        failed_count += 1;
                     }
                     let _ = tx.send(ProgressEvent::FileCompleted {
                         filename: file.filename.clone(),
@@ -130,7 +255,7 @@ impl Engine {
                     });
                 }
                 Err(e) => {
-                    failed += 1;
+                    failed_count += 1;
                     let _ = tx.send(ProgressEvent::ArticleError {
                         filename: file.filename.clone(),
                         segment: 0,
@@ -140,186 +265,238 @@ impl Engine {
             }
         }
 
+        *completed.lock().await = completed_count;
+        *failed.lock().await = failed_count;
+
         // Determine final job state.
-        let final_state = if failed == 0 {
+        let final_state = if failed_count == 0 {
             crate::queue::JobState::Complete
         } else {
             crate::queue::JobState::Failed
         };
         queue.set_job_state(job_id, final_state).await?;
 
-        let _ = tx.send(ProgressEvent::JobFinished { completed, failed });
+        let _ = tx.send(ProgressEvent::JobFinished {
+            completed: completed_count,
+            failed: failed_count,
+        });
         Ok(())
     }
 
-    async fn download_file(
-        self: &Arc<Self>,
-        queue: &Arc<QueueManager>,
-        file: &QueueFile,
-        pending_segments: &[QueueSegment],
+    /// A worker loop: continuously pops segments from the shared queue
+    /// and fetches them using pooled connections until the queue is empty.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_worker(
+        &self,
+        worker_id: usize,
+        _queue: &Arc<QueueManager>,
+        pool: &Arc<ConnectionPool>,
+        work_queue: &Arc<Mutex<VecDeque<(QueueFile, QueueSegment)>>>,
         output_dir: &Path,
         tx: &mpsc::UnboundedSender<ProgressEvent>,
-    ) -> Result<FileOutcome> {
-        let filename = file.filename.clone();
-        let final_path = output_dir.join(&filename);
-        let parts_dir = output_dir.join(format!("{}.parts", filename));
+        state_tx: &mpsc::UnboundedSender<(i64, u32, SegmentState)>,
+    ) -> Result<()> {
+        let parts_dirs: Arc<Mutex<std::collections::HashMap<String, PathBuf>>> =
+            Arc::new(Mutex::new(std::collections::HashMap::new()));
 
-        // Create a temp dir for per-segment decoded bytes.
-        tokio::fs::create_dir_all(&parts_dir)
-            .await
-            .map_err(CoreError::from)?;
+        loop {
+            // Pop the next segment from the queue.
+            let (file, seg) = {
+                let mut wq = work_queue.lock().await;
+                match wq.pop_front() {
+                    Some(item) => item,
+                    None => break, // Queue empty — worker is done.
+                }
+            };
 
-        let mut tasks: JoinSet<Result<()>> = JoinSet::new();
+            tracing::trace!(
+                worker_id,
+                file = %file.filename,
+                segment = seg.number,
+                "worker: processing segment"
+            );
 
-        for seg in pending_segments {
-            let permit = self
-                .semaphore
-                .clone()
-                .acquire_owned()
-                .await
-                .map_err(|e| CoreError::Other(anyhow::anyhow!("semaphore closed: {e}")))?;
-            let servers = self.servers.clone();
-            let msg_id = seg.message_id.clone();
-            let seg_num = seg.number;
-            let file_id = file.id;
-            let queue = Arc::clone(queue);
-            let filename_clone = filename.clone();
-            let parts_dir = parts_dir.clone();
-            let tx = tx.clone();
-            tasks.spawn(async move {
-                let _permit = permit;
-                let fetch_result = fetch_with_fallback(&servers, &msg_id).await;
-                let state = match &fetch_result {
-                    Ok(body) => {
-                        match yenc::decode_article(body) {
-                            Ok(decoded) => {
-                                let seg_state = if decoded.crc_ok || decoded.crc_unknown {
-                                    SegmentState::Done
-                                } else {
-                                    SegmentState::CrcMismatch
-                                };
-                                // Write decoded bytes to a per-segment file
-                                // so they survive a restart.
-                                if seg_state == SegmentState::Done {
-                                    let part_path = parts_dir.join(format!("seg{seg_num:06}"));
-                                    tokio::fs::write(&part_path, &decoded.data)
-                                        .await
-                                        .map_err(CoreError::from)?;
-                                }
-                                seg_state
-                            }
-                            Err(e) => {
-                                let _ = tx.send(ProgressEvent::ArticleError {
-                                    filename: filename_clone.clone(),
-                                    segment: seg_num,
-                                    error: e.to_string(),
-                                });
-                                SegmentState::Failed
-                            }
+            // Ensure the parts directory exists for this file.
+            let parts_dir = {
+                let mut dirs = parts_dirs.lock().await;
+                if let Some(p) = dirs.get(&file.filename) {
+                    p.clone()
+                } else {
+                    let p = output_dir.join(format!("{}.parts", file.filename));
+                    tokio::fs::create_dir_all(&p)
+                        .await
+                        .map_err(CoreError::from)?;
+                    dirs.insert(file.filename.clone(), p.clone());
+                    p
+                }
+            };
+
+            // Fetch the article using the connection pool.
+            let fetch_result = pool_fetch_with_fallback(pool, &self.servers, &seg.message_id).await;
+
+            let state = match &fetch_result {
+                Ok(body) => match yenc::decode_article(body) {
+                    Ok(decoded) => {
+                        let seg_state = if decoded.crc_ok || decoded.crc_unknown {
+                            SegmentState::Done
+                        } else {
+                            SegmentState::CrcMismatch
+                        };
+                        if seg_state == SegmentState::Done {
+                            let part_path = parts_dir.join(format!("seg{:06}", seg.number));
+                            tokio::fs::write(&part_path, &decoded.data)
+                                .await
+                                .map_err(CoreError::from)?;
                         }
+                        seg_state
                     }
-                    Err(FetchError::Missing) => SegmentState::Missing,
-                    Err(FetchError::Other(e)) => {
+                    Err(e) => {
                         let _ = tx.send(ProgressEvent::ArticleError {
-                            filename: filename_clone.clone(),
-                            segment: seg_num,
+                            filename: file.filename.clone(),
+                            segment: seg.number,
                             error: e.to_string(),
                         });
                         SegmentState::Failed
                     }
-                };
-
-                // Persist the segment state to the queue DB.
-                if let Err(e) = queue.set_segment_state(file_id, seg_num, state).await {
-                    tracing::error!(error = %e, "failed to persist segment state");
+                },
+                Err(PoolFetchError::Missing) => SegmentState::Missing,
+                Err(PoolFetchError::Other(e)) => {
+                    let _ = tx.send(ProgressEvent::ArticleError {
+                        filename: file.filename.clone(),
+                        segment: seg.number,
+                        error: e.to_string(),
+                    });
+                    SegmentState::Failed
                 }
+            };
 
-                let bytes = match &fetch_result {
-                    Ok(b) => b.len() as u64,
-                    Err(_) => 0,
-                };
-                let _ = tx.send(ProgressEvent::SegmentDone {
-                    filename: filename_clone,
-                    segment: seg_num,
-                    status: state,
-                    bytes,
-                });
-                Ok(())
+            // Queue the segment state update for the batch writer (no
+            // individual DB write — the writer flushes periodically).
+            let _ = state_tx.send((file.id, seg.number, state));
+
+            let bytes = match &fetch_result {
+                Ok(b) => b.len() as u64,
+                Err(_) => 0,
+            };
+            let _ = tx.send(ProgressEvent::SegmentDone {
+                filename: file.filename.clone(),
+                segment: seg.number,
+                status: state,
+                bytes,
             });
         }
 
-        // Wait for every segment task.
-        while let Some(res) = tasks.join_next().await {
-            res.map_err(|e| CoreError::Other(anyhow::anyhow!("task panicked: {e}")))??;
+        tracing::info!(worker_id, "worker: queue empty, exiting");
+        Ok(())
+    }
+}
+
+/// Per-server connection pool. Each server has its own deque of idle
+/// connections. Workers check out a connection, use it, and return it.
+/// Broken connections are dropped (not returned to the pool).
+pub struct ConnectionPool {
+    /// One deque per server, indexed by server priority order.
+    servers: Vec<Mutex<VecDeque<NntpClient>>>,
+}
+
+impl ConnectionPool {
+    fn new(servers: &[ServerConfig]) -> Self {
+        let server_pools = servers
+            .iter()
+            .map(|_| Mutex::new(VecDeque::new()))
+            .collect();
+        Self {
+            servers: server_pools,
         }
+    }
 
-        // Refresh job-level aggregate counters now that all segments
-        // for this file are done. We skip this during per-segment updates
-        // to avoid 3 extra queries per segment.
-        if let Err(e) = queue.refresh_job_counts(file.id).await {
-            tracing::warn!(error = %e, "failed to refresh job counts");
-        }
-
-        // Assemble the file from per-segment part files.
-        let all_segments = queue.list_segments(file.id).await?;
-        let mut out = tokio::fs::File::create(&final_path)
-            .await
-            .map_err(CoreError::from)?;
-        use tokio::io::AsyncWriteExt;
-        let mut missing = 0u32;
-        let mut crc_mismatches = 0u32;
-
-        for n in 1..=file.segment_count {
-            let seg = all_segments.iter().find(|s| s.number == n);
-            match seg {
-                Some(s)
-                    if s.state == SegmentState::Done
-                        || (s.state == SegmentState::Pending && s.missing) =>
-                {
-                    if s.missing {
-                        missing += 1;
-                        continue;
-                    }
-                    // Read the decoded bytes from the part file.
-                    let part_path = parts_dir.join(format!("seg{n:06}"));
-                    match tokio::fs::read(&part_path).await {
-                        Ok(data) => {
-                            out.write_all(&data).await.map_err(CoreError::from)?;
-                        }
-                        Err(_) => {
-                            // Part file missing — segment was done in a
-                            // previous run but the part file was deleted.
-                            missing += 1;
-                        }
-                    }
-                }
-                Some(s) if s.state == SegmentState::Missing || s.missing => {
-                    missing += 1;
-                }
-                Some(s) if s.state == SegmentState::CrcMismatch => {
-                    crc_mismatches += 1;
-                }
-                Some(s) if s.state == SegmentState::Failed => {
-                    missing += 1;
-                }
-                _ => {
-                    missing += 1;
-                }
+    /// Get a connection from the pool for `server_idx`, or create a new
+    /// one if the pool is empty.
+    async fn get(&self, server_idx: usize, servers: &[ServerConfig]) -> Result<NntpClient> {
+        {
+            let mut pool = self.servers[server_idx].lock().await;
+            if let Some(conn) = pool.pop_front() {
+                return Ok(conn);
             }
         }
-        out.flush().await.map_err(CoreError::from)?;
-        drop(out);
+        // Pool empty — create a new connection.
+        NntpClient::connect(&servers[server_idx]).await
+    }
 
-        // Clean up parts dir if the file is complete (no holes).
-        if missing == 0 && crc_mismatches == 0 {
-            let _ = tokio::fs::remove_dir_all(&parts_dir).await;
+    /// Return a healthy connection to the pool for later reuse.
+    async fn put(&self, server_idx: usize, conn: NntpClient) {
+        let mut pool = self.servers[server_idx].lock().await;
+        pool.push_back(conn);
+    }
+}
+
+/// Error type for pool-aware fetch.
+#[derive(Debug)]
+enum PoolFetchError {
+    /// Article missing on all servers (430/423 from every server).
+    Missing,
+    Other(CoreError),
+}
+
+/// Fetch an article using the connection pool. Tries servers in priority
+/// order. Connections are reused across calls — no per-article TLS handshake.
+///
+/// On success, the connection is returned to the pool. On connection
+/// error, the connection is dropped (not returned) so the next fetch
+/// creates a fresh one.
+async fn pool_fetch_with_fallback(
+    pool: &Arc<ConnectionPool>,
+    servers: &[ServerConfig],
+    message_id: &str,
+) -> std::result::Result<Vec<u8>, PoolFetchError> {
+    let mut all_missing = true;
+    let mut last_error: Option<CoreError> = None;
+
+    for (idx, _server) in servers.iter().enumerate() {
+        // Get a connection (from pool or create new).
+        let mut client = match pool.get(idx, servers).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(server_idx = idx, error = %e, "connect failed; trying next");
+                last_error = Some(e);
+                all_missing = false;
+                continue;
+            }
+        };
+
+        match client.body(message_id).await {
+            Ok(Ok(body)) => {
+                // Success — return connection to pool for reuse.
+                pool.put(idx, client).await;
+                return Ok(body.bytes);
+            }
+            Ok(Err(StatResult::Missing)) => {
+                // Article not on this server — return connection, try next.
+                pool.put(idx, client).await;
+                continue;
+            }
+            Ok(Err(StatResult::Present)) => {
+                // BODY never returns Present; protocol oddity. Return conn.
+                pool.put(idx, client).await;
+                continue;
+            }
+            Err(e) => {
+                // Connection error — drop the connection (don't return to
+                // pool). The next fetch will create a fresh one.
+                tracing::warn!(server_idx = idx, error = %e, "BODY error; dropping connection");
+                last_error = Some(e);
+                all_missing = false;
+                continue;
+            }
         }
+    }
 
-        Ok(FileOutcome {
-            path: final_path,
-            missing,
-            crc_mismatches,
-        })
+    if all_missing {
+        Err(PoolFetchError::Missing)
+    } else {
+        Err(PoolFetchError::Other(last_error.unwrap_or_else(|| {
+            CoreError::Nntp(format!("no server could fetch {message_id}"))
+        })))
     }
 }
 
@@ -330,58 +507,94 @@ struct FileOutcome {
     crc_mismatches: u32,
 }
 
-#[derive(Debug)]
-enum FetchError {
-    /// Article missing on all servers (430/423 from every server).
-    Missing,
-    Other(CoreError),
-}
+/// Assemble a file from per-segment part files. Reads all segments from
+/// the DB, concatenates the done parts in order, and writes the final
+/// file. Also calls `refresh_job_counts` to update aggregate counters.
+async fn assemble_file(
+    queue: &Arc<QueueManager>,
+    file: &QueueFile,
+    output_dir: &Path,
+    _tx: &mpsc::UnboundedSender<ProgressEvent>,
+) -> Result<FileOutcome> {
+    // Refresh job-level aggregate counters now that all segments for this
+    // file are done.
+    if let Err(e) = queue.refresh_job_counts(file.id).await {
+        tracing::warn!(error = %e, "failed to refresh job counts");
+    }
 
-/// Try each server in priority order until one returns the article body, or
-/// all report it missing. If all servers return 430/423, the segment is
-/// hopeless and [`FetchError::Missing`] is returned — the engine marks it
-/// as `SegmentState::Missing` so it won't be retried on restart.
-async fn fetch_with_fallback(
-    servers: &[ServerConfig],
-    message_id: &str,
-) -> std::result::Result<Vec<u8>, FetchError> {
-    let mut all_missing = true;
-    let mut last_error: Option<CoreError> = None;
+    let filename = file.filename.clone();
+    let final_path = output_dir.join(&filename);
+    let parts_dir = output_dir.join(format!("{}.parts", filename));
 
-    for server in servers {
-        let mut client = match NntpClient::connect(server).await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(server = %server.host, error = %e, "connect failed; trying next");
-                last_error = Some(e);
-                all_missing = false; // connection error ≠ missing article
-                continue;
+    let all_segments = queue.list_segments(file.id).await?;
+    let mut out = tokio::fs::File::create(&final_path)
+        .await
+        .map_err(CoreError::from)?;
+    use tokio::io::AsyncWriteExt;
+    let mut missing = 0u32;
+    let mut crc_mismatches = 0u32;
+
+    for n in 1..=file.segment_count {
+        let seg = all_segments.iter().find(|s| s.number == n);
+        match seg {
+            Some(s)
+                if s.state == SegmentState::Done
+                    || (s.state == SegmentState::Pending && s.missing) =>
+            {
+                if s.missing {
+                    missing += 1;
+                    continue;
+                }
+                let part_path = parts_dir.join(format!("seg{n:06}"));
+                match tokio::fs::read(&part_path).await {
+                    Ok(data) => {
+                        out.write_all(&data).await.map_err(CoreError::from)?;
+                    }
+                    Err(_) => {
+                        missing += 1;
+                    }
+                }
             }
-        };
-        match client.body(message_id).await {
-            Ok(Ok(body)) => return Ok(body.bytes),
-            Ok(Err(StatResult::Missing)) => {
-                // 430/423 — article not on this server, try next.
-                continue;
+            Some(s) if s.state == SegmentState::Missing || s.missing => {
+                missing += 1;
             }
-            Ok(Err(StatResult::Present)) => {
-                // BODY never returns Present; treat as a protocol error.
-                continue;
+            Some(s) if s.state == SegmentState::CrcMismatch => {
+                crc_mismatches += 1;
             }
-            Err(e) => {
-                tracing::warn!(server = %server.host, error = %e, "BODY error; trying next");
-                last_error = Some(e);
-                all_missing = false;
-                continue;
+            Some(s) if s.state == SegmentState::Failed => {
+                missing += 1;
+            }
+            _ => {
+                missing += 1;
             }
         }
     }
+    out.flush().await.map_err(CoreError::from)?;
+    drop(out);
 
-    if all_missing {
-        Err(FetchError::Missing)
-    } else {
-        Err(FetchError::Other(last_error.unwrap_or_else(|| {
-            CoreError::Nntp(format!("no server could fetch {message_id}"))
-        })))
+    // Clean up parts dir if the file is complete (no holes).
+    if missing == 0 && crc_mismatches == 0 {
+        let _ = tokio::fs::remove_dir_all(&parts_dir).await;
     }
+
+    Ok(FileOutcome {
+        path: final_path,
+        missing,
+        crc_mismatches,
+    })
 }
+
+/// Flush buffered segment state updates in a single DB transaction.
+async fn flush_batch(queue: &Arc<QueueManager>, buffer: &mut Vec<(i64, u32, SegmentState)>) {
+    if buffer.is_empty() {
+        return;
+    }
+    tracing::trace!(count = buffer.len(), "flushing segment state batch");
+    if let Err(e) = queue.set_segment_states_batch(buffer).await {
+        tracing::error!(error = %e, "batch segment state write failed");
+    }
+    buffer.clear();
+}
+
+// Re-export mpsc for the public API.
+pub use tokio::sync::mpsc;

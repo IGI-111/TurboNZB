@@ -19,4 +19,6 @@ pub mod yenc;
 
 pub use error::{CoreError, Result};
 pub use postprocess::{PostProcessConfig, PostProcessReport, PostProcessStatus};
-pub use queue::{JobState, QueueFile, QueueJob, QueueManager, QueueSegment, SegmentState};
+pub use queue::{
+    JobFileStats, JobState, QueueFile, QueueJob, QueueManager, QueueSegment, SegmentState,
+};

@@ -7,6 +7,7 @@ use nobz_index::types::SearchQuery;
 
 use crate::backend::{BackendCmd, BackendEvent, BackendHandle};
 use crate::settings::AppConfig;
+use crate::theme::Icons;
 
 /// State for the search tab.
 #[derive(Debug, Clone)]
@@ -121,7 +122,13 @@ impl SearchState {
 }
 
 /// Render the search tab.
-pub fn ui(ui: &mut egui::Ui, state: &mut SearchState, backend: &BackendHandle, config: &AppConfig) {
+pub fn ui(
+    ui: &mut egui::Ui,
+    state: &mut SearchState,
+    backend: &BackendHandle,
+    config: &AppConfig,
+    icons: Option<&Icons>,
+) {
     // Search bar
     ui.horizontal(|ui| {
         ui.label("Search:");
@@ -247,27 +254,56 @@ pub fn ui(ui: &mut egui::Ui, state: &mut SearchState, backend: &BackendHandle, c
                         ui.label(format_age(result.result.post_date));
                     });
                     row.col(|ui| {
-                        let btn = if already_downloaded {
-                            egui::Button::new("Queued")
+                        if let Some(icons) = icons {
+                            let img = egui::Image::from_texture(&icons.download)
+                                .fit_to_exact_size(egui::vec2(16.0, 16.0));
+                            let btn = egui::Button::image(img).small();
+                            if ui
+                                .add_enabled(!already_downloaded, btn)
+                                .on_hover_text(if already_downloaded {
+                                    "Already queued"
+                                } else {
+                                    "Download"
+                                })
+                                .clicked()
+                            {
+                                let url = result.result.nzb_url.clone();
+                                let title = result.result.title.clone();
+                                let category = if state.category == "All" {
+                                    None
+                                } else {
+                                    Some(state.category.clone())
+                                };
+                                let download_dir = config.download_dir.clone();
+                                backend.send(BackendCmd::DownloadFromUrl {
+                                    url,
+                                    title,
+                                    download_dir,
+                                    category,
+                                });
+                                state.downloaded.insert(i);
+                            }
                         } else {
-                            egui::Button::new("Download")
-                        };
-                        if ui.add_enabled(!already_downloaded, btn).clicked() {
-                            let url = result.result.nzb_url.clone();
-                            let title = result.result.title.clone();
-                            let category = if state.category == "All" {
-                                None
-                            } else {
-                                Some(state.category.clone())
-                            };
-                            let download_dir = config.download_dir.clone();
-                            backend.send(BackendCmd::DownloadFromUrl {
-                                url,
-                                title,
-                                download_dir,
-                                category,
-                            });
-                            state.downloaded.insert(i);
+                            if ui
+                                .add_enabled(!already_downloaded, egui::Button::new("Download"))
+                                .clicked()
+                            {
+                                let url = result.result.nzb_url.clone();
+                                let title = result.result.title.clone();
+                                let category = if state.category == "All" {
+                                    None
+                                } else {
+                                    Some(state.category.clone())
+                                };
+                                let download_dir = config.download_dir.clone();
+                                backend.send(BackendCmd::DownloadFromUrl {
+                                    url,
+                                    title,
+                                    download_dir,
+                                    category,
+                                });
+                                state.downloaded.insert(i);
+                            }
                         }
                     });
                 });
@@ -284,9 +320,9 @@ fn sort_button(ui: &mut egui::Ui, sort: &mut SortState, col: SortColumn, label: 
     let is_active = sort.col == col;
     let arrow = if is_active {
         if sort.asc {
-            " \u{25B2}" // ▲
+            " ^" // ascending
         } else {
-            " \u{25BC}" // ▼
+            " v" // descending
         }
     } else {
         ""

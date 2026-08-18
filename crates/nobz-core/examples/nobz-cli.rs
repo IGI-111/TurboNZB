@@ -184,7 +184,7 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
 
-            let job_id = queue.add_job(&nzb, &out, 0).await?;
+            let job_id = queue.add_job(&nzb, &out, 0, None).await?;
             println!("Job {job_id} added to queue.");
 
             let cfg = ServerConfig {
@@ -374,9 +374,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Pause { job } => {
             queue
-                .set_job_state(job, nobz_core::queue::JobState::Paused)
+                .set_job_state(job, nobz_core::queue::JobState::Queued)
                 .await?;
-            println!("Job {job} paused.");
+            println!("Job {job} paused (set back to queued).");
         }
         Command::Delete { job } => {
             queue.delete_job(job).await?;

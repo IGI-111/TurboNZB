@@ -52,8 +52,6 @@ pub struct NobzApp {
     queue: QueueState,
     settings: SettingsState,
     icons: Option<Icons>,
-    /// Transient error/status messages shown at the bottom.
-    toasts: Vec<String>,
 }
 
 impl NobzApp {
@@ -90,15 +88,12 @@ impl NobzApp {
             queue: QueueState::default(),
             settings: SettingsState::default(),
             icons: Some(icons),
-            toasts: Vec::new(),
         }
     }
 
     fn save_config(&mut self) {
         if let Err(e) = self.config.save(&self.config_path) {
-            self.toasts.push(format!("Failed to save settings: {e}"));
-        } else {
-            self.toasts.push("Settings saved.".into());
+            tracing::error!("Failed to save settings: {e}");
         }
         // Push updated config to the backend.
         self.backend.send(backend::BackendCmd::SetConfig(Box::new(
@@ -117,11 +112,10 @@ impl NobzApp {
         for ev in &events {
             match ev {
                 BackendEvent::Error(msg) => {
-                    self.toasts.push(msg.clone());
+                    tracing::warn!("{msg}");
                 }
                 BackendEvent::PostProcessFailed { job_id, error } => {
-                    self.toasts
-                        .push(format!("Post-process failed (job {job_id:?}): {error}"));
+                    tracing::warn!("Post-process failed (job {job_id:?}): {error}");
                 }
                 _ => {}
             }
@@ -183,14 +177,14 @@ impl eframe::App for NobzApp {
 
         // Top tab bar with icons.
         let search_icon = self.icons.as_ref().map(|i| &i.search);
-        let folder_icon = self.icons.as_ref().map(|i| &i.folder_open);
+        let queue_icon = self.icons.as_ref().map(|i| &i.file_transfer);
         let settings_icon = self.icons.as_ref().map(|i| &i.settings);
         egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if Self::tab_button(ui, search_icon, "Search", self.tab == Tab::Search) {
                     self.tab = Tab::Search;
                 }
-                if Self::tab_button(ui, folder_icon, "Queue", self.tab == Tab::Queue) {
+                if Self::tab_button(ui, queue_icon, "Queue", self.tab == Tab::Queue) {
                     self.tab = Tab::Queue;
                 }
                 if Self::tab_button(ui, settings_icon, "Settings", self.tab == Tab::Settings) {
@@ -199,29 +193,19 @@ impl eframe::App for NobzApp {
             });
         });
 
-        // Bottom status bar for toasts.
-        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                if self.toasts.is_empty() {
-                    ui.label("Ready.");
-                } else {
-                    // Show the most recent toast.
-                    ui.label(&self.toasts[self.toasts.len() - 1]);
-                }
-            });
-            // Decay toasts.
-            if !self.toasts.is_empty() {
-                self.toasts.remove(0);
-            }
-        });
-
         // Main content.
         egui::CentralPanel::default().show(ctx, |ui| match self.tab {
             Tab::Search => {
-                search_tab::ui(ui, &mut self.search, &self.backend, &self.config);
+                search_tab::ui(
+                    ui,
+                    &mut self.search,
+                    &self.backend,
+                    &self.config,
+                    self.icons.as_ref(),
+                );
             }
             Tab::Queue => {
-                queue_tab::ui(ui, &mut self.queue, &self.backend);
+                queue_tab::ui(ui, &mut self.queue, &self.backend, self.icons.as_ref());
             }
             Tab::Settings => {
                 if settings_tab::ui(ui, &mut self.settings, &mut self.config, &self.backend) {
@@ -245,8 +229,8 @@ pub fn run() -> Result<()> {
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1100.0, 700.0])
-            .with_min_inner_size([700.0, 400.0]),
+            .with_inner_size([1400.0, 900.0])
+            .with_min_inner_size([800.0, 500.0]),
         ..Default::default()
     };
 

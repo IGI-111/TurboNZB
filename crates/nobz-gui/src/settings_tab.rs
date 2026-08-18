@@ -76,19 +76,23 @@ pub fn ui(
             ui.group(|ui| {
                 ui.horizontal(|ui| {
                     ui.label("Host:");
-                    ui.text_edit_singleline(&mut server.host);
+                    ui.add(egui::TextEdit::singleline(&mut server.host).desired_width(160.0));
                     ui.label("Port:");
                     ui.add(egui::DragValue::new(&mut server.port).range(1..=65535));
                     ui.checkbox(&mut server.tls, "TLS");
+                });
+                ui.horizontal(|ui| {
                     let mut user = server.user.clone().unwrap_or_default();
                     ui.label("User:");
-                    ui.text_edit_singleline(&mut user);
+                    ui.add(egui::TextEdit::singleline(&mut user).desired_width(120.0));
                     server.user = if user.is_empty() { None } else { Some(user) };
                     let mut pass = server.password.clone().unwrap_or_default();
                     ui.label("Pass:");
-                    ui.text_edit_singleline(&mut pass);
+                    ui.add(egui::TextEdit::singleline(&mut pass).desired_width(120.0));
                     server.password = if pass.is_empty() { None } else { Some(pass) };
-                    ui.label("Conn:");
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Connections:");
                     ui.add(egui::DragValue::new(&mut server.max_connections).range(1..=100));
                     ui.label("Priority:");
                     ui.add(egui::DragValue::new(&mut server.priority).range(0..=100));
@@ -173,13 +177,17 @@ pub fn ui(
             ui.group(|ui| {
                 ui.horizontal(|ui| {
                     ui.label("Name:");
-                    ui.text_edit_singleline(&mut indexer.name);
-                    ui.label("URL:");
-                    ui.text_edit_singleline(&mut indexer.url);
-                    ui.label("API Key:");
-                    ui.text_edit_singleline(&mut indexer.api_key);
+                    ui.add(egui::TextEdit::singleline(&mut indexer.name).desired_width(120.0));
                     ui.label("Priority:");
                     ui.add(egui::DragValue::new(&mut indexer.priority).range(0..=100));
+                });
+                ui.horizontal(|ui| {
+                    ui.label("URL:");
+                    ui.add(egui::TextEdit::singleline(&mut indexer.url).desired_width(240.0));
+                });
+                ui.horizontal(|ui| {
+                    ui.label("API Key:");
+                    ui.add(egui::TextEdit::singleline(&mut indexer.api_key).desired_width(200.0));
                     if ui.button("Test").clicked() {
                         backend.send(BackendCmd::TestIndexer {
                             config: indexer.clone(),

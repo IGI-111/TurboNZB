@@ -145,7 +145,7 @@ async fn end_to_end_download_and_assemble() {
     let tmp = tempfile_dir();
 
     let queue = Arc::new(QueueManager::open_in_memory().await.unwrap());
-    let job_id = queue.add_job(&nzb, &tmp, 0).await.unwrap();
+    let job_id = queue.add_job(&nzb, &tmp, 0, None).await.unwrap();
 
     let mut cfg = ServerConfig::localhost();
     cfg.port = addr.port();
@@ -198,7 +198,7 @@ async fn missing_segment_is_reported_not_fatal() {
     let tmp = tempfile_dir();
 
     let queue = Arc::new(QueueManager::open_in_memory().await.unwrap());
-    let job_id = queue.add_job(&nzb, &tmp, 0).await.unwrap();
+    let job_id = queue.add_job(&nzb, &tmp, 0, None).await.unwrap();
 
     let mut cfg = ServerConfig::localhost();
     cfg.port = addr.port();
@@ -250,7 +250,7 @@ async fn resume_after_partial_download() {
     let tmp = tempfile_dir();
 
     let queue = Arc::new(QueueManager::open_in_memory().await.unwrap());
-    let job_id = queue.add_job(&nzb, &tmp, 0).await.unwrap();
+    let job_id = queue.add_job(&nzb, &tmp, 0, None).await.unwrap();
 
     let mut cfg1 = ServerConfig::localhost();
     cfg1.port = addr1.port();

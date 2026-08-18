@@ -40,6 +40,7 @@ pub struct Icons {
     pub tick: TextureHandle,
     pub computer: TextureHandle,
     pub network: TextureHandle,
+    pub file_transfer: TextureHandle,
 }
 
 impl Icons {
@@ -56,6 +57,7 @@ impl Icons {
             tick: load_icon(ctx, "Tick_16x16_4.png"),
             computer: load_icon(ctx, "Computer_16x16_4.png"),
             network: load_icon(ctx, "Network_32x32_4.png"),
+            file_transfer: load_icon(ctx, "FileTransfer_32x32_4.png"),
         }
     }
 }
@@ -86,12 +88,41 @@ fn include_bytes_concat(filename: &str) -> &'static [u8] {
         "Tick_16x16_4.png" => include_bytes!("../icons/Tick_16x16_4.png"),
         "Computer_16x16_4.png" => include_bytes!("../icons/Computer_16x16_4.png"),
         "Network_32x32_4.png" => include_bytes!("../icons/Network_32x32_4.png"),
+        "FileTransfer_32x32_4.png" => include_bytes!("../icons/FileTransfer_32x32_4.png"),
         _ => panic!("unknown icon: {filename}"),
     }
 }
 
 /// Apply the Win95 theme to the egui context.
 pub fn apply_theme(ctx: &Context) {
+    // --- Font setup: W95FA as the primary font ---
+    // W95FA is a free re-creation of MS Sans Serif (the Win95 system font).
+    // We install it as the Proportional and Button family, keeping the
+    // default fonts as fallbacks for glyphs W95FA doesn't cover (emoji,
+    // CJK, etc.).
+    {
+        let mut fonts = egui::FontDefinitions::default();
+        fonts.font_data.insert(
+            "W95FA".to_owned(),
+            egui::FontData::from_static(include_bytes!("../fonts/W95FA.otf")),
+        );
+        // Put W95FA first in the Proportional family so it takes priority,
+        // with Ubuntu-Light as fallback for missing glyphs.
+        fonts
+            .families
+            .entry(egui::FontFamily::Proportional)
+            .or_default()
+            .insert(0, "W95FA".to_owned());
+        // Use W95FA for monospace too (Win95 didn't distinguish, but
+        // keep Hack as fallback for code blocks).
+        fonts
+            .families
+            .entry(egui::FontFamily::Monospace)
+            .or_default()
+            .insert(0, "W95FA".to_owned());
+        ctx.set_fonts(fonts);
+    }
+
     // Start from egui's built-in light visuals, then customize.
     let mut visuals = egui::Visuals::light();
 

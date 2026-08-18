@@ -16,6 +16,7 @@ use nobz_core::PostProcessReport;
 use nobz_core::queue::{JobState, QueueJob};
 
 use crate::backend::{BackendCmd, BackendEvent, BackendHandle, JobFileDetail};
+use crate::theme::Icons;
 
 /// State for the queue tab.
 #[derive(Debug, Clone, Default)]
@@ -31,12 +32,16 @@ pub struct QueueState {
     pub current_total: u64,
     /// Job id of the currently-downloading job (None when idle).
     pub current_job_id: Option<i64>,
+    /// Whether the download engine is paused (global Play/Pause).
+    pub engine_paused: bool,
     /// Currently selected job (clicked row).
     pub selected_job: Option<i64>,
     /// Per-file details for the selected job.
     pub job_details: Vec<JobFileDetail>,
     /// Post-process reports keyed by job id.
     pub pp_reports: Vec<(Option<i64>, PostProcessReport)>,
+    /// Jobs currently being post-processed (show "Verifying..." status).
+    pub pp_in_progress: std::collections::HashSet<i64>,
 }
 
 impl QueueState {
@@ -82,8 +87,17 @@ impl QueueState {
                         self.job_details = files.clone();
                     }
                 }
+                BackendEvent::PostProcessStarted { job_id } => {
+                    self.pp_in_progress.insert(*job_id);
+                }
                 BackendEvent::PostProcessDone { job_id, report } => {
+                    if let Some(id) = job_id {
+                        self.pp_in_progress.remove(id);
+                    }
                     self.pp_reports.push((*job_id, report.clone()));
+                }
+                BackendEvent::EnginePaused(paused) => {
+                    self.engine_paused = *paused;
                 }
                 _ => {}
             }
@@ -109,13 +123,26 @@ impl QueueState {
 }
 
 /// Render the queue tab (three-pane layout).
-pub fn ui(ui: &mut egui::Ui, state: &mut QueueState, backend: &BackendHandle) {
-    // Top: toolbar
+pub fn ui(
+    ui: &mut egui::Ui,
+    state: &mut QueueState,
+    backend: &BackendHandle,
+    _icons: Option<&Icons>,
+) {
+    // Top: toolbar with global Play/Pause.
     ui.horizontal(|ui| {
-        if ui.button("Refresh").clicked() {
-            backend.send(BackendCmd::RefreshJobs);
+        // Global Play/Pause — always visible. Controls the download engine.
+        // Play = resume engine (start next queued job).
+        // Pause = stop engine (cancel active download, job goes back to queued).
+        if state.engine_paused {
+            if icon_button(ui, IconKind::Play, true, "Start downloads").clicked() {
+                backend.send(BackendCmd::ResumeEngine);
+            }
+        } else {
+            if icon_button(ui, IconKind::Pause, true, "Pause downloads").clicked() {
+                backend.send(BackendCmd::PauseEngine);
+            }
         }
-        ui.label(format!("{} jobs", state.jobs.len()));
     });
 
     ui.separator();
@@ -159,19 +186,19 @@ pub fn ui(ui: &mut egui::Ui, state: &mut QueueState, backend: &BackendHandle) {
 
 /// Top pane: table of all jobs with clickable rows.
 fn job_list_pane(ui: &mut egui::Ui, state: &mut QueueState, backend: &BackendHandle) {
-    // Name width = available - (ID + State + Progress + Actions) - padding
-    let id_w = 30.0;
+    // Name width = available - (State + Progress + Actions) - padding
     let state_w = 80.0;
     let progress_w = 220.0;
-    let actions_w = 120.0;
-    let name_width =
-        (ui.available_width() - id_w - state_w - progress_w - actions_w - 16.0).max(100.0);
+    let actions_w = 78.0; // 3 icon buttons: up, down, delete
+    let name_width = (ui.available_width() - state_w - progress_w - actions_w - 16.0).max(100.0);
 
+    let avail_h = ui.available_height();
     let table = TableBuilder::new(ui)
         .striped(true)
         .resizable(true)
         .auto_shrink(false)
-        .column(Column::exact(id_w)) // ID
+        .vscroll(true)
+        .min_scrolled_height(avail_h)
         .column(Column::exact(name_width).clip(true)) // Name (stretches)
         .column(Column::exact(state_w)) // State
         .column(Column::exact(progress_w)) // Progress
@@ -179,7 +206,7 @@ fn job_list_pane(ui: &mut egui::Ui, state: &mut QueueState, backend: &BackendHan
 
     table
         .header(20.0, |mut header| {
-            for label in ["ID", "Name", "State", "Progress", "Actions"] {
+            for label in ["Name", "State", "Progress", ""] {
                 header.col(|ui| {
                     ui.strong(label);
                 });
@@ -189,21 +216,23 @@ fn job_list_pane(ui: &mut egui::Ui, state: &mut QueueState, backend: &BackendHan
             let jobs = state.jobs.clone();
             let selected = state.selected_job;
             let current_job_id = state.current_job_id;
-            for job in &jobs {
+            let job_count = jobs.len();
+            for (row_idx, job) in jobs.iter().enumerate() {
                 let is_selected = selected == Some(job.id);
                 let row_height = 28.0;
                 body.row(row_height, |mut row| {
-                    row.col(|ui| {
-                        ui.label(job.id.to_string());
-                    });
                     row.col(|ui| {
                         if ui.selectable_label(is_selected, &job.name).clicked() {
                             state.select_job(job.id, backend);
                         }
                     });
                     row.col(|ui| {
-                        let (color, text) = state_color(&job.state);
-                        ui.colored_label(color, text);
+                        if state.pp_in_progress.contains(&job.id) {
+                            ui.colored_label(Color32::from_rgb(80, 180, 80), "Verifying...");
+                        } else {
+                            let (color, text) = state_color(&job.state);
+                            ui.colored_label(color, text);
+                        }
                     });
                     row.col(|ui| {
                         // Use live downloaded bytes for the active job,
@@ -244,23 +273,18 @@ fn job_list_pane(ui: &mut egui::Ui, state: &mut QueueState, backend: &BackendHan
                     });
                     row.col(|ui| {
                         ui.horizontal(|ui| {
-                            let can_resume =
-                                matches!(job.state, JobState::Paused | JobState::Failed);
-                            let can_pause =
-                                matches!(job.state, JobState::Queued | JobState::Downloading);
-                            if ui
-                                .add_enabled(can_resume, egui::Button::new("Resume"))
+                            // Up button — disabled for first row.
+                            if icon_button(ui, IconKind::Up, row_idx > 0, "Move up").clicked() {
+                                backend.send(BackendCmd::MoveJobUp { job_id: job.id });
+                            }
+                            // Down button — disabled for last row.
+                            if icon_button(ui, IconKind::Down, row_idx < job_count - 1, "Move down")
                                 .clicked()
                             {
-                                backend.send(BackendCmd::ResumeJob { job_id: job.id });
+                                backend.send(BackendCmd::MoveJobDown { job_id: job.id });
                             }
-                            if ui
-                                .add_enabled(can_pause, egui::Button::new("Pause"))
-                                .clicked()
-                            {
-                                backend.send(BackendCmd::PauseJob { job_id: job.id });
-                            }
-                            if ui.button("Delete").clicked() {
+                            // Delete button.
+                            if icon_button(ui, IconKind::Delete, true, "Delete").clicked() {
                                 backend.send(BackendCmd::DeleteJob { job_id: job.id });
                                 if selected == Some(job.id) {
                                     state.clear_selection(backend);
@@ -275,9 +299,6 @@ fn job_list_pane(ui: &mut egui::Ui, state: &mut QueueState, backend: &BackendHan
 
 /// Middle pane: speed graph for the currently-downloading job.
 fn speed_graph_pane(ui: &mut egui::Ui, state: &QueueState) {
-    ui.heading("Speed");
-    ui.separator();
-
     let available = ui.available_size();
     let (rect, _) = ui.allocate_at_least(available, egui::Sense::hover());
     let painter = ui.painter_at(rect);
@@ -416,8 +437,15 @@ fn details_pane(ui: &mut egui::Ui, state: &QueueState) {
         )));
     }
 
-    // Post-process status
-    if let Some((_, report)) = state
+    // Post-process status: show "Verifying..." if in progress, otherwise
+    // show the report summary.
+    if state.pp_in_progress.contains(&job.id) {
+        ui.horizontal(|ui| {
+            ui.label("Post-process:");
+            ui.colored_label(Color32::from_rgb(80, 180, 80), "Verifying + unpacking...");
+            ui.spinner();
+        });
+    } else if let Some((_, report)) = state
         .pp_reports
         .iter()
         .rev()
@@ -439,24 +467,25 @@ fn details_pane(ui: &mut egui::Ui, state: &QueueState) {
 
     // File list table — Filename stretches with the window.
     let segs_w = 80.0;
-    let size_w = 80.0;
-    let status_w = 100.0;
-    let grid_w = 140.0;
-    let file_width = (ui.available_width() - segs_w - size_w - status_w - grid_w - 16.0).max(100.0);
+    let size_w = 140.0;
+    let grid_w = 170.0;
+    let file_width = (ui.available_width() - segs_w - size_w - grid_w - 16.0).max(100.0);
 
+    let avail_h = ui.available_height();
     let table = TableBuilder::new(ui)
         .striped(true)
         .resizable(true)
         .auto_shrink(false)
+        .vscroll(true)
+        .min_scrolled_height(avail_h)
         .column(Column::exact(file_width).clip(true)) // Filename (stretches)
         .column(Column::exact(segs_w)) // Segs
         .column(Column::exact(size_w)) // Size
-        .column(Column::exact(status_w)) // Status
         .column(Column::exact(grid_w)); // Segment grid
 
     table
         .header(20.0, |mut header| {
-            for label in ["File", "Segs", "Size", "Status", "Segments"] {
+            for label in ["File", "Segs", "Size", "Segments"] {
                 header.col(|ui| {
                     ui.strong(label);
                 });
@@ -479,10 +508,6 @@ fn details_pane(ui: &mut egui::Ui, state: &QueueState) {
                         ));
                     });
                     row.col(|ui| {
-                        let (color, text) = file_status(file);
-                        ui.colored_label(color, text);
-                    });
-                    row.col(|ui| {
                         file_segment_grid(ui, file);
                     });
                 });
@@ -502,7 +527,7 @@ fn file_segment_grid(ui: &mut egui::Ui, file: &JobFileDetail) {
 
     let dot_size = 4.0;
     let gap = 1.0;
-    let dots_per_row = 40usize;
+    let dots_per_row = 28usize;
     let rows = total.div_ceil(dots_per_row);
     let width = dots_per_row as f32 * (dot_size + gap);
     let height = rows as f32 * (dot_size + gap);
@@ -530,23 +555,10 @@ fn file_segment_grid(ui: &mut egui::Ui, file: &JobFileDetail) {
     }
 }
 
-fn file_status(file: &JobFileDetail) -> (Color32, &'static str) {
-    if file.segments_missing > 0 {
-        (Color32::from_rgb(200, 60, 60), "Missing segments")
-    } else if file.segments_done >= file.segment_count {
-        (Color32::from_rgb(60, 160, 60), "Done")
-    } else if file.segments_done > 0 {
-        (Color32::from_rgb(200, 160, 40), "Downloading")
-    } else {
-        (Color32::from_rgb(120, 120, 120), "Pending")
-    }
-}
-
 fn state_color(state: &JobState) -> (Color32, &'static str) {
     match state {
         JobState::Queued => (Color32::from_rgb(120, 120, 120), "Queued"),
         JobState::Downloading => (Color32::from_rgb(80, 180, 80), "Downloading"),
-        JobState::Paused => (Color32::from_rgb(200, 160, 40), "Paused"),
         JobState::Complete => (Color32::from_rgb(60, 160, 60), "Complete"),
         JobState::Failed => (Color32::from_rgb(200, 60, 60), "Failed"),
     }
@@ -587,4 +599,115 @@ fn format_size(bytes: u64) -> String {
     } else {
         format!("{bytes} B")
     }
+}
+
+// --- Vector-drawn icon buttons (no font dependency) ---
+
+/// Which icon to draw on a button.
+#[derive(Hash)]
+enum IconKind {
+    Play,
+    Pause,
+    Delete,
+    Up,
+    Down,
+}
+
+/// A small button with a vector-drawn icon. Uses `ui.interact` for proper
+/// enabled/disabled/hover/click state handling.
+fn icon_button(ui: &mut egui::Ui, kind: IconKind, enabled: bool, tooltip: &str) -> egui::Response {
+    let size = egui::vec2(24.0, 20.0);
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let id = ui.id().with(("icon_btn", &kind));
+    let sense = if enabled {
+        egui::Sense::click()
+    } else {
+        egui::Sense::hover()
+    };
+    let response = ui.interact(rect, id, sense).on_hover_text(tooltip);
+
+    let painter = ui.painter_at(rect);
+    let visuals = ui.style().interact(&response);
+
+    // Button background.
+    painter.rect_filled(rect, 0.0, visuals.bg_fill);
+    painter.rect_stroke(rect, 0.0, visuals.bg_stroke);
+
+    // Icon color: black when enabled, grey when disabled.
+    let icon_color = if enabled {
+        Color32::from_rgb(0, 0, 0)
+    } else {
+        Color32::from_rgb(128, 128, 128)
+    };
+
+    let cx = rect.center().x;
+    let cy = rect.center().y;
+    let s = 5.0; // half-size of the icon
+
+    match kind {
+        IconKind::Play => {
+            let p1 = egui::pos2(cx - s * 0.6, cy - s);
+            let p2 = egui::pos2(cx - s * 0.6, cy + s);
+            let p3 = egui::pos2(cx + s, cy);
+            painter.add(egui::Shape::convex_polygon(
+                vec![p1, p2, p3],
+                icon_color,
+                egui::Stroke::NONE,
+            ));
+        }
+        IconKind::Pause => {
+            let bar_w = 2.5_f32;
+            let bar_h = s * 2.0;
+            let gap = 2.5_f32;
+            let total_w = bar_w * 2.0 + gap;
+            let left_x = cx - total_w / 2.0;
+            let right_x = left_x + bar_w + gap;
+            let top_y = cy - bar_h / 2.0;
+            painter.rect_filled(
+                egui::Rect::from_min_size(egui::pos2(left_x, top_y), egui::vec2(bar_w, bar_h)),
+                0.0,
+                icon_color,
+            );
+            painter.rect_filled(
+                egui::Rect::from_min_size(egui::pos2(right_x, top_y), egui::vec2(bar_w, bar_h)),
+                0.0,
+                icon_color,
+            );
+        }
+        IconKind::Delete => {
+            let stroke = egui::Stroke::new(2.0_f32, icon_color);
+            painter.line_segment(
+                [egui::pos2(cx - s, cy - s), egui::pos2(cx + s, cy + s)],
+                stroke,
+            );
+            painter.line_segment(
+                [egui::pos2(cx + s, cy - s), egui::pos2(cx - s, cy + s)],
+                stroke,
+            );
+        }
+        IconKind::Up => {
+            // Up arrow: filled triangle pointing up.
+            let p1 = egui::pos2(cx, cy - s);
+            let p2 = egui::pos2(cx - s, cy + s * 0.7);
+            let p3 = egui::pos2(cx + s, cy + s * 0.7);
+            painter.add(egui::Shape::convex_polygon(
+                vec![p1, p2, p3],
+                icon_color,
+                egui::Stroke::NONE,
+            ));
+        }
+        IconKind::Down => {
+            // Down arrow: filled triangle pointing down.
+            let p1 = egui::pos2(cx, cy + s);
+            let p2 = egui::pos2(cx - s, cy - s * 0.7);
+            let p3 = egui::pos2(cx + s, cy - s * 0.7);
+            painter.add(egui::Shape::convex_polygon(
+                vec![p1, p2, p3],
+                icon_color,
+                egui::Stroke::NONE,
+            ));
+        }
+    }
+
+    response
 }
