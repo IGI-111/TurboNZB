@@ -221,10 +221,16 @@ impl QueueManager {
                 state       TEXT NOT NULL DEFAULT 'pending'
             );
 
-            CREATE INDEX IF NOT EXISTS idx_files_job ON files(job_id);
-            CREATE INDEX IF NOT EXISTS idx_segments_file ON segments(file_id);
-            CREATE INDEX IF NOT EXISTS idx_jobs_state ON jobs(state);
-            "#,
+        CREATE INDEX IF NOT EXISTS idx_files_job ON files(job_id);
+        CREATE INDEX IF NOT EXISTS idx_segments_file ON segments(file_id);
+        CREATE INDEX IF NOT EXISTS idx_jobs_state ON jobs(state);
+
+        -- Only one job may be in the 'downloading' state at a time.
+        -- This partial unique index makes that invariant impossible to
+        -- violate at the database level, even across crashes/restarts.
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_one_downloading
+            ON jobs(state) WHERE state = 'downloading';
+        "#,
         )
         .execute(&self.pool)
         .await
@@ -429,6 +435,76 @@ impl QueueManager {
             .await
             .map_err(|e| CoreError::Other(anyhow::anyhow!("set job state: {e}")))?;
         Ok(())
+    }
+
+    /// Atomically claim the single download slot for `job_id`. Returns
+    /// `true` if this caller won the slot, `false` if the slot is already
+    /// held by another job or the job is not in a claimable state (queued
+    /// or paused). The partial unique index `idx_one_downloading`
+    /// guarantees that at most one job can ever be in the 'downloading'
+    /// state — a concurrent claim is rejected by SQLite.
+    pub async fn claim_download_slot(&self, job_id: i64) -> Result<bool> {
+        let result = sqlx::query(
+            r#"UPDATE jobs SET state = 'downloading'
+               WHERE id = ?1 AND state IN ('queued', 'paused')"#,
+        )
+        .bind(job_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CoreError::Other(anyhow::anyhow!("claim download slot: {e}")))?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Release the download slot, setting the job to `new_state`. Only
+    /// has an effect if the job is currently 'downloading'. This is
+    /// idempotent — safe to call multiple times.
+    pub async fn release_download_slot(&self, job_id: i64, new_state: JobState) -> Result<()> {
+        sqlx::query(r#"UPDATE jobs SET state = ?1 WHERE id = ?2 AND state = 'downloading'"#)
+            .bind(new_state.as_str())
+            .bind(job_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| CoreError::Other(anyhow::anyhow!("release download slot: {e}")))?;
+        Ok(())
+    }
+
+    /// Get the id of the job currently in the 'downloading' state, if any.
+    pub async fn current_downloading_job(&self) -> Result<Option<i64>> {
+        let row = sqlx::query(r#"SELECT id FROM jobs WHERE state = 'downloading' LIMIT 1"#)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| CoreError::Other(anyhow::anyhow!("current downloading: {e}")))?;
+        Ok(row.map(|r| r.get::<i64, _>("id")))
+    }
+
+    /// Reset all jobs in 'downloading' state back to 'queued'. Called at
+    /// startup to recover from an unclean shutdown (crash, force-quit,
+    /// power loss). After this call, the download slot is guaranteed
+    /// empty and `claim_download_slot` can be used to start the next job.
+    pub async fn recover_interrupted(&self) -> Result<u64> {
+        let result = sqlx::query(r#"UPDATE jobs SET state = 'queued' WHERE state = 'downloading'"#)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| CoreError::Other(anyhow::anyhow!("recover interrupted: {e}")))?;
+        Ok(result.rows_affected())
+    }
+
+    /// Reset segments in the 'failed' state back to 'pending' for a job,
+    /// so they get retried on the next download attempt. Transient
+    /// failures (connection timeouts, protocol errors) should get
+    /// retried; 'crc_mismatch' segments are left alone because the
+    /// article is corrupt on the server and retrying won't help.
+    pub async fn reset_failed_segments(&self, job_id: i64) -> Result<u64> {
+        let result = sqlx::query(
+            r#"UPDATE segments SET state = 'pending'
+               WHERE state = 'failed'
+               AND file_id IN (SELECT id FROM files WHERE job_id = ?1)"#,
+        )
+        .bind(job_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CoreError::Other(anyhow::anyhow!("reset failed segments: {e}")))?;
+        Ok(result.rows_affected())
     }
 
     /// Update a job's priority (for reordering).

@@ -6,8 +6,18 @@
 //! processes commands on a background tokio runtime and pushes `BackendEvent`s
 //! back. The egui `Context` is stored so the backend can call
 //! `ctx.request_repaint()` after pushing an event, waking the GUI immediately.
+//!
+//! ## Single-download guarantee
+//!
+//! Only one job downloads at a time. This is enforced **at the database
+//! level** via a partial unique index (`idx_one_downloading`) that makes it
+//! impossible for two jobs to be in the `'downloading'` state simultaneously.
+//! The backend uses `claim_download_slot` / `release_download_slot` as the
+//! atomic gate — no in-memory mutexes track "what's running". If the app
+//! crashes, `recover_interrupted` at startup resets any stale `'downloading'`
+//! jobs back to `'queued'`.
 
-use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -20,6 +30,7 @@ use nobz_core::queue::{JobState, QueueJob, QueueManager};
 use nobz_index::types::{IndexerConfig, SearchQuery};
 use nobz_index::{AggregatedResult, NewznabClient, SearchAggregator};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use crate::settings::AppConfig;
@@ -69,7 +80,7 @@ pub enum BackendCmd {
     RefreshJobs,
     /// Fetch per-file details for a job (for the details pane).
     GetJobDetails { job_id: i64 },
-    /// Set the currently selected job (so the 500ms interval can auto-refresh
+    /// Set the currently selected job (so the 200ms interval can auto-refresh
     /// its details).
     SetSelectedJob { job_id: Option<i64> },
     /// Update the backend's copy of the config (after settings are saved).
@@ -83,12 +94,15 @@ pub enum BackendCmd {
 pub enum BackendEvent {
     /// A download progress event from the engine.
     Progress(ProgressEvent),
-    /// Download speed update (emitted ~2x per second during active downloads).
+    /// Speed update for the currently-downloading job (emitted ~5x per
+    /// second during active downloads). `job_id` is None when idle.
     Speed {
-        job_id: i64,
+        job_id: Option<i64>,
         bytes_per_sec: f64,
         downloaded_bytes: u64,
         total_bytes: u64,
+        /// Recent speed history (most recent last), for the speed graph.
+        history: Vec<f64>,
     },
     /// A job was added to the queue (returns job id).
     JobAdded { job_id: i64 },
@@ -164,6 +178,78 @@ impl BackendHandle {
     }
 }
 
+/// Speed tracker for the single active download. Maintains a ring buffer
+/// of recent speed samples for the graph.
+struct SpeedTracker {
+    history: VecDeque<f64>,
+    last_time: Instant,
+    last_bytes: u64,
+    current_bps: f64,
+    downloaded: u64,
+    total: u64,
+}
+
+impl SpeedTracker {
+    const HISTORY_CAP: usize = 240; // ~24s at 100ms intervals
+    /// EMA smoothing factor. Lower = smoother but more lag.
+    /// 0.3 means new sample contributes 30%, history contributes 70%.
+    const EMA_ALPHA: f64 = 0.3;
+
+    fn new() -> Self {
+        Self {
+            history: VecDeque::with_capacity(Self::HISTORY_CAP),
+            last_time: Instant::now(),
+            last_bytes: 0,
+            current_bps: 0.0,
+            downloaded: 0,
+            total: 0,
+        }
+    }
+
+    fn start(&mut self, total: u64) {
+        self.history.clear();
+        self.last_time = Instant::now();
+        self.last_bytes = 0;
+        self.current_bps = 0.0;
+        self.downloaded = 0;
+        self.total = total;
+    }
+
+    fn add_bytes(&mut self, bytes: u64) {
+        self.last_bytes += bytes;
+    }
+
+    fn tick(&mut self) -> (f64, u64) {
+        let elapsed = self.last_time.elapsed().as_secs_f64().max(0.001);
+        let raw_bps = self.last_bytes as f64 / elapsed;
+
+        // Exponential moving average to smooth out spikes from per-tick
+        // timing jitter (article arrives just before/after the tick).
+        if self.current_bps == 0.0 {
+            // First sample — initialize directly.
+            self.current_bps = raw_bps;
+        } else {
+            self.current_bps = Self::EMA_ALPHA * raw_bps
+                + (1.0 - Self::EMA_ALPHA) * self.current_bps;
+        }
+
+        self.downloaded += self.last_bytes;
+        self.last_bytes = 0;
+        self.last_time = Instant::now();
+
+        if self.history.len() >= Self::HISTORY_CAP {
+            self.history.pop_front();
+        }
+        self.history.push_back(self.current_bps);
+
+        (self.current_bps, self.downloaded)
+    }
+
+    fn history_vec(&self) -> Vec<f64> {
+        self.history.iter().copied().collect()
+    }
+}
+
 /// The backend owns the tokio runtime and the queue manager. It is created
 /// once at startup and runs for the lifetime of the app.
 pub struct Backend {
@@ -171,19 +257,18 @@ pub struct Backend {
     config: Arc<std::sync::RwLock<AppConfig>>,
     ctx: Option<egui::Context>,
     event_tx: mpsc::UnboundedSender<BackendEvent>,
-    /// Track which job is currently downloading (only one at a time in v1).
-    current_job: Arc<std::sync::Mutex<Option<i64>>>,
-    /// Speed tracker: job_id → (start_time, bytes_seen_so_far).
-    speed: Arc<std::sync::Mutex<HashMap<i64, (Instant, u64)>>>,
-    /// Cancellation tokens for running jobs, so pause can stop them.
-    cancel_tokens: Arc<std::sync::Mutex<HashMap<i64, tokio_util::sync::CancellationToken>>>,
-    /// Currently selected job (for auto-refreshing details in the 500ms interval).
+    /// Cancellation token for the single running download, if any.
+    cancel_token: Arc<std::sync::Mutex<Option<CancellationToken>>>,
+    /// Speed tracker for the single active download.
+    speed: Arc<std::sync::Mutex<SpeedTracker>>,
+    /// Currently selected job (for auto-refreshing details in the 200ms interval).
     selected_job: Arc<std::sync::Mutex<Option<i64>>>,
 }
 
 impl Backend {
-    /// Spawn the backend: starts a tokio runtime, opens the queue DB, and
-    /// spawns a command-processing task. Returns a handle for the GUI.
+    /// Spawn the backend: starts a tokio runtime, opens the queue DB,
+    /// recovers any interrupted downloads, and spawns a command-processing
+    /// task. Returns a handle for the GUI.
     pub fn spawn(
         config: AppConfig,
         ctx: egui::Context,
@@ -208,6 +293,19 @@ impl Backend {
             runtime.block_on(async { QueueManager::open(&db_path).await.expect("queue db open") });
         let queue = Arc::new(queue);
 
+        // Recover from any unclean shutdown: reset stale 'downloading'
+        // jobs back to 'queued' so the download slot is free.
+        runtime.block_on(async {
+            match queue.recover_interrupted().await {
+                Ok(n) => {
+                    if n > 0 {
+                        tracing::info!(recovered = n, "recovered interrupted downloads");
+                    }
+                }
+                Err(e) => tracing::error!(error = %e, "failed to recover interrupted downloads"),
+            }
+        });
+
         let handle = BackendHandle {
             cmd_tx,
             event_rx: std::sync::Arc::new(std::sync::Mutex::new(event_rx)),
@@ -218,9 +316,8 @@ impl Backend {
             config: Arc::clone(&config),
             ctx: Some(ctx),
             event_tx,
-            current_job: Arc::new(std::sync::Mutex::new(None)),
-            speed: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            cancel_tokens: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            cancel_token: Arc::new(std::sync::Mutex::new(None)),
+            speed: Arc::new(std::sync::Mutex::new(SpeedTracker::new())),
             selected_job: Arc::new(std::sync::Mutex::new(None)),
         };
 
@@ -240,6 +337,10 @@ impl Backend {
     }
 
     async fn run_loop(self, cmd_rx: &mut mpsc::UnboundedReceiver<BackendCmd>) {
+        // Auto-start the first queued job on launch (in case there were
+        // interrupted downloads recovered at startup).
+        self.try_start_next_job().await;
+
         while let Some(cmd) = cmd_rx.recv().await {
             match cmd {
                 BackendCmd::DownloadNzb {
@@ -360,15 +461,6 @@ impl Backend {
             total_bytes = total_bytes_nzb,
             "NZB segment summary"
         );
-        for (i, f) in nzb.files.iter().enumerate() {
-            tracing::debug!(
-                file = i,
-                filename = %f.filename(),
-                segment_count = f.segment_count,
-                actual_segments = f.segments.len(),
-                "NZB file"
-            );
-        }
 
         let pw = archive_password.or_else(|| nzb.passwords().first().map(|s| s.to_string()));
 
@@ -384,28 +476,11 @@ impl Backend {
         // Refresh the queue immediately so the new job shows up.
         self.handle_refresh_jobs().await;
 
-        // Store the password for post-processing later.
-        {
-            let mut current = self.current_job.lock().expect("current_job lock");
-            *current = Some(job_id);
-        }
-
-        // Only one download at a time — if another job is already
-        // downloading, this job stays queued until the current one
-        // finishes (and the engine task picks up the next queued job).
-        let already_downloading = {
-            let tokens = self.cancel_tokens.lock().expect("cancel_tokens lock");
-            !tokens.is_empty()
-        };
-
-        if already_downloading {
-            tracing::info!(job_id, "another job is downloading — queuing");
-            return;
-        }
-
-        // Spawn the engine as a separate task so the command loop
-        // continues processing RefreshJobs/Pause/etc. while downloading.
-        self.spawn_engine(job_id, category, pw);
+        // Try to start downloading. If the download slot is already held
+        // by another job, this job stays queued and will be auto-started
+        // when the current download finishes.
+        self.try_start_next_job_with_password(Some(job_id), category, pw)
+            .await;
     }
 
     async fn handle_download_from_url(
@@ -481,34 +556,82 @@ impl Backend {
     }
 
     async fn handle_resume(&self, job_id: i64) {
-        // Set job back to queued so the engine picks it up.
-        let _job = match self.queue.get_job(job_id).await {
-            Ok(j) => j,
-            Err(e) => {
-                self.emit(BackendEvent::Error(format!("Get job error: {e}")));
-                return;
-            }
-        };
+        // Reset transient-failed segments so they get retried.
+        if let Err(e) = self.queue.reset_failed_segments(job_id).await {
+            self.emit(BackendEvent::Error(format!(
+                "Reset failed segments error: {e}"
+            )));
+            return;
+        }
+
+        // Set job back to queued.
         if let Err(e) = self.queue.set_job_state(job_id, JobState::Queued).await {
             self.emit(BackendEvent::Error(format!("Set job state error: {e}")));
             return;
         }
-        {
-            let mut current = self.current_job.lock().expect("current_job lock");
-            *current = Some(job_id);
-        }
-        self.spawn_engine(job_id, None, None);
+
+        self.handle_refresh_jobs().await;
+
+        // Try to start downloading. If another job is already downloading,
+        // this job stays queued until the current one finishes.
+        self.try_start_next_job().await;
     }
 
-    /// Spawn the engine as a background task. This is non-blocking — the
-    /// command loop continues processing other commands (RefreshJobs, etc.)
-    /// while the download runs concurrently.
-    fn spawn_engine(
+    /// Try to start the next queued job. If the download slot is already
+    /// held (another job is downloading), this is a no-op. The job at the
+    /// front of the queue claims the slot atomically via the DB.
+    async fn try_start_next_job(&self) {
+        self.try_start_next_job_with_password(None, None, None)
+            .await;
+    }
+
+    /// Try to start the next queued job, optionally passing along category
+    /// and archive_password from a just-added job (for post-processing).
+    async fn try_start_next_job_with_password(
         &self,
-        job_id: i64,
+        _preferred_job_id: Option<i64>,
         _category: Option<String>,
         _archive_password: Option<String>,
     ) {
+        // If a download is already running, do nothing.
+        {
+            let tokens = self.cancel_token.lock().expect("cancel_token lock");
+            if tokens.is_some() {
+                return;
+            }
+        }
+
+        // Find the next queued job.
+        let next = match self.queue.next_queued_job().await {
+            Ok(Some(j)) => j,
+            Ok(None) => return,
+            Err(e) => {
+                tracing::warn!(error = %e, "next_queued_job failed");
+                return;
+            }
+        };
+
+        // Atomically claim the download slot.
+        let claimed = match self.queue.claim_download_slot(next.id).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(error = %e, "claim_download_slot failed");
+                return;
+            }
+        };
+        if !claimed {
+            tracing::debug!(job_id = next.id, "could not claim download slot");
+            return;
+        }
+
+        self.spawn_engine(next.id);
+    }
+
+    /// Spawn the engine as a background task for a job that has already
+    /// claimed the download slot. This is non-blocking — the command loop
+    /// continues processing other commands (RefreshJobs, etc.) while the
+    /// download runs concurrently.
+    fn spawn_engine(&self, job_id: i64) {
         let servers: Vec<ServerConfig> = {
             let c = self.config.read().expect("config lock");
             c.server_configs()
@@ -521,24 +644,32 @@ impl Backend {
             self.emit(BackendEvent::Error(
                 "No NNTP servers configured. Add one in Settings.".into(),
             ));
+            // Release the slot we just claimed.
+            let queue = Arc::clone(&self.queue);
+            let event_tx = self.event_tx.clone();
+            let ctx = self.ctx.clone();
+            tokio::spawn(async move {
+                let _ = queue.release_download_slot(job_id, JobState::Queued).await;
+                let _ = event_tx.send(BackendEvent::JobsList(
+                    queue.list_jobs().await.unwrap_or_default(),
+                ));
+                if let Some(ref ctx) = ctx {
+                    ctx.request_repaint();
+                }
+            });
             return;
         }
 
         tracing::info!(job_id, servers = servers.len(), max_conn, "starting engine");
 
-        let cancel_token = tokio_util::sync::CancellationToken::new();
+        let cancel_token = CancellationToken::new();
         {
-            let mut tokens = self.cancel_tokens.lock().expect("cancel_tokens lock");
-            tokens.insert(job_id, cancel_token.clone());
-        }
-        {
-            let mut speed = self.speed.lock().expect("speed lock");
-            speed.insert(job_id, (Instant::now(), 0));
+            let mut token = self.cancel_token.lock().expect("cancel_token lock");
+            *token = Some(cancel_token.clone());
         }
 
         spawn_engine_task(
             job_id,
-            PathBuf::new(), // output_dir not needed, engine reads from DB
             servers,
             max_conn,
             Arc::clone(&self.queue),
@@ -546,25 +677,18 @@ impl Backend {
             self.event_tx.clone(),
             self.ctx.clone(),
             Arc::clone(&self.speed),
-            Arc::clone(&self.current_job),
-            Arc::clone(&self.cancel_tokens),
+            Arc::clone(&self.cancel_token),
             Arc::clone(&self.selected_job),
             cancel_token,
         );
     }
 
     async fn handle_pause(&self, job_id: i64) {
-        // Set state to Paused in the DB.
-        if let Err(e) = self.queue.set_job_state(job_id, JobState::Paused).await {
-            self.emit(BackendEvent::Error(format!("Pause error: {e}")));
-            return;
-        }
-
-        // Cancel the running engine task if any.
+        // Cancel the running engine task if this is the active job.
         let cancelled = {
-            let tokens = self.cancel_tokens.lock().expect("cancel_tokens lock");
-            if let Some(token) = tokens.get(&job_id) {
-                token.cancel();
+            let token = self.cancel_token.lock().expect("cancel_token lock");
+            if let Some(ref tk) = *token {
+                tk.cancel();
                 true
             } else {
                 false
@@ -572,10 +696,14 @@ impl Backend {
         };
 
         if cancelled {
-            // The engine task will set the state and emit events.
+            // The engine task will release the slot and set state to Paused.
             tracing::info!(job_id, "pause: cancel token fired");
         } else {
-            // No running task — just emit the state change.
+            // No running task — just set the state in the DB.
+            if let Err(e) = self.queue.set_job_state(job_id, JobState::Paused).await {
+                self.emit(BackendEvent::Error(format!("Pause error: {e}")));
+                return;
+            }
             self.emit(BackendEvent::JobStateChanged {
                 job_id,
                 state: JobState::Paused,
@@ -585,6 +713,14 @@ impl Backend {
     }
 
     async fn handle_delete(&self, job_id: i64) {
+        // If this is the active download, cancel it first.
+        {
+            let token = self.cancel_token.lock().expect("cancel_token lock");
+            if let Some(ref tk) = *token {
+                tk.cancel();
+            }
+        }
+
         if let Err(e) = self.queue.delete_job(job_id).await {
             self.emit(BackendEvent::Error(format!("Delete error: {e}")));
             return;
@@ -721,39 +857,7 @@ impl Backend {
             }
         };
 
-        let mut details = Vec::with_capacity(files.len());
-        for file in &files {
-            let segments = match self.queue.list_segments(file.id).await {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!(error = %e, "list_segments failed");
-                    continue;
-                }
-            };
-            let segments_done = segments
-                .iter()
-                .filter(|s| s.state != nobz_core::queue::SegmentState::Pending)
-                .count() as u32;
-            let segments_missing = segments
-                .iter()
-                .filter(|s| s.missing || s.state == nobz_core::queue::SegmentState::Missing)
-                .count() as u32;
-            let total_bytes: u64 = segments.iter().map(|s| s.bytes).sum();
-            let downloaded_bytes: u64 = segments
-                .iter()
-                .filter(|s| s.state == nobz_core::queue::SegmentState::Done)
-                .map(|s| s.bytes)
-                .sum();
-            details.push(JobFileDetail {
-                filename: file.filename.clone(),
-                segment_count: file.segment_count,
-                segments_done,
-                segments_missing,
-                total_bytes,
-                downloaded_bytes,
-            });
-        }
-
+        let details = build_job_details(&self.queue, &files, job_id).await;
         self.emit(BackendEvent::JobDetails {
             job_id,
             files: details,
@@ -765,6 +869,48 @@ impl Backend {
         let mut c = self.config.write().expect("config lock");
         *c = new_config;
     }
+}
+
+/// Build job file details from a list of queue files.
+async fn build_job_details(
+    queue: &QueueManager,
+    files: &[nobz_core::queue::QueueFile],
+    job_id: i64,
+) -> Vec<JobFileDetail> {
+    let mut details = Vec::with_capacity(files.len());
+    for file in files {
+        let segments = match queue.list_segments(file.id).await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, "list_segments failed");
+                continue;
+            }
+        };
+        let segments_done = segments
+            .iter()
+            .filter(|s| s.state != nobz_core::queue::SegmentState::Pending)
+            .count() as u32;
+        let segments_missing = segments
+            .iter()
+            .filter(|s| s.missing || s.state == nobz_core::queue::SegmentState::Missing)
+            .count() as u32;
+        let total_bytes: u64 = segments.iter().map(|s| s.bytes).sum();
+        let downloaded_bytes: u64 = segments
+            .iter()
+            .filter(|s| s.state == nobz_core::queue::SegmentState::Done)
+            .map(|s| s.bytes)
+            .sum();
+        details.push(JobFileDetail {
+            filename: file.filename.clone(),
+            segment_count: file.segment_count,
+            segments_done,
+            segments_missing,
+            total_bytes,
+            downloaded_bytes,
+        });
+    }
+    tracing::debug!(job_id, files = details.len(), "built job details");
+    details
 }
 
 /// Normalize an indexer URL: if it doesn't end with `/api`, append it.
@@ -802,24 +948,23 @@ fn append_api_key(url: &str, indexers: &[IndexerConfig]) -> String {
     url.to_string()
 }
 
-/// Spawn an engine task for a job. This is a free function so it can be
-/// called both from `Backend::spawn_engine` and from the auto-start-next
-/// logic at the end of a previous engine task.
+/// Spawn an engine task for a job. The job must have already claimed the
+/// download slot (state = 'downloading'). When the engine finishes (or
+/// is cancelled), the slot is released and the next queued job is
+/// auto-started.
 #[allow(clippy::too_many_arguments)]
 fn spawn_engine_task(
     job_id: i64,
-    _output_dir: PathBuf,
     servers: Vec<ServerConfig>,
     max_conn: usize,
     queue: Arc<QueueManager>,
     config: Arc<std::sync::RwLock<AppConfig>>,
     event_tx: mpsc::UnboundedSender<BackendEvent>,
     ctx: Option<egui::Context>,
-    speed_tracker: Arc<std::sync::Mutex<HashMap<i64, (Instant, u64)>>>,
-    current_job: Arc<std::sync::Mutex<Option<i64>>>,
-    cancel_tokens: Arc<std::sync::Mutex<HashMap<i64, tokio_util::sync::CancellationToken>>>,
+    speed_tracker: Arc<std::sync::Mutex<SpeedTracker>>,
+    cancel_token_slot: Arc<std::sync::Mutex<Option<CancellationToken>>>,
     selected_job: Arc<std::sync::Mutex<Option<i64>>>,
-    cancel_token: tokio_util::sync::CancellationToken,
+    cancel_token: CancellationToken,
 ) {
     tracing::info!(
         job_id,
@@ -835,6 +980,12 @@ fn spawn_engine_task(
             .map(|j| j.total_bytes)
             .unwrap_or(0);
 
+        // Initialize the speed tracker for this job.
+        {
+            let mut speed = speed_tracker.lock().expect("speed lock");
+            speed.start(total_bytes);
+        }
+
         let engine = Arc::new(Engine::new(servers, max_conn));
         let (tx, mut rx) = mpsc::unbounded_channel::<ProgressEvent>();
 
@@ -844,8 +995,9 @@ fn spawn_engine_task(
         let fwd_speed = Arc::clone(&speed_tracker);
         let fwd_queue = Arc::clone(&queue);
         let fwd_selected = Arc::clone(&selected_job);
+        let fwd_job_id = job_id;
         let forwarder = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_millis(200));
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tokio::select! {
@@ -853,9 +1005,7 @@ fn spawn_engine_task(
                         let Some(ev) = ev else { break };
                         if let ProgressEvent::SegmentDone { bytes, .. } = &ev {
                             if let Ok(mut tracker) = fwd_speed.lock() {
-                                if let Some(entry) = tracker.get_mut(&job_id) {
-                                    entry.1 += bytes;
-                                }
+                                tracker.add_bytes(*bytes);
                             }
                         }
                         let _ = fwd_event_tx.send(BackendEvent::Progress(ev));
@@ -866,19 +1016,19 @@ fn spawn_engine_task(
                     _ = interval.tick() => {
                         let (bps, downloaded) = fwd_speed
                             .lock()
-                            .ok()
-                            .and_then(|s| {
-                                s.get(&job_id).map(|(start, bytes)| {
-                                    let elapsed = start.elapsed().as_secs_f64().max(0.1);
-                                    (*bytes as f64 / elapsed, *bytes)
-                                })
-                            })
+                            .map(|mut s| s.tick())
                             .unwrap_or((0.0, 0));
+                        let history = fwd_speed
+                            .lock()
+                            .ok()
+                            .map(|s| s.history_vec())
+                            .unwrap_or_default();
                         let _ = fwd_event_tx.send(BackendEvent::Speed {
-                            job_id,
+                            job_id: Some(fwd_job_id),
                             bytes_per_sec: bps,
                             downloaded_bytes: downloaded,
                             total_bytes,
+                            history,
                         });
 
                         if let Ok(jobs) = fwd_queue.list_jobs().await {
@@ -891,41 +1041,7 @@ fn spawn_engine_task(
                             .and_then(|s| *s)
                         {
                             if let Ok(files) = fwd_queue.list_files(sel_id).await {
-                                let mut details = Vec::with_capacity(files.len());
-                                for file in &files {
-                                    if let Ok(segs) = fwd_queue.list_segments(file.id).await {
-                                        let seg_done = segs
-                                            .iter()
-                                            .filter(|s| s.state
-                                                != nobz_core::queue::SegmentState::Pending)
-                                            .count() as u32;
-                                        let seg_missing = segs
-                                            .iter()
-                                            .filter(|s| {
-                                                s.missing
-                                                    || s.state
-                                                        == nobz_core::queue::SegmentState::Missing
-                                            })
-                                            .count() as u32;
-                                        let tb: u64 = segs.iter().map(|s| s.bytes).sum();
-                                        let db: u64 = segs
-                                            .iter()
-                                            .filter(|s| {
-                                                s.state
-                                                    == nobz_core::queue::SegmentState::Done
-                                            })
-                                            .map(|s| s.bytes)
-                                            .sum();
-                                        details.push(JobFileDetail {
-                                            filename: file.filename.clone(),
-                                            segment_count: file.segment_count,
-                                            segments_done: seg_done,
-                                            segments_missing: seg_missing,
-                                            total_bytes: tb,
-                                            downloaded_bytes: db,
-                                        });
-                                    }
-                                }
+                                let details = build_job_details(&fwd_queue, &files, sel_id).await;
                                 let _ = fwd_event_tx.send(BackendEvent::JobDetails {
                                     job_id: sel_id,
                                     files: details,
@@ -945,7 +1061,6 @@ fn spawn_engine_task(
             r = engine.run_job(queue.clone(), job_id, tx) => r,
             _ = cancel_token.cancelled() => {
                 tracing::info!(job_id, "engine: cancelled by pause");
-                let _ = queue.set_job_state(job_id, JobState::Paused).await;
                 Ok(())
             }
         };
@@ -959,80 +1074,113 @@ fn spawn_engine_task(
             }
         };
 
-        match result {
+        // Determine final state and release the download slot.
+        match &result {
             Ok(()) => {
                 let job = queue.get_job(job_id).await.ok();
                 let state = job.as_ref().map(|j| j.state).unwrap_or(JobState::Complete);
-                emit(BackendEvent::JobStateChanged { job_id, state });
-
-                let do_pp = {
-                    let c = config.read().expect("config lock");
-                    c.post_process.auto_post_process
+                // The engine's run_job already sets the final state in the
+                // DB (Complete or Failed). But if cancelled, we need to set
+                // Paused. release_download_slot only works if state is
+                // still 'downloading'.
+                let final_state = if cancel_token.is_cancelled() {
+                    JobState::Paused
+                } else {
+                    state
                 };
-                if do_pp && state == JobState::Complete {
-                    if let Some(job) = job {
-                        let pp_defaults = {
-                            let c = config.read().expect("config lock");
-                            c.post_process.clone()
-                        };
-                        let completed_dir = {
-                            let c = config.read().expect("config lock");
-                            c.completed_dir.clone()
-                        };
-                        let pp_config = PostProcessConfig {
-                            download_dir: job.output_dir,
-                            completed_dir,
-                            category: None,
-                            cleanup_archives: pp_defaults.cleanup_archives,
-                            archive_password: None,
-                            skip_verify: pp_defaults.skip_verify,
-                        };
-                        match post_process(pp_config).await {
-                            Ok(report) => {
-                                emit(BackendEvent::PostProcessDone {
-                                    job_id: Some(job_id),
-                                    report,
-                                });
-                            }
-                            Err(e) => {
-                                emit(BackendEvent::PostProcessFailed {
-                                    job_id: Some(job_id),
-                                    error: e.to_string(),
-                                });
+
+                // If the engine set it to Complete/Failed already, the slot
+                // is already released (state != 'downloading'). If it was
+                // cancelled, we need to release it to Paused.
+                if cancel_token.is_cancelled() {
+                    let _ = queue.release_download_slot(job_id, JobState::Paused).await;
+                    // Reset failed segments so they get retried on resume.
+                    let _ = queue.reset_failed_segments(job_id).await;
+                }
+
+                emit(BackendEvent::JobStateChanged {
+                    job_id,
+                    state: final_state,
+                });
+
+                // Run post-processing if enabled and job completed successfully.
+                if !cancel_token.is_cancelled() && state == JobState::Complete {
+                    let do_pp = {
+                        let c = config.read().expect("config lock");
+                        c.post_process.auto_post_process
+                    };
+                    if do_pp {
+                        if let Some(job) = job {
+                            let pp_defaults = {
+                                let c = config.read().expect("config lock");
+                                c.post_process.clone()
+                            };
+                            let completed_dir = {
+                                let c = config.read().expect("config lock");
+                                c.completed_dir.clone()
+                            };
+                            let pp_config = PostProcessConfig {
+                                download_dir: job.output_dir,
+                                completed_dir,
+                                category: None,
+                                cleanup_archives: pp_defaults.cleanup_archives,
+                                archive_password: None,
+                                skip_verify: pp_defaults.skip_verify,
+                            };
+                            match post_process(pp_config).await {
+                                Ok(report) => {
+                                    emit(BackendEvent::PostProcessDone {
+                                        job_id: Some(job_id),
+                                        report,
+                                    });
+                                }
+                                Err(e) => {
+                                    emit(BackendEvent::PostProcessFailed {
+                                        job_id: Some(job_id),
+                                        error: e.to_string(),
+                                    });
+                                }
                             }
                         }
                     }
                 }
             }
             Err(e) => {
+                // Engine errored — release the slot to Failed.
+                let _ = queue.release_download_slot(job_id, JobState::Failed).await;
                 emit(BackendEvent::Error(format!("Engine error: {e}")));
             }
         }
 
+        // Clear the cancel token slot.
         {
-            let mut current = current_job.lock().expect("current_job lock");
-            *current = None;
+            let mut slot = cancel_token_slot.lock().expect("cancel_token lock");
+            *slot = None;
         }
+        // Reset the speed tracker.
         {
             let mut speed = speed_tracker.lock().expect("speed lock");
-            speed.remove(&job_id);
+            speed.start(0);
         }
-        {
-            cancel_tokens
-                .lock()
-                .expect("cancel_tokens lock")
-                .remove(&job_id);
-        }
+
+        // Emit a zero-speed event so the GUI knows the download stopped.
+        emit(BackendEvent::Speed {
+            job_id: None,
+            bytes_per_sec: 0.0,
+            downloaded_bytes: 0,
+            total_bytes: 0,
+            history: Vec::new(),
+        });
 
         // Refresh jobs list + auto-start next queued job.
         match queue.list_jobs().await {
             Ok(jobs) => {
                 emit(BackendEvent::JobsList(jobs.clone()));
 
+                // Auto-start the next queued job.
                 if let Some(next) = jobs.iter().find(|j| j.state == JobState::Queued) {
                     tracing::info!(next_job_id = next.id, "auto-starting next queued job");
                     let next_id = next.id;
-                    let next_output = next.output_dir.clone();
 
                     let (next_servers, next_conn) = {
                         let c = config.read().expect("config lock");
@@ -1041,35 +1189,36 @@ fn spawn_engine_task(
                     if next_servers.is_empty() {
                         tracing::warn!("no servers configured, skipping auto-start");
                     } else {
-                        let cancel = tokio_util::sync::CancellationToken::new();
-                        cancel_tokens
-                            .lock()
-                            .expect("cancel_tokens lock")
-                            .insert(next_id, cancel.clone());
-                        speed_tracker
-                            .lock()
-                            .expect("speed lock")
-                            .insert(next_id, (Instant::now(), 0));
-                        current_job
-                            .lock()
-                            .expect("current_job lock")
-                            .replace(next_id);
-
-                        spawn_engine_task(
-                            next_id,
-                            next_output,
-                            next_servers,
-                            next_conn,
-                            queue.clone(),
-                            config.clone(),
-                            event_tx.clone(),
-                            ctx.clone(),
-                            speed_tracker.clone(),
-                            current_job.clone(),
-                            cancel_tokens.clone(),
-                            selected_job.clone(),
-                            cancel,
-                        );
+                        // Claim the slot for the next job.
+                        match queue.claim_download_slot(next_id).await {
+                            Ok(true) => {
+                                let new_cancel = CancellationToken::new();
+                                {
+                                    let mut slot =
+                                        cancel_token_slot.lock().expect("cancel_token lock");
+                                    *slot = Some(new_cancel.clone());
+                                }
+                                spawn_engine_task(
+                                    next_id,
+                                    next_servers,
+                                    next_conn,
+                                    queue.clone(),
+                                    config.clone(),
+                                    event_tx.clone(),
+                                    ctx.clone(),
+                                    speed_tracker.clone(),
+                                    cancel_token_slot.clone(),
+                                    selected_job.clone(),
+                                    new_cancel,
+                                );
+                            }
+                            Ok(false) => {
+                                tracing::warn!(next_id, "could not claim slot for next job");
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "claim slot for next job failed");
+                            }
+                        }
                     }
                 }
             }

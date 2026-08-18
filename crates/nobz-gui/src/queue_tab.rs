@@ -1,13 +1,14 @@
-//! Queue tab: uTorrent-style two-pane layout.
+//! Queue tab: three-pane layout.
 //!
-//! Top pane: list of all jobs (active + completed) with progress, speed,
-//! and actions. Rows are clickable to select a job.
+//! Top pane: list of all jobs (active + completed) with progress and actions.
+//! Rows are clickable to select a job.
+//!
+//! Middle pane: speed graph for the currently-downloading job (line chart
+//! of recent speed samples). Shows "No active download" when idle.
 //!
 //! Bottom pane: details for the selected job — file list with per-file
 //! segment progress, post-process status, output directory, and a
 //! high-granularity segment dot grid.
-
-use std::collections::HashMap;
 
 use egui::Color32;
 use egui_extras::{Column, TableBuilder};
@@ -20,15 +21,21 @@ use crate::backend::{BackendCmd, BackendEvent, BackendHandle, JobFileDetail};
 #[derive(Debug, Clone, Default)]
 pub struct QueueState {
     pub jobs: Vec<QueueJob>,
-    /// Speed per job (bytes/sec), updated live from Speed events.
-    pub speeds: HashMap<i64, f64>,
-    /// Downloaded bytes per job (from Speed events, for live display).
-    pub live_downloaded: HashMap<i64, u64>,
+    /// Speed of the currently-downloading job (bytes/sec), updated live.
+    pub current_speed: f64,
+    /// Speed history samples (most recent last), for the speed graph.
+    pub speed_history: Vec<f64>,
+    /// Downloaded bytes of the current download (live, from Speed events).
+    pub current_downloaded: u64,
+    /// Total bytes of the current download.
+    pub current_total: u64,
+    /// Job id of the currently-downloading job (None when idle).
+    pub current_job_id: Option<i64>,
     /// Currently selected job (clicked row).
     pub selected_job: Option<i64>,
     /// Per-file details for the selected job.
     pub job_details: Vec<JobFileDetail>,
-    /// Post-process reports keyed by job id (absorbed from HistoryState).
+    /// Post-process reports keyed by job id.
     pub pp_reports: Vec<(Option<i64>, PostProcessReport)>,
 }
 
@@ -39,18 +46,21 @@ impl QueueState {
             match ev {
                 BackendEvent::JobsList(jobs) => {
                     self.jobs = jobs.clone();
-                    let active_ids: std::collections::HashSet<i64> =
-                        jobs.iter().map(|j| j.id).collect();
-                    self.speeds.retain(|id, _| active_ids.contains(id));
-                    self.live_downloaded.retain(|id, _| active_ids.contains(id));
+                    // Update current_job_id from the job list (the DB is
+                    // the source of truth).
+                    self.current_job_id = jobs
+                        .iter()
+                        .find(|j| j.state == JobState::Downloading)
+                        .map(|j| j.id);
                 }
                 BackendEvent::JobStateChanged { job_id, state } => {
                     if let Some(job) = self.jobs.iter_mut().find(|j| j.id == *job_id) {
                         job.state = *state;
                     }
-                    if *state == JobState::Complete || *state == JobState::Failed {
-                        self.speeds.remove(job_id);
-                        self.live_downloaded.remove(job_id);
+                    if *state == JobState::Downloading {
+                        self.current_job_id = Some(*job_id);
+                    } else if self.current_job_id == Some(*job_id) {
+                        self.current_job_id = None;
                     }
                 }
                 BackendEvent::JobAdded { .. } => {}
@@ -58,10 +68,14 @@ impl QueueState {
                     job_id,
                     bytes_per_sec,
                     downloaded_bytes,
-                    ..
+                    total_bytes,
+                    history,
                 } => {
-                    self.speeds.insert(*job_id, *bytes_per_sec);
-                    self.live_downloaded.insert(*job_id, *downloaded_bytes);
+                    self.current_job_id = *job_id;
+                    self.current_speed = *bytes_per_sec;
+                    self.speed_history = history.clone();
+                    self.current_downloaded = *downloaded_bytes;
+                    self.current_total = *total_bytes;
                 }
                 BackendEvent::JobDetails { job_id, files } => {
                     if self.selected_job == Some(*job_id) {
@@ -94,7 +108,7 @@ impl QueueState {
     }
 }
 
-/// Render the queue tab (two-pane layout).
+/// Render the queue tab (three-pane layout).
 pub fn ui(ui: &mut egui::Ui, state: &mut QueueState, backend: &BackendHandle) {
     // Top: toolbar
     ui.horizontal(|ui| {
@@ -111,32 +125,47 @@ pub fn ui(ui: &mut egui::Ui, state: &mut QueueState, backend: &BackendHandle) {
         return;
     }
 
-    // Split the remaining space: top ~55% for job list, bottom ~45% for details.
+    // Split the remaining space: three panes.
     let available = ui.available_height();
-    let top_height = (available * 0.55).max(120.0);
+    let graph_height = 100.0;
+    let top_height = ((available - graph_height) * 0.50).max(120.0);
+    let bottom_height = (available - top_height - graph_height).max(120.0);
 
     // --- Top pane: job list ---
-    ui.allocate_ui(egui::vec2(ui.available_width(), top_height), |ui| {
-        job_list_pane(ui, state, backend);
+    ui.push_id("job_list_pane", |ui| {
+        ui.allocate_ui(egui::vec2(ui.available_width(), top_height), |ui| {
+            job_list_pane(ui, state, backend);
+        });
+    });
+
+    ui.separator();
+
+    // --- Middle pane: speed graph ---
+    ui.push_id("speed_graph_pane", |ui| {
+        ui.allocate_ui(egui::vec2(ui.available_width(), graph_height), |ui| {
+            speed_graph_pane(ui, state);
+        });
     });
 
     ui.separator();
 
     // --- Bottom pane: job details ---
-    details_pane(ui, state);
+    ui.push_id("details_pane", |ui| {
+        ui.allocate_ui(egui::vec2(ui.available_width(), bottom_height), |ui| {
+            details_pane(ui, state);
+        });
+    });
 }
 
 /// Top pane: table of all jobs with clickable rows.
 fn job_list_pane(ui: &mut egui::Ui, state: &mut QueueState, backend: &BackendHandle) {
-    // Name width = available - (ID + State + Progress + Speed + Actions) - padding
+    // Name width = available - (ID + State + Progress + Actions) - padding
     let id_w = 30.0;
     let state_w = 80.0;
     let progress_w = 220.0;
-    let speed_w = 80.0;
     let actions_w = 120.0;
     let name_width =
-        (ui.available_width() - id_w - state_w - progress_w - speed_w - actions_w - 16.0)
-            .max(100.0);
+        (ui.available_width() - id_w - state_w - progress_w - actions_w - 16.0).max(100.0);
 
     let table = TableBuilder::new(ui)
         .striped(true)
@@ -146,12 +175,11 @@ fn job_list_pane(ui: &mut egui::Ui, state: &mut QueueState, backend: &BackendHan
         .column(Column::exact(name_width).clip(true)) // Name (stretches)
         .column(Column::exact(state_w)) // State
         .column(Column::exact(progress_w)) // Progress
-        .column(Column::exact(speed_w)) // Speed
         .column(Column::exact(actions_w)); // Actions
 
     table
         .header(20.0, |mut header| {
-            for label in ["ID", "Name", "State", "Progress", "Speed", "Actions"] {
+            for label in ["ID", "Name", "State", "Progress", "Actions"] {
                 header.col(|ui| {
                     ui.strong(label);
                 });
@@ -159,9 +187,8 @@ fn job_list_pane(ui: &mut egui::Ui, state: &mut QueueState, backend: &BackendHan
         })
         .body(|mut body| {
             let jobs = state.jobs.clone();
-            let speeds = state.speeds.clone();
-            let live_downloaded = state.live_downloaded.clone();
             let selected = state.selected_job;
+            let current_job_id = state.current_job_id;
             for job in &jobs {
                 let is_selected = selected == Some(job.id);
                 let row_height = 28.0;
@@ -179,10 +206,13 @@ fn job_list_pane(ui: &mut egui::Ui, state: &mut QueueState, backend: &BackendHan
                         ui.colored_label(color, text);
                     });
                     row.col(|ui| {
-                        let downloaded = live_downloaded
-                            .get(&job.id)
-                            .copied()
-                            .unwrap_or(job.downloaded_bytes);
+                        // Use live downloaded bytes for the active job,
+                        // fall back to DB-stored values for others.
+                        let downloaded = if current_job_id == Some(job.id) {
+                            state.current_downloaded
+                        } else {
+                            job.downloaded_bytes
+                        };
 
                         let (pct, bar_text) = if job.total_bytes > 0 && downloaded > 0 {
                             let p = (downloaded as f64 / job.total_bytes as f64).min(1.0);
@@ -211,20 +241,6 @@ fn job_list_pane(ui: &mut egui::Ui, state: &mut QueueState, backend: &BackendHan
                             (0.0, "—".into())
                         };
                         ui.add(egui::ProgressBar::new(pct).text(bar_text));
-                    });
-                    row.col(|ui| {
-                        if let Some(bps) = speeds.get(&job.id) {
-                            if *bps > 0.0 {
-                                ui.colored_label(
-                                    Color32::from_rgb(80, 180, 80),
-                                    format!("{}/s", format_size(*bps as u64)),
-                                );
-                            } else {
-                                ui.label("—");
-                            }
-                        } else {
-                            ui.label("—");
-                        }
                     });
                     row.col(|ui| {
                         ui.horizontal(|ui| {
@@ -257,6 +273,109 @@ fn job_list_pane(ui: &mut egui::Ui, state: &mut QueueState, backend: &BackendHan
         });
 }
 
+/// Middle pane: speed graph for the currently-downloading job.
+fn speed_graph_pane(ui: &mut egui::Ui, state: &QueueState) {
+    ui.heading("Speed");
+    ui.separator();
+
+    let available = ui.available_size();
+    let (rect, _) = ui.allocate_at_least(available, egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+
+    let bg = Color32::from_rgb(30, 30, 40);
+    let grid = Color32::from_rgb(50, 50, 60);
+    let line = Color32::from_rgb(80, 220, 80);
+    let text = Color32::from_rgb(200, 200, 200);
+
+    painter.rect_filled(rect, 0.0, bg);
+
+    if state.current_job_id.is_none() || state.speed_history.is_empty() {
+        painter.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "No active download",
+            egui::FontId::proportional(14.0),
+            text,
+        );
+        return;
+    }
+
+    // Draw horizontal grid lines (4 lines).
+    for i in 0..=4 {
+        let y = rect.top() + (rect.height() * i as f32 / 4.0);
+        painter.line_segment(
+            [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
+            egui::Stroke::new(1.0_f32, grid),
+        );
+    }
+
+    let history = &state.speed_history;
+    let max_bps = history.iter().cloned().fold(0.0f64, f64::max).max(1.0);
+    let n = history.len();
+    let padding = 8.0;
+    let plot_rect = egui::Rect::from_min_max(
+        egui::pos2(rect.left() + padding, rect.top() + padding),
+        egui::pos2(rect.right() - padding, rect.bottom() - padding),
+    );
+
+    // Draw the speed line.
+    let mut points = Vec::with_capacity(n);
+    for (i, &bps) in history.iter().enumerate() {
+        let x = if n > 1 {
+            plot_rect.left() + (plot_rect.width() * i as f32 / (n - 1) as f32)
+        } else {
+            plot_rect.left()
+        };
+        let y = plot_rect.bottom() - (plot_rect.height() * (bps as f32 / max_bps as f32));
+        points.push(egui::pos2(x, y));
+    }
+
+    if points.len() >= 2 {
+        // Draw the speed line only — no fill (fill creates visible edges
+        // from the baseline to the first/last data points).
+        painter.add(egui::Shape::line(points, egui::Stroke::new(2.0_f32, line)));
+    } else if points.len() == 1 {
+        painter.circle_filled(points[0], 3.0, line);
+    }
+
+    // Draw current speed label.
+    let speed_label = format!("{}/s", format_size(state.current_speed as u64));
+    painter.text(
+        egui::pos2(plot_rect.left(), rect.top() + 4.0),
+        egui::Align2::LEFT_TOP,
+        &speed_label,
+        egui::FontId::proportional(13.0),
+        text,
+    );
+
+    // Draw max label.
+    let max_label = format!("max: {}/s", format_size(max_bps as u64));
+    painter.text(
+        egui::pos2(plot_rect.right(), rect.top() + 4.0),
+        egui::Align2::RIGHT_TOP,
+        &max_label,
+        egui::FontId::proportional(11.0),
+        Color32::from_rgb(140, 140, 140),
+    );
+
+    // Draw downloaded / total.
+    if state.current_total > 0 {
+        let progress_label = format!(
+            "{} / {} ({}%)",
+            format_size(state.current_downloaded),
+            format_size(state.current_total),
+            (state.current_downloaded as f64 / state.current_total as f64 * 100.0) as u32
+        );
+        painter.text(
+            egui::pos2(plot_rect.right(), rect.bottom() - 4.0),
+            egui::Align2::RIGHT_BOTTOM,
+            &progress_label,
+            egui::FontId::proportional(11.0),
+            Color32::from_rgb(140, 140, 140),
+        );
+    }
+}
+
 /// Bottom pane: details for the selected job.
 fn details_pane(ui: &mut egui::Ui, state: &QueueState) {
     let Some(job_id) = state.selected_job else {
@@ -274,14 +393,6 @@ fn details_pane(ui: &mut egui::Ui, state: &QueueState) {
         ui.heading(&job.name);
         let (color, text) = state_color(&job.state);
         ui.colored_label(color, text);
-        if let Some(bps) = state.speeds.get(&job.id) {
-            if *bps > 0.0 {
-                ui.colored_label(
-                    Color32::from_rgb(80, 180, 80),
-                    format!("{}/s", format_size(*bps as u64)),
-                );
-            }
-        }
     });
 
     ui.horizontal(|ui| {
@@ -290,11 +401,11 @@ fn details_pane(ui: &mut egui::Ui, state: &QueueState) {
     });
 
     // Progress summary
-    let downloaded = state
-        .live_downloaded
-        .get(&job.id)
-        .copied()
-        .unwrap_or(job.downloaded_bytes);
+    let downloaded = if state.current_job_id == Some(job.id) {
+        state.current_downloaded
+    } else {
+        job.downloaded_bytes
+    };
     if job.total_bytes > 0 {
         let p = (downloaded as f64 / job.total_bytes as f64).min(1.0);
         ui.add(egui::ProgressBar::new(p as f32).text(format!(
