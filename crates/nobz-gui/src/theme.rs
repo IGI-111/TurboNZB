@@ -5,31 +5,36 @@
 
 use egui::{Context, TextureHandle};
 
-/// Win95 color palette.
+/// Win95 color palette — exact values from COLOR_* system colors.
 pub mod colors {
     use egui::Color32;
     pub const DESKTOP: Color32 = Color32::from_rgb(0, 128, 128); // teal
-    pub const BUTTON_FACE: Color32 = Color32::from_rgb(192, 192, 192); // #c0c0c0
-    pub const BUTTON_HIGHLIGHT: Color32 = Color32::from_rgb(255, 255, 255); // #ffffff
-    pub const BUTTON_LIGHT: Color32 = Color32::from_rgb(223, 223, 223);
-    pub const BUTTON_SHADOW: Color32 = Color32::from_rgb(128, 128, 128); // #808080
-    pub const BUTTON_DARK_SHADOW: Color32 = Color32::from_rgb(64, 64, 64);
-    pub const WINDOW: Color32 = Color32::from_rgb(192, 192, 192);
+    pub const BUTTON_FACE: Color32 = Color32::from_rgb(192, 192, 192); // #c0c0c0 COLOR_BTNFACE
+    pub const BUTTON_HIGHLIGHT: Color32 = Color32::from_rgb(255, 255, 255); // #ffffff COLOR_BTNHIGHLIGHT
+    pub const BUTTON_LIGHT: Color32 = Color32::from_rgb(223, 223, 223); // #dfdfdf COLOR_3DLIGHT
+    pub const BUTTON_SHADOW: Color32 = Color32::from_rgb(128, 128, 128); // #808080 COLOR_BTNSHADOW
+    pub const BUTTON_DARK_SHADOW: Color32 = Color32::from_rgb(0, 0, 0); // #000000 COLOR_3DDKSHADOW
+    pub const WINDOW: Color32 = Color32::from_rgb(255, 255, 255); // COLOR_WINDOW (white)
+    pub const WINDOW_FRAME: Color32 = Color32::from_rgb(0, 0, 0); // COLOR_WINDOWFRAME
     pub const WINDOW_TEXT: Color32 = Color32::from_rgb(0, 0, 0);
-    pub const TITLE_BAR_ACTIVE: Color32 = Color32::from_rgb(0, 0, 128); // navy
+    pub const TITLE_BAR_ACTIVE: Color32 = Color32::from_rgb(0, 14, 122); // #000e7a
+    pub const TITLE_BAR_ACTIVE_GRADIENT: Color32 = Color32::from_rgb(16, 132, 208); // #1084d0
     pub const TITLE_BAR_ACTIVE_TEXT: Color32 = Color32::from_rgb(255, 255, 255);
-    pub const TITLE_BAR_INACTIVE: Color32 = Color32::from_rgb(128, 128, 128);
-    pub const TITLE_BAR_INACTIVE_TEXT: Color32 = Color32::from_rgb(192, 192, 192);
+    pub const TITLE_BAR_INACTIVE: Color32 = Color32::from_rgb(127, 120, 127); // #7f787f
+    pub const TITLE_BAR_INACTIVE_TEXT: Color32 = Color32::from_rgb(198, 198, 198); // #c6c6c6
     pub const SELECTION: Color32 = Color32::from_rgb(0, 0, 128);
     pub const SELECTION_TEXT: Color32 = Color32::from_rgb(255, 255, 255);
     /// Lighter selection for text editing — black text must remain readable.
     pub const TEXT_SELECTION: Color32 = Color32::from_rgb(180, 200, 255);
     pub const HIGHLIGHT: Color32 = Color32::from_rgb(0, 0, 128);
-    pub const LINK: Color32 = Color32::from_rgb(0, 0, 255);
+    pub const LINK: Color32 = Color32::from_rgb(0, 14, 122);
+    pub const DISABLED_TEXT: Color32 = Color32::from_rgb(128, 128, 128); // #808080
+    pub const DISABLED_TEXT_SHADOW: Color32 = Color32::from_rgb(255, 255, 255); // white emboss
 }
 
 /// Icon textures loaded at startup.
 pub struct Icons {
+    // --- React95 icons (legacy, larger 32x32 set) ---
     pub search: TextureHandle,
     pub download: TextureHandle,
     pub folder_open: TextureHandle,
@@ -41,12 +46,42 @@ pub struct Icons {
     pub computer: TextureHandle,
     pub network: TextureHandle,
     pub file_transfer: TextureHandle,
+    // --- Chicago95 16x16 icons for toolbar ---
+    pub tb_play: TextureHandle,
+    pub tb_pause: TextureHandle,
+    pub tb_open: TextureHandle,
+    pub tb_delete: TextureHandle,
+    pub tb_search: TextureHandle,
+    pub tb_download: TextureHandle,
+    pub tb_up: TextureHandle,
+    pub tb_stop: TextureHandle,
+    pub tb_settings: TextureHandle,
+    pub tb_info: TextureHandle,
+    pub tb_warning: TextureHandle,
+    pub tb_network: TextureHandle,
+    pub tb_folder_open: TextureHandle,
+    pub tb_computer: TextureHandle,
+    pub tb_tick: TextureHandle,
+    // --- Chicago95 32x32 icons for tab headers / title bar ---
+    pub tab_search: TextureHandle,
+    pub tab_download: TextureHandle,
+    pub tab_settings: TextureHandle,
+    pub tab_info: TextureHandle,
+    pub tab_warning: TextureHandle,
+    pub tab_network: TextureHandle,
+    pub tab_computer: TextureHandle,
+    pub tab_folder_open: TextureHandle,
+    pub tab_play: TextureHandle,
+    pub tab_pause: TextureHandle,
+    pub tab_tick: TextureHandle,
+    pub tab_stop: TextureHandle,
 }
 
 impl Icons {
     /// Load all icons from embedded PNG data.
     pub fn load(ctx: &Context) -> Self {
         Self {
+            // React95 legacy icons
             search: load_icon(ctx, "FileFind_32x32_4.png"),
             download: load_icon(ctx, "Download_16x16_4.png"),
             folder_open: load_icon(ctx, "FolderOpen_16x16_4.png"),
@@ -58,6 +93,35 @@ impl Icons {
             computer: load_icon(ctx, "Computer_16x16_4.png"),
             network: load_icon(ctx, "Network_32x32_4.png"),
             file_transfer: load_icon(ctx, "FileTransfer_32x32_4.png"),
+            // Chicago95 16x16 toolbar icons
+            tb_play: load_icon(ctx, "win95_play_16.png"),
+            tb_pause: load_icon(ctx, "win95_pause_16.png"),
+            tb_open: load_icon(ctx, "win95_open_16.png"),
+            tb_delete: load_icon(ctx, "win95_delete_16.png"),
+            tb_search: load_icon(ctx, "win95_search_16.png"),
+            tb_download: load_icon(ctx, "win95_download_16.png"),
+            tb_up: load_icon(ctx, "win95_up_16.png"),
+            tb_stop: load_icon(ctx, "win95_stop_16.png"),
+            tb_settings: load_icon(ctx, "win95_settings_16.png"),
+            tb_info: load_icon(ctx, "win95_info_16.png"),
+            tb_warning: load_icon(ctx, "win95_warning_16.png"),
+            tb_network: load_icon(ctx, "win95_network_16.png"),
+            tb_folder_open: load_icon(ctx, "win95_folder_open_16.png"),
+            tb_computer: load_icon(ctx, "win95_computer_16.png"),
+            tb_tick: load_icon(ctx, "Tick_16x16_4.png"),
+            // Chicago95 32x32 tab icons
+            tab_search: load_icon(ctx, "win95_search_32.png"),
+            tab_download: load_icon(ctx, "win95_download_32.png"),
+            tab_settings: load_icon(ctx, "win95_settings_32.png"),
+            tab_info: load_icon(ctx, "win95_info_32.png"),
+            tab_warning: load_icon(ctx, "win95_warning_32.png"),
+            tab_network: load_icon(ctx, "win95_network_32.png"),
+            tab_computer: load_icon(ctx, "win95_computer_32.png"),
+            tab_folder_open: load_icon(ctx, "win95_folder_open_32.png"),
+            tab_play: load_icon(ctx, "win95_play_32.png"),
+            tab_pause: load_icon(ctx, "win95_pause_32.png"),
+            tab_tick: load_icon(ctx, "win95_tick_32.png"),
+            tab_stop: load_icon(ctx, "win95_stop_32.png"),
         }
     }
 }
@@ -75,9 +139,8 @@ fn load_icon(ctx: &Context, filename: &str) -> TextureHandle {
 
 /// Concatenate the icon path prefix.
 fn include_bytes_concat(filename: &str) -> &'static [u8] {
-    // This is a macro-free approach using match. Since include_bytes!
-    // requires a literal, we use a match statement for each icon.
     match filename {
+        // React95 legacy icons
         "FileFind_32x32_4.png" => include_bytes!("../icons/FileFind_32x32_4.png"),
         "Download_16x16_4.png" => include_bytes!("../icons/Download_16x16_4.png"),
         "FolderOpen_16x16_4.png" => include_bytes!("../icons/FolderOpen_16x16_4.png"),
@@ -89,6 +152,34 @@ fn include_bytes_concat(filename: &str) -> &'static [u8] {
         "Computer_16x16_4.png" => include_bytes!("../icons/Computer_16x16_4.png"),
         "Network_32x32_4.png" => include_bytes!("../icons/Network_32x32_4.png"),
         "FileTransfer_32x32_4.png" => include_bytes!("../icons/FileTransfer_32x32_4.png"),
+        // Chicago95 16x16 toolbar icons
+        "win95_play_16.png" => include_bytes!("../icons/win95_play_16.png"),
+        "win95_pause_16.png" => include_bytes!("../icons/win95_pause_16.png"),
+        "win95_open_16.png" => include_bytes!("../icons/win95_open_16.png"),
+        "win95_delete_16.png" => include_bytes!("../icons/win95_delete_16.png"),
+        "win95_search_16.png" => include_bytes!("../icons/win95_search_16.png"),
+        "win95_download_16.png" => include_bytes!("../icons/win95_download_16.png"),
+        "win95_up_16.png" => include_bytes!("../icons/win95_up_16.png"),
+        "win95_stop_16.png" => include_bytes!("../icons/win95_stop_16.png"),
+        "win95_settings_16.png" => include_bytes!("../icons/win95_settings_16.png"),
+        "win95_info_16.png" => include_bytes!("../icons/win95_info_16.png"),
+        "win95_warning_16.png" => include_bytes!("../icons/win95_warning_16.png"),
+        "win95_network_16.png" => include_bytes!("../icons/win95_network_16.png"),
+        "win95_folder_open_16.png" => include_bytes!("../icons/win95_folder_open_16.png"),
+        "win95_computer_16.png" => include_bytes!("../icons/win95_computer_16.png"),
+        // Chicago95 32x32 tab icons
+        "win95_search_32.png" => include_bytes!("../icons/win95_search_32.png"),
+        "win95_download_32.png" => include_bytes!("../icons/win95_download_32.png"),
+        "win95_settings_32.png" => include_bytes!("../icons/win95_settings_32.png"),
+        "win95_info_32.png" => include_bytes!("../icons/win95_info_32.png"),
+        "win95_warning_32.png" => include_bytes!("../icons/win95_warning_32.png"),
+        "win95_network_32.png" => include_bytes!("../icons/win95_network_32.png"),
+        "win95_computer_32.png" => include_bytes!("../icons/win95_computer_32.png"),
+        "win95_folder_open_32.png" => include_bytes!("../icons/win95_folder_open_32.png"),
+        "win95_play_32.png" => include_bytes!("../icons/win95_play_32.png"),
+        "win95_pause_32.png" => include_bytes!("../icons/win95_pause_32.png"),
+        "win95_tick_32.png" => include_bytes!("../icons/win95_tick_32.png"),
+        "win95_stop_32.png" => include_bytes!("../icons/win95_stop_32.png"),
         _ => panic!("unknown icon: {filename}"),
     }
 }
@@ -142,6 +233,10 @@ pub fn apply_theme(ctx: &Context) {
     visuals.faint_bg_color = colors::BUTTON_FACE;
 
     // Widget colors: Win95 beveled button look.
+    // NOTE: egui's bg_stroke is only a single 1px stroke. The authentic Win95
+    // 2-layer bevel (outer highlight/darkest + inner light/shadow) is painted
+    // by our custom win95_widgets. These visuals serve as the fallback for
+    // any stock egui widgets we don't override.
     let widgets = &mut visuals.widgets;
     widgets.noninteractive.bg_fill = colors::BUTTON_FACE;
     widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0_f32, colors::WINDOW_TEXT);
@@ -151,11 +246,11 @@ pub fn apply_theme(ctx: &Context) {
     widgets.inactive.fg_stroke = egui::Stroke::new(1.0_f32, colors::WINDOW_TEXT);
     widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, colors::BUTTON_SHADOW);
 
-    widgets.hovered.bg_fill = colors::BUTTON_LIGHT;
-    widgets.hovered.fg_stroke = egui::Stroke::new(1.0_f32, colors::WINDOW_TEXT);
-    widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, colors::BUTTON_HIGHLIGHT);
+    // Win95 had NO hover state — buttons looked identical whether hovered or not.
+    widgets.hovered = widgets.inactive;
 
-    widgets.active.bg_fill = colors::BUTTON_SHADOW;
+    // Pressed/sunken state: invert the bevel (dark top-left, light bottom-right).
+    widgets.active.bg_fill = colors::BUTTON_FACE;
     widgets.active.fg_stroke = egui::Stroke::new(1.0_f32, colors::WINDOW_TEXT);
     widgets.active.bg_stroke = egui::Stroke::new(1.0_f32, colors::BUTTON_DARK_SHADOW);
 
@@ -183,6 +278,10 @@ pub fn apply_theme(ctx: &Context) {
     // Slightly larger spacing for readability.
     style.spacing.item_spacing = egui::vec2(4.0, 3.0);
     style.spacing.button_padding = egui::vec2(6.0, 4.0);
+
+    // Zero window margin — Win95 apps have no padding around the main
+    // window content. This prevents the grey border on the sides.
+    style.spacing.window_margin = egui::Margin::same(0.0);
 
     // Larger font sizes for readability.
     style.text_styles = {

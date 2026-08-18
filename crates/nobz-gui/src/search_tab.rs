@@ -8,6 +8,7 @@ use nobz_index::types::SearchQuery;
 use crate::backend::{BackendCmd, BackendEvent, BackendHandle};
 use crate::settings::AppConfig;
 use crate::theme::Icons;
+use crate::win95_widgets::Win95Button;
 
 /// State for the search tab.
 #[derive(Debug, Clone)]
@@ -129,208 +130,214 @@ pub fn ui(
     config: &AppConfig,
     icons: Option<&Icons>,
 ) {
-    // Search bar
-    ui.horizontal(|ui| {
-        ui.label("Search:");
-        let response = ui.text_edit_singleline(&mut state.query);
-        ui.label("Category:");
-        egui::ComboBox::from_label("")
-            .selected_text(&state.category)
-            .show_ui(ui, |ui| {
-                for cat in [
-                    "All", "Movies", "TV", "Audio", "PC", "Books", "Console", "XXX",
-                ] {
-                    ui.selectable_value(&mut state.category, cat.to_string(), cat);
+    // Use a frame with horizontal margins so content isn't flush against
+    // the window edges, but still gets the full vertical space.
+    egui::Frame::none()
+        .inner_margin(egui::Margin {
+            left: 8.0,
+            right: 8.0,
+            top: 4.0,
+            bottom: 4.0,
+        })
+        .show(ui, |ui| {
+            // Search bar
+            ui.horizontal(|ui| {
+                ui.label("Search:");
+                let response = ui.text_edit_singleline(&mut state.query);
+                ui.label("Category:");
+                egui::ComboBox::from_label("")
+                    .selected_text(&state.category)
+                    .show_ui(ui, |ui| {
+                        for cat in [
+                            "All", "Movies", "TV", "Audio", "PC", "Books", "Console", "XXX",
+                        ] {
+                            ui.selectable_value(&mut state.category, cat.to_string(), cat);
+                        }
+                    });
+                let searching = state.status == SearchStatus::Searching;
+
+                let enter_pressed =
+                    response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+
+                if enter_pressed
+                    || ui
+                        .add_enabled(!searching, Win95Button::new("Search"))
+                        .clicked()
+                {
+                    if state.query.trim().is_empty() {
+                        state.status = SearchStatus::Error("Enter a search query".into());
+                    } else {
+                        state.status = SearchStatus::Searching;
+                        backend.send(BackendCmd::Search {
+                            query: state.build_query(),
+                        });
+                    }
                 }
             });
-        let searching = state.status == SearchStatus::Searching;
 
-        // Trigger search on Enter key while focused in the text field.
-        let enter_pressed = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            crate::win95_widgets::etched_separator(ui, true);
 
-        if enter_pressed
-            || ui
-                .add_enabled(!searching, egui::Button::new("Search"))
-                .clicked()
-        {
-            if state.query.trim().is_empty() {
-                state.status = SearchStatus::Error("Enter a search query".into());
-            } else {
-                state.status = SearchStatus::Searching;
-                backend.send(BackendCmd::Search {
-                    query: state.build_query(),
-                });
+            // Status line
+            match &state.status {
+                SearchStatus::Idle => {
+                    ui.label("Enter a query and click Search.");
+                }
+                SearchStatus::Searching => {
+                    ui.label("Searching...");
+                }
+                SearchStatus::Results(n) => {
+                    ui.label(format!("{n} results"));
+                }
+                SearchStatus::Error(e) => {
+                    ui.colored_label(egui::Color32::RED, format!("Error: {e}"));
+                }
             }
-        }
-    });
 
-    ui.separator();
+            crate::win95_widgets::etched_separator(ui, true);
 
-    // Status line
-    match &state.status {
-        SearchStatus::Idle => {
-            ui.label("Enter a query and click Search.");
-        }
-        SearchStatus::Searching => {
-            ui.label("Searching…");
-        }
-        SearchStatus::Results(n) => {
-            ui.label(format!("{n} results"));
-        }
-        SearchStatus::Error(e) => {
-            ui.colored_label(egui::Color32::RED, format!("Error: {e}"));
-        }
-    }
+            // Results table
+            let avail_h = ui.available_height();
+            let table = TableBuilder::new(ui)
+                .striped(true)
+                .resizable(true)
+                .auto_shrink(false)
+                .vscroll(true)
+                .min_scrolled_height(avail_h)
+                .column(Column::remainder().clip(true))
+                .column(Column::exact(100.0).clip(true))
+                .column(Column::exact(80.0))
+                .column(Column::exact(50.0))
+                .column(Column::exact(80.0).clip(true))
+                .column(Column::exact(50.0))
+                .column(Column::exact(36.0));
 
-    ui.separator();
-
-    // Results table — Title width is computed from available space so it
-    // stretches with the window while other columns stay fixed.
-    let other_cols: f32 = 100.0 + 80.0 + 50.0 + 80.0 + 50.0 + 80.0; // sources+size+parts+cat+age+action
-    let title_width = (ui.available_width() - other_cols - 16.0).max(150.0);
-
-    let table = TableBuilder::new(ui)
-        .striped(true)
-        .resizable(true)
-        .auto_shrink(false)
-        .column(Column::exact(title_width).clip(true)) // title (stretches with window)
-        .column(Column::exact(100.0).clip(true)) // sources
-        .column(Column::exact(80.0)) // size
-        .column(Column::exact(50.0)) // parts
-        .column(Column::exact(80.0).clip(true)) // cat
-        .column(Column::exact(50.0)) // age
-        .column(Column::exact(80.0)); // action
-
-    table
-        .header(24.0, |mut header| {
-            header.col(|ui| {
-                sort_button(ui, &mut state.sort, SortColumn::Title, "Title");
-            });
-            header.col(|ui| {
-                sort_button(ui, &mut state.sort, SortColumn::Sources, "Sources");
-            });
-            header.col(|ui| {
-                sort_button(ui, &mut state.sort, SortColumn::Size, "Size");
-            });
-            header.col(|ui| {
-                ui.strong("Parts");
-            });
-            header.col(|ui| {
-                sort_button(ui, &mut state.sort, SortColumn::Category, "Cat");
-            });
-            header.col(|ui| {
-                sort_button(ui, &mut state.sort, SortColumn::Age, "Age");
-            });
-            header.col(|ui| {
-                ui.strong("");
-            });
-        })
-        .body(|mut body| {
-            let downloaded = state.downloaded.clone();
-            for (i, result) in state.results.iter().enumerate() {
-                let already_downloaded = downloaded.contains(&i);
-                let row_height = 22.0;
-                body.row(row_height, |mut row| {
-                    row.col(|ui| {
-                        ui.label(&result.result.title);
+            table
+                .header(24.0, |mut header| {
+                    header.col(|ui| {
+                        sort_button(ui, &mut state.sort, SortColumn::Title, "Title");
                     });
-                    row.col(|ui| {
-                        ui.label(result.sources.join(", "));
+                    header.col(|ui| {
+                        sort_button(ui, &mut state.sort, SortColumn::Sources, "Sources");
                     });
-                    row.col(|ui| {
-                        ui.label(format_size(result.result.size));
+                    header.col(|ui| {
+                        sort_button(ui, &mut state.sort, SortColumn::Size, "Size");
                     });
-                    row.col(|ui| {
-                        if result.result.files > 0 {
-                            ui.label(result.result.files.to_string());
-                        } else {
-                            ui.label("?");
-                        }
+                    header.col(|ui| {
+                        ui.strong("Parts");
                     });
-                    row.col(|ui| {
-                        ui.label(&result.result.category_name);
+                    header.col(|ui| {
+                        sort_button(ui, &mut state.sort, SortColumn::Category, "Cat");
                     });
-                    row.col(|ui| {
-                        ui.label(format_age(result.result.post_date));
+                    header.col(|ui| {
+                        sort_button(ui, &mut state.sort, SortColumn::Age, "Age");
                     });
-                    row.col(|ui| {
-                        if let Some(icons) = icons {
-                            let (img, tooltip) = if already_downloaded {
-                                (
-                                    egui::Image::from_texture(&icons.tick)
-                                        .fit_to_exact_size(egui::vec2(16.0, 16.0)),
-                                    "Added to queue",
-                                )
-                            } else {
-                                (
-                                    egui::Image::from_texture(&icons.download)
-                                        .fit_to_exact_size(egui::vec2(16.0, 16.0)),
-                                    "Download",
-                                )
-                            };
-                            let btn = egui::Button::image(img).small();
-                            if ui
-                                .add_enabled(!already_downloaded, btn)
-                                .on_hover_text(tooltip)
-                                .clicked()
-                            {
-                                let url = result.result.nzb_url.clone();
-                                let title = result.result.title.clone();
-                                let category = if state.category == "All" {
-                                    None
+                    header.col(|ui| {
+                        ui.strong("");
+                    });
+                })
+                .body(|mut body| {
+                    let downloaded = state.downloaded.clone();
+                    for (i, result) in state.results.iter().enumerate() {
+                        let already_downloaded = downloaded.contains(&i);
+                        let row_height = 22.0;
+                        body.row(row_height, |mut row| {
+                            row.col(|ui| {
+                                ui.label(&result.result.title);
+                            });
+                            row.col(|ui| {
+                                ui.label(result.sources.join(", "));
+                            });
+                            row.col(|ui| {
+                                ui.label(format_size(result.result.size));
+                            });
+                            row.col(|ui| {
+                                if result.result.files > 0 {
+                                    ui.label(result.result.files.to_string());
                                 } else {
-                                    Some(state.category.clone())
-                                };
-                                let download_dir = config.download_dir.clone();
-                                backend.send(BackendCmd::DownloadFromUrl {
-                                    url,
-                                    title,
-                                    download_dir,
-                                    category,
-                                });
-                                state.downloaded.insert(i);
-                            }
-                        } else {
-                            if ui
-                                .add_enabled(!already_downloaded, egui::Button::new("Download"))
-                                .clicked()
-                            {
-                                let url = result.result.nzb_url.clone();
-                                let title = result.result.title.clone();
-                                let category = if state.category == "All" {
-                                    None
+                                    ui.label("?");
+                                }
+                            });
+                            row.col(|ui| {
+                                ui.label(&result.result.category_name);
+                            });
+                            row.col(|ui| {
+                                ui.label(format_age(result.result.post_date));
+                            });
+                            row.col(|ui| {
+                                if let Some(icons) = icons {
+                                    let (img, tooltip) = if already_downloaded {
+                                        (
+                                            egui::Image::from_texture(&icons.tab_tick)
+                                                .fit_to_exact_size(egui::vec2(16.0, 16.0)),
+                                            "Added to queue",
+                                        )
+                                    } else {
+                                        (
+                                            egui::Image::from_texture(&icons.tab_download)
+                                                .fit_to_exact_size(egui::vec2(16.0, 16.0)),
+                                            "Download",
+                                        )
+                                    };
+                                    let btn = egui::Button::image(img).small();
+                                    if ui
+                                        .add_enabled(!already_downloaded, btn)
+                                        .on_hover_text(tooltip)
+                                        .clicked()
+                                    {
+                                        let url = result.result.nzb_url.clone();
+                                        let title = result.result.title.clone();
+                                        let category = if state.category == "All" {
+                                            None
+                                        } else {
+                                            Some(state.category.clone())
+                                        };
+                                        let download_dir = config.download_dir.clone();
+                                        backend.send(BackendCmd::DownloadFromUrl {
+                                            url,
+                                            title,
+                                            download_dir,
+                                            category,
+                                        });
+                                        state.downloaded.insert(i);
+                                    }
                                 } else {
-                                    Some(state.category.clone())
-                                };
-                                let download_dir = config.download_dir.clone();
-                                backend.send(BackendCmd::DownloadFromUrl {
-                                    url,
-                                    title,
-                                    download_dir,
-                                    category,
-                                });
-                                state.downloaded.insert(i);
-                            }
-                        }
-                    });
+                                    if ui
+                                        .add_enabled(
+                                            !already_downloaded,
+                                            Win95Button::new("Download"),
+                                        )
+                                        .clicked()
+                                    {
+                                        let url = result.result.nzb_url.clone();
+                                        let title = result.result.title.clone();
+                                        let category = if state.category == "All" {
+                                            None
+                                        } else {
+                                            Some(state.category.clone())
+                                        };
+                                        let download_dir = config.download_dir.clone();
+                                        backend.send(BackendCmd::DownloadFromUrl {
+                                            url,
+                                            title,
+                                            download_dir,
+                                            category,
+                                        });
+                                        state.downloaded.insert(i);
+                                    }
+                                }
+                            });
+                        });
+                    }
                 });
-            }
         });
-
-    // No bulk action anymore — single download per row.
 }
 
 /// Render a sortable column header. Clicking toggles sort direction, or
-/// switches to that column. Uses a plain label (not a Button) to avoid
-/// layout issues in table headers.
+/// switches to that column.
 fn sort_button(ui: &mut egui::Ui, sort: &mut SortState, col: SortColumn, label: &str) {
     let is_active = sort.col == col;
     let arrow = if is_active {
-        if sort.asc {
-            " ^" // ascending
-        } else {
-            " v" // descending
-        }
+        if sort.asc { " ^" } else { " v" }
     } else {
         ""
     };

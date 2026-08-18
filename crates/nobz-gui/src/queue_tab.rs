@@ -17,6 +17,7 @@ use nobz_core::queue::{JobState, QueueJob};
 
 use crate::backend::{BackendCmd, BackendEvent, BackendHandle, JobFileDetail};
 use crate::theme::Icons;
+use crate::win95_widgets::{Win95Button, Win95IconButton, Win95ProgressBar, paint_sunken_bevel};
 
 /// State for the queue tab.
 #[derive(Debug, Clone, Default)]
@@ -127,87 +128,132 @@ pub fn ui(
     ui: &mut egui::Ui,
     state: &mut QueueState,
     backend: &BackendHandle,
-    _icons: Option<&Icons>,
+    icons: Option<&Icons>,
 ) {
-    // Top: toolbar with Open NZB, Play/Pause, and Clear completed.
-    ui.horizontal(|ui| {
-        // Open NZB file from disk.
-        if icon_button(ui, IconKind::Open, true, "Open NZB file").clicked() {
-            if let Some(path) = rfd::FileDialog::new()
-                .add_filter("NZB files", &["nzb"])
-                .pick_file()
-            {
-                backend.send(BackendCmd::OpenNzbFile { path });
+    // Use a frame with horizontal margins so content isn't flush against
+    // the window edges, but still gets the full vertical space.
+    egui::Frame::none()
+        .inner_margin(egui::Margin {
+            left: 8.0,
+            right: 8.0,
+            top: 4.0,
+            bottom: 4.0,
+        })
+        .show(ui, |ui| {
+            // Top: toolbar with Open NZB, Play/Pause, and Clear completed.
+            ui.horizontal(|ui| {
+                // Open NZB file from disk.
+                if let Some(icons) = icons {
+                    if ui
+                        .add(Win95IconButton::new(icons.tb_open.clone()).tooltip("Open NZB file"))
+                        .clicked()
+                    {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("NZB files", &["nzb"])
+                            .pick_file()
+                        {
+                            backend.send(BackendCmd::OpenNzbFile { path });
+                        }
+                    }
+                }
+
+                // Global Play/Pause — always visible. Controls the download engine.
+                if state.engine_paused {
+                    if let Some(icons) = icons {
+                        if ui
+                            .add(
+                                Win95IconButton::new(icons.tb_play.clone())
+                                    .tooltip("Start downloads"),
+                            )
+                            .clicked()
+                        {
+                            backend.send(BackendCmd::ResumeEngine);
+                        }
+                    }
+                } else {
+                    if let Some(icons) = icons {
+                        if ui
+                            .add(
+                                Win95IconButton::new(icons.tb_pause.clone())
+                                    .tooltip("Pause downloads"),
+                            )
+                            .clicked()
+                        {
+                            backend.send(BackendCmd::PauseEngine);
+                        }
+                    }
+                }
+
+                // Clear completed — only enabled if there are completed/failed jobs.
+                let has_completed = state
+                    .jobs
+                    .iter()
+                    .any(|j| matches!(j.state, JobState::Complete | JobState::Failed));
+                if let Some(icons) = icons {
+                    if ui
+                        .add(
+                            Win95IconButton::new(icons.tb_delete.clone())
+                                .enabled(has_completed)
+                                .tooltip("Clear completed"),
+                        )
+                        .clicked()
+                    {
+                        backend.send(BackendCmd::ClearCompleted);
+                    }
+                }
+            });
+
+            crate::win95_widgets::etched_separator(ui, true);
+
+            if state.jobs.is_empty() {
+                ui.add_space(20.0);
+                ui.label("Queue is empty. Search and download something!");
+                return;
             }
-        }
 
-        // Global Play/Pause — always visible. Controls the download engine.
-        if state.engine_paused {
-            if icon_button(ui, IconKind::Play, true, "Start downloads").clicked() {
-                backend.send(BackendCmd::ResumeEngine);
-            }
-        } else {
-            if icon_button(ui, IconKind::Pause, true, "Pause downloads").clicked() {
-                backend.send(BackendCmd::PauseEngine);
-            }
-        }
+            // Split the remaining space: three panes.
+            let available = ui.available_height();
+            let graph_height = 100.0;
+            let bottom_height = 180.0_f32.min((available - graph_height) * 0.35).max(80.0);
+            let top_height = (available - graph_height - bottom_height).max(120.0);
 
-        // Clear completed — only enabled if there are completed/failed jobs.
-        let has_completed = state
-            .jobs
-            .iter()
-            .any(|j| matches!(j.state, JobState::Complete | JobState::Failed));
-        if icon_button(ui, IconKind::Clear, has_completed, "Clear completed").clicked() {
-            backend.send(BackendCmd::ClearCompleted);
-        }
-    });
+            // --- Top pane: job list ---
+            ui.push_id("job_list_pane", |ui| {
+                ui.allocate_ui(egui::vec2(ui.available_width(), top_height), |ui| {
+                    job_list_pane(ui, state, backend, icons);
+                });
+            });
 
-    ui.separator();
+            crate::win95_widgets::etched_separator(ui, true);
 
-    if state.jobs.is_empty() {
-        ui.label("Queue is empty. Search and download something!");
-        return;
-    }
+            // --- Middle pane: speed graph ---
+            ui.push_id("speed_graph_pane", |ui| {
+                ui.allocate_ui(egui::vec2(ui.available_width(), graph_height), |ui| {
+                    speed_graph_pane(ui, state);
+                });
+            });
 
-    // Split the remaining space: three panes.
-    let available = ui.available_height();
-    let graph_height = 100.0;
-    let top_height = ((available - graph_height) * 0.50).max(120.0);
-    let bottom_height = (available - top_height - graph_height).max(120.0);
+            crate::win95_widgets::etched_separator(ui, true);
 
-    // --- Top pane: job list ---
-    ui.push_id("job_list_pane", |ui| {
-        ui.allocate_ui(egui::vec2(ui.available_width(), top_height), |ui| {
-            job_list_pane(ui, state, backend);
+            // --- Bottom pane: job details ---
+            ui.push_id("details_pane", |ui| {
+                ui.allocate_ui(egui::vec2(ui.available_width(), bottom_height), |ui| {
+                    details_pane(ui, state);
+                });
+            });
         });
-    });
-
-    ui.separator();
-
-    // --- Middle pane: speed graph ---
-    ui.push_id("speed_graph_pane", |ui| {
-        ui.allocate_ui(egui::vec2(ui.available_width(), graph_height), |ui| {
-            speed_graph_pane(ui, state);
-        });
-    });
-
-    ui.separator();
-
-    // --- Bottom pane: job details ---
-    ui.push_id("details_pane", |ui| {
-        ui.allocate_ui(egui::vec2(ui.available_width(), bottom_height), |ui| {
-            details_pane(ui, state);
-        });
-    });
 }
 
 /// Top pane: table of all jobs with clickable rows.
-fn job_list_pane(ui: &mut egui::Ui, state: &mut QueueState, backend: &BackendHandle) {
-    // Name width = available - (State + Progress + Actions) - padding
+fn job_list_pane(
+    ui: &mut egui::Ui,
+    state: &mut QueueState,
+    backend: &BackendHandle,
+    icons: Option<&Icons>,
+) {
     let state_w = 80.0;
     let progress_w = 220.0;
-    let actions_w = 78.0; // 3 icon buttons: up, down, delete
-    let name_width = (ui.available_width() - state_w - progress_w - actions_w - 16.0).max(100.0);
+    let actions_w = 90.0; // 3 icon buttons: up, down, delete
 
     let avail_h = ui.available_height();
     let table = TableBuilder::new(ui)
@@ -216,14 +262,14 @@ fn job_list_pane(ui: &mut egui::Ui, state: &mut QueueState, backend: &BackendHan
         .auto_shrink(false)
         .vscroll(true)
         .min_scrolled_height(avail_h)
-        .column(Column::exact(name_width).clip(true)) // Name (stretches)
+        .column(Column::remainder().clip(true)) // Name (stretches)
         .column(Column::exact(state_w)) // State
         .column(Column::exact(progress_w)) // Progress
         .column(Column::exact(actions_w)); // Actions
 
     table
         .header(20.0, |mut header| {
-            for label in ["Name", "State", "Progress", ""] {
+            for label in ["Name", "State", "Progress", "Actions"] {
                 header.col(|ui| {
                     ui.strong(label);
                 });
@@ -286,25 +332,64 @@ fn job_list_pane(ui: &mut egui::Ui, state: &mut QueueState, backend: &BackendHan
                         } else {
                             (0.0, "—".into())
                         };
-                        ui.add(egui::ProgressBar::new(pct).text(bar_text));
+                        ui.add(Win95ProgressBar::new(pct).text(bar_text));
                     });
                     row.col(|ui| {
                         ui.horizontal(|ui| {
-                            // Up button — disabled for first row.
-                            if icon_button(ui, IconKind::Up, row_idx > 0, "Move up").clicked() {
-                                backend.send(BackendCmd::MoveJobUp { job_id: job.id });
-                            }
-                            // Down button — disabled for last row.
-                            if icon_button(ui, IconKind::Down, row_idx < job_count - 1, "Move down")
-                                .clicked()
-                            {
-                                backend.send(BackendCmd::MoveJobDown { job_id: job.id });
-                            }
-                            // Delete button.
-                            if icon_button(ui, IconKind::Delete, true, "Delete").clicked() {
-                                backend.send(BackendCmd::DeleteJob { job_id: job.id });
-                                if selected == Some(job.id) {
-                                    state.clear_selection(backend);
+                            if let Some(icons) = icons {
+                                // Up button — disabled for first row.
+                                if ui
+                                    .add(
+                                        Win95IconButton::new(icons.tb_up.clone())
+                                            .enabled(row_idx > 0)
+                                            .tooltip("Move up"),
+                                    )
+                                    .clicked()
+                                {
+                                    backend.send(BackendCmd::MoveJobUp { job_id: job.id });
+                                }
+                                // Down button — disabled for last row.
+                                if ui
+                                    .add(
+                                        Win95IconButton::new(icons.tb_download.clone())
+                                            .enabled(row_idx < job_count - 1)
+                                            .tooltip("Move down"),
+                                    )
+                                    .clicked()
+                                {
+                                    backend.send(BackendCmd::MoveJobDown { job_id: job.id });
+                                }
+                                // Delete button.
+                                if ui
+                                    .add(
+                                        Win95IconButton::new(icons.tb_delete.clone())
+                                            .tooltip("Delete"),
+                                    )
+                                    .clicked()
+                                {
+                                    backend.send(BackendCmd::DeleteJob { job_id: job.id });
+                                    if selected == Some(job.id) {
+                                        state.clear_selection(backend);
+                                    }
+                                }
+                            } else {
+                                if ui
+                                    .add_enabled(row_idx > 0, Win95Button::new("Up"))
+                                    .clicked()
+                                {
+                                    backend.send(BackendCmd::MoveJobUp { job_id: job.id });
+                                }
+                                if ui
+                                    .add_enabled(row_idx < job_count - 1, Win95Button::new("Down"))
+                                    .clicked()
+                                {
+                                    backend.send(BackendCmd::MoveJobDown { job_id: job.id });
+                                }
+                                if ui.add(Win95Button::new("Delete")).clicked() {
+                                    backend.send(BackendCmd::DeleteJob { job_id: job.id });
+                                    if selected == Some(job.id) {
+                                        state.clear_selection(backend);
+                                    }
                                 }
                             }
                         });
@@ -320,12 +405,18 @@ fn speed_graph_pane(ui: &mut egui::Ui, state: &QueueState) {
     let (rect, _) = ui.allocate_at_least(available, egui::Sense::hover());
     let painter = ui.painter_at(rect);
 
-    let bg = Color32::from_rgb(30, 30, 40);
-    let grid = Color32::from_rgb(50, 50, 60);
-    let line = Color32::from_rgb(80, 220, 80);
-    let text = Color32::from_rgb(200, 200, 200);
+    // Win95 sunken bevel + white background.
+    painter.rect_filled(rect, 0.0, crate::theme::colors::BUTTON_FACE);
+    paint_sunken_bevel(&painter, rect);
+    let inner = rect.shrink(2.0);
+    painter.rect_filled(inner, 0.0, crate::theme::colors::WINDOW);
 
-    painter.rect_filled(rect, 0.0, bg);
+    let bg = Color32::from_rgb(255, 255, 255);
+    let grid = Color32::from_rgb(200, 200, 200);
+    let line = crate::theme::colors::TITLE_BAR_ACTIVE;
+    let text = Color32::from_rgb(0, 0, 0);
+
+    painter.rect_filled(inner, 0.0, bg);
 
     if state.current_job_id.is_none() || state.speed_history.is_empty() {
         painter.text(
@@ -340,9 +431,9 @@ fn speed_graph_pane(ui: &mut egui::Ui, state: &QueueState) {
 
     // Draw horizontal grid lines (4 lines).
     for i in 0..=4 {
-        let y = rect.top() + (rect.height() * i as f32 / 4.0);
+        let y = inner.top() + (inner.height() * i as f32 / 4.0);
         painter.line_segment(
-            [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
+            [egui::pos2(inner.left(), y), egui::pos2(inner.right(), y)],
             egui::Stroke::new(1.0_f32, grid),
         );
     }
@@ -352,8 +443,8 @@ fn speed_graph_pane(ui: &mut egui::Ui, state: &QueueState) {
     let n = history.len();
     let padding = 8.0;
     let plot_rect = egui::Rect::from_min_max(
-        egui::pos2(rect.left() + padding, rect.top() + padding),
-        egui::pos2(rect.right() - padding, rect.bottom() - padding),
+        egui::pos2(inner.left() + padding, inner.top() + padding),
+        egui::pos2(inner.right() - padding, inner.bottom() - padding),
     );
 
     // Draw the speed line.
@@ -369,8 +460,6 @@ fn speed_graph_pane(ui: &mut egui::Ui, state: &QueueState) {
     }
 
     if points.len() >= 2 {
-        // Draw the speed line only — no fill (fill creates visible edges
-        // from the baseline to the first/last data points).
         painter.add(egui::Shape::line(points, egui::Stroke::new(2.0_f32, line)));
     } else if points.len() == 1 {
         painter.circle_filled(points[0], 3.0, line);
@@ -393,7 +482,7 @@ fn speed_graph_pane(ui: &mut egui::Ui, state: &QueueState) {
         egui::Align2::RIGHT_TOP,
         &max_label,
         egui::FontId::proportional(11.0),
-        Color32::from_rgb(140, 140, 140),
+        Color32::from_rgb(100, 100, 100),
     );
 
     // Draw downloaded / total.
@@ -409,7 +498,7 @@ fn speed_graph_pane(ui: &mut egui::Ui, state: &QueueState) {
             egui::Align2::RIGHT_BOTTOM,
             &progress_label,
             egui::FontId::proportional(11.0),
-            Color32::from_rgb(140, 140, 140),
+            Color32::from_rgb(100, 100, 100),
         );
     }
 }
@@ -446,7 +535,7 @@ fn details_pane(ui: &mut egui::Ui, state: &QueueState) {
     };
     if job.total_bytes > 0 {
         let p = (downloaded as f64 / job.total_bytes as f64).min(1.0);
-        ui.add(egui::ProgressBar::new(p as f32).text(format!(
+        ui.add(Win95ProgressBar::new(p as f32).text(format!(
             "{} / {} ({}%)",
             format_size(downloaded),
             format_size(job.total_bytes),
@@ -474,7 +563,7 @@ fn details_pane(ui: &mut egui::Ui, state: &QueueState) {
         });
     }
 
-    ui.separator();
+    crate::win95_widgets::etched_separator(ui, true);
 
     // File list table with per-file segment dot grid
     if state.job_details.is_empty() {
@@ -486,7 +575,6 @@ fn details_pane(ui: &mut egui::Ui, state: &QueueState) {
     let segs_w = 80.0;
     let size_w = 140.0;
     let grid_w = 170.0;
-    let file_width = (ui.available_width() - segs_w - size_w - grid_w - 16.0).max(100.0);
 
     let avail_h = ui.available_height();
     let table = TableBuilder::new(ui)
@@ -495,7 +583,7 @@ fn details_pane(ui: &mut egui::Ui, state: &QueueState) {
         .auto_shrink(false)
         .vscroll(true)
         .min_scrolled_height(avail_h)
-        .column(Column::exact(file_width).clip(true)) // Filename (stretches)
+        .column(Column::remainder().clip(true)) // Filename (stretches)
         .column(Column::exact(segs_w)) // Segs
         .column(Column::exact(size_w)) // Size
         .column(Column::exact(grid_w)); // Segment grid
@@ -558,7 +646,7 @@ fn file_segment_grid(ui: &mut egui::Ui, file: &JobFileDetail) {
         let x = rect.left() + col as f32 * (dot_size + gap);
         let y = rect.top() + row as f32 * (dot_size + gap);
         let color = if i < done {
-            Color32::from_rgb(80, 180, 80) // green = done
+            Color32::from_rgb(0, 0, 128) // navy = done (Win95 blue)
         } else if i < done + missing {
             Color32::from_rgb(200, 60, 60) // red = missing
         } else {
@@ -576,8 +664,8 @@ fn state_color(state: &JobState) -> (Color32, &'static str) {
     match state {
         JobState::Fetching => (Color32::from_rgb(100, 150, 220), "Fetching..."),
         JobState::Queued => (Color32::from_rgb(120, 120, 120), "Queued"),
-        JobState::Downloading => (Color32::from_rgb(80, 180, 80), "Downloading"),
-        JobState::Complete => (Color32::from_rgb(60, 160, 60), "Complete"),
+        JobState::Downloading => (Color32::from_rgb(0, 128, 0), "Downloading"),
+        JobState::Complete => (Color32::from_rgb(0, 128, 0), "Complete"),
         JobState::Failed => (Color32::from_rgb(200, 60, 60), "Failed"),
     }
 }
@@ -617,210 +705,4 @@ fn format_size(bytes: u64) -> String {
     } else {
         format!("{bytes} B")
     }
-}
-
-// --- Vector-drawn icon buttons (no font dependency) ---
-
-/// Which icon to draw on a button.
-#[derive(Hash)]
-enum IconKind {
-    Play,
-    Pause,
-    Delete,
-    Up,
-    Down,
-    Clear,
-    Open,
-}
-
-/// A small button with a vector-drawn icon. Uses `ui.interact` for proper
-/// enabled/disabled/hover/click state handling.
-fn icon_button(ui: &mut egui::Ui, kind: IconKind, enabled: bool, tooltip: &str) -> egui::Response {
-    let size = egui::vec2(24.0, 20.0);
-    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
-    let id = ui.id().with(("icon_btn", &kind));
-    let sense = if enabled {
-        egui::Sense::click()
-    } else {
-        egui::Sense::hover()
-    };
-    let response = ui.interact(rect, id, sense).on_hover_text(tooltip);
-
-    let painter = ui.painter_at(rect);
-    let visuals = ui.style().interact(&response);
-
-    // Button background.
-    painter.rect_filled(rect, 0.0, visuals.bg_fill);
-    painter.rect_stroke(rect, 0.0, visuals.bg_stroke);
-
-    // Icon color: black when enabled, grey when disabled.
-    let icon_color = if enabled {
-        Color32::from_rgb(0, 0, 0)
-    } else {
-        Color32::from_rgb(128, 128, 128)
-    };
-
-    let cx = rect.center().x;
-    let cy = rect.center().y;
-    let s = 5.0; // half-size of the icon
-
-    match kind {
-        IconKind::Play => {
-            let p1 = egui::pos2(cx - s * 0.6, cy - s);
-            let p2 = egui::pos2(cx - s * 0.6, cy + s);
-            let p3 = egui::pos2(cx + s, cy);
-            painter.add(egui::Shape::convex_polygon(
-                vec![p1, p2, p3],
-                icon_color,
-                egui::Stroke::NONE,
-            ));
-        }
-        IconKind::Pause => {
-            let bar_w = 2.5_f32;
-            let bar_h = s * 2.0;
-            let gap = 2.5_f32;
-            let total_w = bar_w * 2.0 + gap;
-            let left_x = cx - total_w / 2.0;
-            let right_x = left_x + bar_w + gap;
-            let top_y = cy - bar_h / 2.0;
-            painter.rect_filled(
-                egui::Rect::from_min_size(egui::pos2(left_x, top_y), egui::vec2(bar_w, bar_h)),
-                0.0,
-                icon_color,
-            );
-            painter.rect_filled(
-                egui::Rect::from_min_size(egui::pos2(right_x, top_y), egui::vec2(bar_w, bar_h)),
-                0.0,
-                icon_color,
-            );
-        }
-        IconKind::Delete => {
-            let stroke = egui::Stroke::new(2.0_f32, icon_color);
-            painter.line_segment(
-                [egui::pos2(cx - s, cy - s), egui::pos2(cx + s, cy + s)],
-                stroke,
-            );
-            painter.line_segment(
-                [egui::pos2(cx + s, cy - s), egui::pos2(cx - s, cy + s)],
-                stroke,
-            );
-        }
-        IconKind::Up => {
-            // Up arrow: filled triangle pointing up.
-            let p1 = egui::pos2(cx, cy - s);
-            let p2 = egui::pos2(cx - s, cy + s * 0.7);
-            let p3 = egui::pos2(cx + s, cy + s * 0.7);
-            painter.add(egui::Shape::convex_polygon(
-                vec![p1, p2, p3],
-                icon_color,
-                egui::Stroke::NONE,
-            ));
-        }
-        IconKind::Down => {
-            // Down arrow: filled triangle pointing down.
-            let p1 = egui::pos2(cx, cy + s);
-            let p2 = egui::pos2(cx - s, cy - s * 0.7);
-            let p3 = egui::pos2(cx + s, cy - s * 0.7);
-            painter.add(egui::Shape::convex_polygon(
-                vec![p1, p2, p3],
-                icon_color,
-                egui::Stroke::NONE,
-            ));
-        }
-        IconKind::Clear => {
-            // Trash can: lid + handle + trapezoid body.
-            let stroke = egui::Stroke::new(2.0_f32, icon_color);
-            // Handle: small line on top.
-            painter.line_segment(
-                [
-                    egui::pos2(cx - s * 0.3, cy - s),
-                    egui::pos2(cx + s * 0.3, cy - s),
-                ],
-                stroke,
-            );
-            // Lid: horizontal line.
-            painter.line_segment(
-                [
-                    egui::pos2(cx - s, cy - s * 0.6),
-                    egui::pos2(cx + s, cy - s * 0.6),
-                ],
-                stroke,
-            );
-            // Body: left side.
-            painter.line_segment(
-                [
-                    egui::pos2(cx - s * 0.7, cy - s * 0.6),
-                    egui::pos2(cx - s * 0.4, cy + s),
-                ],
-                stroke,
-            );
-            // Body: right side.
-            painter.line_segment(
-                [
-                    egui::pos2(cx + s * 0.7, cy - s * 0.6),
-                    egui::pos2(cx + s * 0.4, cy + s),
-                ],
-                stroke,
-            );
-            // Body: bottom.
-            painter.line_segment(
-                [
-                    egui::pos2(cx - s * 0.4, cy + s),
-                    egui::pos2(cx + s * 0.4, cy + s),
-                ],
-                stroke,
-            );
-        }
-        IconKind::Open => {
-            // Folder icon: tab on top-left + body rectangle.
-            let stroke = egui::Stroke::new(2.0_f32, icon_color);
-            // Tab (the little notch on the folder flap).
-            painter.line_segment(
-                [
-                    egui::pos2(cx - s, cy - s * 0.5),
-                    egui::pos2(cx - s * 0.3, cy - s * 0.5),
-                ],
-                stroke,
-            );
-            painter.line_segment(
-                [
-                    egui::pos2(cx - s * 0.3, cy - s * 0.5),
-                    egui::pos2(cx - s * 0.1, cy - s * 0.8),
-                ],
-                stroke,
-            );
-            painter.line_segment(
-                [
-                    egui::pos2(cx - s * 0.1, cy - s * 0.8),
-                    egui::pos2(cx + s, cy - s * 0.8),
-                ],
-                stroke,
-            );
-            // Top edge.
-            painter.line_segment(
-                [
-                    egui::pos2(cx + s, cy - s * 0.8),
-                    egui::pos2(cx + s, cy - s * 0.5),
-                ],
-                stroke,
-            );
-            // Right side.
-            painter.line_segment(
-                [egui::pos2(cx + s, cy - s * 0.5), egui::pos2(cx + s, cy + s)],
-                stroke,
-            );
-            // Bottom.
-            painter.line_segment(
-                [egui::pos2(cx - s, cy + s), egui::pos2(cx + s, cy + s)],
-                stroke,
-            );
-            // Left side.
-            painter.line_segment(
-                [egui::pos2(cx - s, cy - s * 0.5), egui::pos2(cx - s, cy + s)],
-                stroke,
-            );
-        }
-    }
-
-    response
 }

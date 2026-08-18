@@ -12,6 +12,7 @@ pub mod search_tab;
 pub mod settings;
 pub mod settings_tab;
 pub mod theme;
+pub mod win95_widgets;
 pub mod wizard;
 
 pub type Result<T> = std::result::Result<T, anyhow::Error>;
@@ -20,12 +21,13 @@ use std::sync::Arc;
 
 use eframe::egui;
 
-use crate::backend::{Backend, BackendEvent, BackendHandle};
+use crate::backend::{Backend, BackendCmd, BackendEvent, BackendHandle};
 use crate::queue_tab::QueueState;
 use crate::search_tab::SearchState;
 use crate::settings::AppConfig;
 use crate::settings_tab::SettingsState;
 use crate::theme::{Icons, apply_theme};
+use crate::win95_widgets::{Win95TabButton, status_segment};
 use crate::wizard::Wizard;
 
 const ORG_NAME: &str = "nobz";
@@ -55,6 +57,8 @@ pub struct NobzApp {
     queue: QueueState,
     settings: SettingsState,
     icons: Option<Icons>,
+    /// Show the About dialog.
+    show_about: bool,
 }
 
 impl NobzApp {
@@ -92,6 +96,7 @@ impl NobzApp {
             queue: QueueState::default(),
             settings: SettingsState::default(),
             icons: Some(icons),
+            show_about: false,
         }
     }
 
@@ -135,30 +140,87 @@ impl NobzApp {
         }
     }
 
-    /// Render a tab button with an icon + label.
-    fn tab_button(
-        ui: &mut egui::Ui,
-        icon: Option<&egui::TextureHandle>,
-        label: &str,
-        is_selected: bool,
-    ) -> bool {
-        let icon_img =
-            icon.map(|t| egui::Image::from_texture(t).fit_to_exact_size(egui::vec2(24.0, 24.0)));
-        let btn = egui::Button::opt_image_and_text(icon_img, Some(label.into()));
-        if is_selected {
-            // Subtle: slightly lighter background + thin bottom border,
-            // like a Win95 pressed tab.
-            ui.add(
-                btn.fill(egui::Color32::from_rgb(223, 223, 223))
-                    .stroke(egui::Stroke::new(
-                        1.0_f32,
-                        egui::Color32::from_rgb(128, 128, 128),
-                    )),
-            )
-            .clicked()
-        } else {
-            ui.add(btn).clicked()
-        }
+    /// Render the menu bar (File / Queue / Settings / Help).
+    fn menu_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.horizontal(|ui| {
+            ui.add_space(4.0);
+            // File menu
+            ui.menu_button("File", |ui| {
+                if ui.button("Open NZB...").clicked() {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("NZB files", &["nzb"])
+                        .pick_file()
+                    {
+                        self.backend.send(BackendCmd::OpenNzbFile { path });
+                    }
+                }
+                ui.separator();
+                if ui.button("Exit").clicked() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            });
+
+            // Queue menu
+            ui.menu_button("Queue", |ui| {
+                if self.queue.engine_paused {
+                    if ui.button("Resume downloads").clicked() {
+                        self.backend.send(BackendCmd::ResumeEngine);
+                    }
+                } else {
+                    if ui.button("Pause downloads").clicked() {
+                        self.backend.send(BackendCmd::PauseEngine);
+                    }
+                }
+                ui.separator();
+                if ui.button("Clear completed").clicked() {
+                    self.backend.send(BackendCmd::ClearCompleted);
+                }
+            });
+
+            // Settings menu
+            ui.menu_button("Settings", |ui| {
+                if ui.button("Go to Settings...").clicked() {
+                    self.tab = Tab::Settings;
+                }
+            });
+
+            // Help menu
+            ui.menu_button("Help", |ui| {
+                if ui.button("About Nobz").clicked() {
+                    self.show_about = true;
+                }
+            });
+        });
+    }
+
+    /// Render the status bar at the bottom.
+    fn status_bar(&self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            let speed_text = if self.queue.current_job_id.is_some() {
+                format!("{}/s", format_speed(self.queue.current_speed as u64))
+            } else {
+                "Idle".to_string()
+            };
+            let speed_icon = if self.queue.current_job_id.is_some() {
+                self.icons.as_ref().map(|i| i.tb_network.clone())
+            } else {
+                None
+            };
+            status_segment(ui, 200.0, 22.0, &speed_text, speed_icon);
+
+            let job_count = self.queue.jobs.len();
+            let jobs_text = format!("{job_count} job(s)");
+            status_segment(ui, 120.0, 22.0, &jobs_text, None);
+
+            let engine_text = if self.queue.engine_paused {
+                "Paused"
+            } else if self.queue.current_job_id.is_some() {
+                "Downloading"
+            } else {
+                "Ready"
+            };
+            status_segment(ui, 120.0, 22.0, engine_text, None);
+        });
     }
 }
 
@@ -188,44 +250,158 @@ impl eframe::App for NobzApp {
             }
         }
 
-        // Top tab bar with icons.
-        let search_icon = self.icons.as_ref().map(|i| &i.search);
-        let queue_icon = self.icons.as_ref().map(|i| &i.file_transfer);
-        let settings_icon = self.icons.as_ref().map(|i| &i.settings);
-        egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
+        // --- Menu bar ---
+        egui::TopBottomPanel::top("menu_bar")
+            .exact_height(22.0)
+            .resizable(false)
+            .show_separator_line(false)
+            .frame(egui::Frame::none().fill(crate::theme::colors::BUTTON_FACE))
+            .show(ctx, |ui| {
+                self.menu_bar(ui, ctx);
+            });
+
+        // --- Tab bar ---
+        egui::TopBottomPanel::top("tabs")
+            .resizable(false)
+            .show_separator_line(false)
+            .frame(egui::Frame::none().fill(crate::theme::colors::BUTTON_FACE))
+            .show(ctx, |ui| {
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(4.0);
+                    let search_icon = self.icons.as_ref().map(|i| i.tab_search.clone());
+                    let queue_icon = self.icons.as_ref().map(|i| i.tab_download.clone());
+                    let settings_icon = self.icons.as_ref().map(|i| i.tab_settings.clone());
+
+                    if ui
+                        .add(Win95TabButton::new(
+                            search_icon,
+                            "Search",
+                            self.tab == Tab::Search,
+                        ))
+                        .clicked()
+                    {
+                        self.tab = Tab::Search;
+                    }
+                    if ui
+                        .add(Win95TabButton::new(
+                            queue_icon,
+                            "Queue",
+                            self.tab == Tab::Queue,
+                        ))
+                        .clicked()
+                    {
+                        self.tab = Tab::Queue;
+                    }
+                    if ui
+                        .add(Win95TabButton::new(
+                            settings_icon,
+                            "Settings",
+                            self.tab == Tab::Settings,
+                        ))
+                        .clicked()
+                    {
+                        self.tab = Tab::Settings;
+                    }
+                });
+            });
+
+        // --- Bottom: status bar ---
+        egui::TopBottomPanel::bottom("status_bar")
+            .exact_height(24.0)
+            .resizable(false)
+            .show_separator_line(false)
+            .frame(egui::Frame::none().fill(crate::theme::colors::BUTTON_FACE))
+            .show(ctx, |ui| {
+                self.status_bar(ui);
+            });
+
+        // --- Main content ---
+        egui::CentralPanel::default()
+            .frame(egui::Frame::none().fill(crate::theme::colors::BUTTON_FACE))
+            .show(ctx, |ui| match self.tab {
+                Tab::Search => {
+                    search_tab::ui(
+                        ui,
+                        &mut self.search,
+                        &self.backend,
+                        &self.config,
+                        self.icons.as_ref(),
+                    );
+                }
+                Tab::Queue => {
+                    queue_tab::ui(ui, &mut self.queue, &self.backend, self.icons.as_ref());
+                }
+                Tab::Settings => {
+                    if settings_tab::ui(ui, &mut self.settings, &mut self.config, &self.backend) {
+                        self.save_config();
+                    }
+                }
+            });
+
+        // --- About dialog ---
+        if self.show_about {
+            show_about_dialog(ctx, &mut self.show_about, self.icons.as_ref());
+        }
+    }
+}
+
+/// Show the About dialog as a Win95-style modal window.
+fn show_about_dialog(ctx: &egui::Context, open: &mut bool, icons: Option<&Icons>) {
+    let mut close = false;
+    egui::Window::new("About Nobz")
+        .open(open)
+        .resizable(false)
+        .collapsible(false)
+        .min_width(360.0)
+        .min_height(200.0)
+        .show(ctx, |ui| {
             ui.horizontal(|ui| {
-                if Self::tab_button(ui, search_icon, "Search", self.tab == Tab::Search) {
-                    self.tab = Tab::Search;
+                if let Some(icons) = icons {
+                    ui.add(
+                        egui::Image::from_texture(&icons.tab_info)
+                            .fit_to_exact_size(egui::vec2(32.0, 32.0)),
+                    );
                 }
-                if Self::tab_button(ui, queue_icon, "Queue", self.tab == Tab::Queue) {
-                    self.tab = Tab::Queue;
-                }
-                if Self::tab_button(ui, settings_icon, "Settings", self.tab == Tab::Settings) {
-                    self.tab = Tab::Settings;
+                ui.vertical(|ui| {
+                    ui.heading("Nobz");
+                    ui.label("Usenet search & downloader");
+                    ui.label("Win95-themed desktop client");
+                    ui.add_space(8.0);
+                    ui.label("Built with Rust + egui");
+                    ui.label("Icons from Chicago95 (MIT/GPL) + React95 (MIT)");
+                });
+            });
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                ui.add_space(240.0);
+                if ui.button("OK").clicked() {
+                    close = true;
                 }
             });
         });
+    if close {
+        *open = false;
+    }
+}
 
-        // Main content.
-        egui::CentralPanel::default().show(ctx, |ui| match self.tab {
-            Tab::Search => {
-                search_tab::ui(
-                    ui,
-                    &mut self.search,
-                    &self.backend,
-                    &self.config,
-                    self.icons.as_ref(),
-                );
-            }
-            Tab::Queue => {
-                queue_tab::ui(ui, &mut self.queue, &self.backend, self.icons.as_ref());
-            }
-            Tab::Settings => {
-                if settings_tab::ui(ui, &mut self.settings, &mut self.config, &self.backend) {
-                    self.save_config();
-                }
-            }
-        });
+/// Format a speed (bytes/sec) as a human-readable string.
+fn format_speed(bytes_per_sec: u64) -> String {
+    if bytes_per_sec == 0 {
+        return "0".into();
+    }
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    let b = bytes_per_sec as f64;
+    if b >= GB {
+        format!("{:.1} GB", b / GB)
+    } else if b >= MB {
+        format!("{:.1} MB", b / MB)
+    } else if b >= KB {
+        format!("{:.0} KB", b / KB)
+    } else {
+        format!("{bytes_per_sec} B")
     }
 }
 

@@ -7,6 +7,7 @@ use nobz_index::types::IndexerConfig;
 
 use crate::backend::{BackendCmd, BackendEvent, BackendHandle};
 use crate::settings::{AppConfig, ServerEntry};
+use crate::win95_widgets::{Win95Button, Win95Checkbox, group};
 
 /// Wizard state.
 #[derive(Debug, Clone)]
@@ -91,99 +92,119 @@ pub fn ui(
 ) -> bool {
     let mut finished = false;
     egui::CentralPanel::default().show_inside(ui, |ui| {
-        ui.vertical_centered(|ui| {
-            ui.add_space(40.0);
-            ui.heading("Welcome to Nobz");
-            ui.label("Usenet search & downloader for your desktop.");
+        // Center the wizard content.
+        let available = ui.available_width();
+        let wizard_w = (available * 0.6).min(600.0);
+        let wizard_h = ui.available_height() * 0.8;
 
-            match wizard.step {
-                WizardStep::Welcome => {
-                    ui.add_space(20.0);
-                    ui.label("Let's set up your NNTP server and a search indexer.");
-                    if ui.button("Get started").clicked() {
-                        wizard.step = WizardStep::AddServer;
-                    }
-                }
-                WizardStep::AddServer => {
-                    ui.add_space(20.0);
-                    ui.heading("Step 1: NNTP Server");
-                    server_form(ui, wizard);
-                    if ui.button("Test connection").clicked() {
-                        let cfg: ServerConfig = (&wizard.server).into();
-                        backend.send(BackendCmd::TestServer { config: cfg });
-                        wizard.step = WizardStep::TestServer;
-                        wizard.server_test_msg = None;
-                    }
-                }
-                WizardStep::TestServer => {
-                    ui.add_space(20.0);
-                    ui.heading("Step 1: Testing NNTP Server…");
-                    server_form(ui, wizard);
-                    if ui.button("Retry").clicked() {
-                        let cfg: ServerConfig = (&wizard.server).into();
-                        backend.send(BackendCmd::TestServer { config: cfg });
-                    }
-                    if let Some((msg, ok)) = &wizard.server_test_msg {
-                        let color = if *ok {
-                            egui::Color32::from_rgb(60, 160, 60)
-                        } else {
-                            egui::Color32::RED
-                        };
-                        ui.colored_label(color, msg);
-                    }
-                }
-                WizardStep::AddIndexer => {
-                    ui.add_space(20.0);
-                    ui.heading("Step 2: Newznab Indexer");
-                    indexer_form(ui, wizard);
-                    if ui.button("Test indexer").clicked() {
-                        backend.send(BackendCmd::TestIndexer {
-                            config: wizard.indexer.clone(),
-                        });
-                        wizard.step = WizardStep::TestIndexer;
-                        wizard.indexer_test_msg = None;
-                    }
-                    if ui.button("Skip (add later in Settings)").clicked() {
-                        wizard.step = WizardStep::Finish;
-                    }
-                }
-                WizardStep::TestIndexer => {
-                    ui.add_space(20.0);
-                    ui.heading("Step 2: Testing Indexer…");
-                    indexer_form(ui, wizard);
-                    if ui.button("Retry").clicked() {
-                        backend.send(BackendCmd::TestIndexer {
-                            config: wizard.indexer.clone(),
-                        });
-                    }
-                    if ui.button("Skip").clicked() {
-                        wizard.step = WizardStep::Finish;
-                    }
-                    if let Some((msg, ok)) = &wizard.indexer_test_msg {
-                        let color = if *ok {
-                            egui::Color32::from_rgb(60, 160, 60)
-                        } else {
-                            egui::Color32::RED
-                        };
-                        ui.colored_label(color, msg);
-                    }
-                }
-                WizardStep::Finish => {
-                    ui.add_space(20.0);
-                    ui.heading("Setup complete!");
-                    ui.label("Your settings will be saved. You can change them anytime in the Settings tab.");
-                    if ui.button("Start using Nobz").clicked() {
-                        if !wizard.server.host.is_empty() {
-                            config.servers.push(wizard.server.clone());
+        ui.vertical_centered(|ui| {
+            ui.add_space(20.0);
+
+            group(ui, Some("Nobz Setup Wizard"), |ui| {
+                ui.set_min_width(wizard_w);
+                ui.set_min_height(wizard_h);
+                ui.add_space(10.0);
+
+                ui.vertical_centered(|ui| {
+                    ui.heading("Welcome to Nobz");
+                    ui.label("Usenet search & downloader for your desktop.");
+
+                    match wizard.step {
+                        WizardStep::Welcome => {
+                            ui.add_space(20.0);
+                            ui.label("Let's set up your NNTP server and a search indexer.");
+                            ui.add_space(10.0);
+                            if ui.add(Win95Button::new("Get started")).clicked() {
+                                wizard.step = WizardStep::AddServer;
+                            }
                         }
-                        if !wizard.indexer.url.is_empty() {
-                            config.indexers.push(wizard.indexer.clone());
+                        WizardStep::AddServer => {
+                            ui.add_space(10.0);
+                            ui.heading("Step 1: NNTP Server");
+                            server_form(ui, wizard);
+                            ui.add_space(8.0);
+                            if ui.add(Win95Button::new("Test connection")).clicked() {
+                                let cfg: ServerConfig = (&wizard.server).into();
+                                backend.send(BackendCmd::TestServer { config: cfg });
+                                wizard.step = WizardStep::TestServer;
+                                wizard.server_test_msg = None;
+                            }
                         }
-                        wizard.done = true;
-                        finished = true;
+                        WizardStep::TestServer => {
+                            ui.add_space(10.0);
+                            ui.heading("Step 1: Testing NNTP Server...");
+                            server_form(ui, wizard);
+                            ui.add_space(8.0);
+                            if ui.add(Win95Button::new("Retry")).clicked() {
+                                let cfg: ServerConfig = (&wizard.server).into();
+                                backend.send(BackendCmd::TestServer { config: cfg });
+                            }
+                            if let Some((msg, ok)) = &wizard.server_test_msg {
+                                let color = if *ok {
+                                    egui::Color32::from_rgb(0, 128, 0)
+                                } else {
+                                    egui::Color32::RED
+                                };
+                                ui.colored_label(color, msg);
+                            }
+                        }
+                        WizardStep::AddIndexer => {
+                            ui.add_space(10.0);
+                            ui.heading("Step 2: Newznab Indexer");
+                            indexer_form(ui, wizard);
+                            ui.add_space(8.0);
+                            if ui.add(Win95Button::new("Test indexer")).clicked() {
+                                backend.send(BackendCmd::TestIndexer {
+                                    config: wizard.indexer.clone(),
+                                });
+                                wizard.step = WizardStep::TestIndexer;
+                                wizard.indexer_test_msg = None;
+                            }
+                            if ui.add(Win95Button::new("Skip (add later)")).clicked() {
+                                wizard.step = WizardStep::Finish;
+                            }
+                        }
+                        WizardStep::TestIndexer => {
+                            ui.add_space(10.0);
+                            ui.heading("Step 2: Testing Indexer...");
+                            indexer_form(ui, wizard);
+                            ui.add_space(8.0);
+                            if ui.add(Win95Button::new("Retry")).clicked() {
+                                backend.send(BackendCmd::TestIndexer {
+                                    config: wizard.indexer.clone(),
+                                });
+                            }
+                            if ui.add(Win95Button::new("Skip")).clicked() {
+                                wizard.step = WizardStep::Finish;
+                            }
+                            if let Some((msg, ok)) = &wizard.indexer_test_msg {
+                                let color = if *ok {
+                                    egui::Color32::from_rgb(0, 128, 0)
+                                } else {
+                                    egui::Color32::RED
+                                };
+                                ui.colored_label(color, msg);
+                            }
+                        }
+                        WizardStep::Finish => {
+                            ui.add_space(10.0);
+                            ui.heading("Setup complete!");
+                            ui.label("Your settings will be saved. You can change them anytime in the Settings tab.");
+                            ui.add_space(8.0);
+                            if ui.add(Win95Button::new("Start using Nobz")).clicked() {
+                                if !wizard.server.host.is_empty() {
+                                    config.servers.push(wizard.server.clone());
+                                }
+                                if !wizard.indexer.url.is_empty() {
+                                    config.indexers.push(wizard.indexer.clone());
+                                }
+                                wizard.done = true;
+                                finished = true;
+                            }
+                        }
                     }
-                }
-            }
+                });
+            });
         });
     });
     finished
@@ -195,7 +216,7 @@ fn server_form(ui: &mut egui::Ui, wizard: &mut Wizard) {
         ui.text_edit_singleline(&mut wizard.server.host);
         ui.label("Port:");
         ui.add(egui::DragValue::new(&mut wizard.server.port).range(1..=65535));
-        ui.checkbox(&mut wizard.server.tls, "TLS");
+        ui.add(Win95Checkbox::new(&mut wizard.server.tls, "TLS"));
     });
     ui.horizontal(|ui| {
         let mut user = wizard.server.user.clone().unwrap_or_default();
