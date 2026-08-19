@@ -1,8 +1,6 @@
-# Nobz
+<img src="logo.png" alt="Nobz logo" width="80">
 
-<p align="center">
-  <img src="logo.png" alt="Nobz logo" width="80">
-</p>
+# Nobz
 
 A Usenet client that would have been right at home in 1995.
 
