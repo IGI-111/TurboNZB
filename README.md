@@ -13,11 +13,11 @@ NixOS-first.
 ## Screenshots
 
 <p align="center">
-  <img src="screenshot1.png" alt="Screenshot 1" width="80">
+  <img src="screenshot1.png" alt="Screenshot 1" width="1000">
 </p>
 
 <p align="center">
-  <img src="screenshot2.png" alt="Screenshot 2" width="80">
+  <img src="screenshot2.png" alt="Screenshot 2" width="1000">
 </p>
 
 ## Features
