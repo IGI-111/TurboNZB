@@ -352,6 +352,18 @@ fn format_speed(bytes_per_sec: u64) -> String {
     }
 }
 
+/// Load the embedded window icon (RGBA) for the OS title bar and taskbar.
+fn window_icon() -> Option<egui::viewport::IconData> {
+    let bytes = include_bytes!("../icons/nobz_icon.png");
+    let img = image::load_from_memory(bytes).ok()?.to_rgba8();
+    let (w, h) = img.dimensions();
+    Some(egui::viewport::IconData {
+        rgba: img.into_raw(),
+        width: w,
+        height: h,
+    })
+}
+
 /// Entry point — launches the eframe app.
 pub fn run() -> Result<()> {
     tracing_subscriber::fmt()
@@ -363,10 +375,15 @@ pub fn run() -> Result<()> {
 
     tracing::info!("nobz GUI starting");
 
+    let viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1400.0, 900.0])
+        .with_min_inner_size([800.0, 500.0]);
+    let viewport = match window_icon() {
+        Some(icon) => viewport.with_icon(icon),
+        None => viewport,
+    };
     let native_options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1400.0, 900.0])
-            .with_min_inner_size([800.0, 500.0]),
+        viewport,
         ..Default::default()
     };
 

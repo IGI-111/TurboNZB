@@ -311,6 +311,73 @@ async fn resume_after_partial_download() {
     assert_eq!(job.state, JobState::Complete);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn obfuscated_file_assembled_under_yenc_name() {
+    // Obfuscated posts put a hash in the NZB subject but the real filename
+    // in the article's `=ybegin name=` header. The assembled file must be
+    // named after the real (yEnc) name, not the hash.
+    let payload = b"actual-binary-payload-bytes-for-the-real-movie";
+    let hex_name = "da2e2d71d5376d20cacce12c936da33e.mkv";
+    let real_name = "Some.Real.Release.2026.1080p.BluRay.x264.mkv";
+
+    let body = yenc_article_body(payload, real_name);
+    let addr = spawn_fake_nntp(vec![("x@y".into(), body)]).await;
+
+    let mut xml = String::from(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+  <head><meta type="title">test</meta></head>
+  <file poster="t@t" date="1" subject="&quot;"#,
+    );
+    xml.push_str(hex_name);
+    xml.push_str(
+        r#"&quot; (1/1)">
+    <groups><group>alt.binaries.test</group></groups>
+    <segments>
+      <segment bytes="100" number="1">x@y</segment>
+    </segments></file></nzb>"#,
+    );
+    let nzb = nzb::parse(xml.as_bytes()).unwrap();
+    let tmp = tempfile_dir();
+
+    let queue = Arc::new(QueueManager::open_in_memory().await.unwrap());
+    let job_id = queue.add_job(&nzb, &tmp, 0, None).await.unwrap();
+
+    let mut cfg = ServerConfig::localhost();
+    cfg.port = addr.port();
+    let engine = Arc::new(Engine::new(vec![cfg], 2));
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let q = Arc::clone(&queue);
+    let runner = tokio::spawn(async move { engine.run_job(q, job_id, tx).await.unwrap() });
+
+    runner.await.unwrap();
+    let events = collect_events(&mut rx).await;
+    assert!(events.iter().any(|e| matches!(
+        e,
+        ProgressEvent::FileCompleted {
+            missing: 0,
+            crc_mismatches: 0,
+            ..
+        }
+    )));
+
+    // Assembled under the real name, not the hash.
+    let assembled = tokio::fs::read(tmp.join(real_name))
+        .await
+        .expect("real name file");
+    assert_eq!(assembled, payload);
+    assert!(
+        !tmp.join(hex_name).exists(),
+        "hex (subject) filename should not be created"
+    );
+
+    // The real name should be persisted on the file.
+    let files = queue.list_files(job_id).await.unwrap();
+    assert_eq!(files[0].yenc_name.as_deref(), Some(real_name));
+    assert_eq!(files[0].filename, hex_name);
+}
+
 /// Create a unique temp directory for a test.
 fn tempfile_dir() -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};

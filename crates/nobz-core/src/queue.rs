@@ -125,6 +125,10 @@ pub struct QueueFile {
     pub id: i64,
     pub job_id: i64,
     pub filename: String,
+    /// Real filename taken from the articles' `=ybegin name=` header, when
+    /// it differs from the subject-derived `filename` (obfuscated posts put
+    /// a hash in the subject but the real name in the yEnc header).
+    pub yenc_name: Option<String>,
     pub subject: String,
     pub poster: String,
     pub date: u64,
@@ -211,6 +215,7 @@ impl QueueManager {
                 job_id      INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
                 file_index  INTEGER NOT NULL,
                 filename    TEXT NOT NULL,
+                yenc_name   TEXT,
                 subject     TEXT NOT NULL,
                 poster      TEXT NOT NULL,
                 date        INTEGER NOT NULL,
@@ -256,6 +261,10 @@ impl QueueManager {
         // so queued jobs keep their own password through auto-start and
         // post-processing.
         self.migrate_add_column("jobs", "archive_password", "TEXT")
+            .await?;
+        // Real filename from the yEnc `=ybegin name=` header, for posts
+        // whose subject carries an obfuscated (hex) filename.
+        self.migrate_add_column("files", "yenc_name", "TEXT")
             .await?;
 
         debug!("queue schema initialized");
@@ -727,7 +736,7 @@ impl QueueManager {
     /// List all files for a job, in file_index order.
     pub async fn list_files(&self, job_id: i64) -> Result<Vec<QueueFile>> {
         let rows = sqlx::query(
-            r#"SELECT id, job_id, file_index, filename, subject, poster, date, segment_count
+            r#"SELECT id, job_id, file_index, filename, yenc_name, subject, poster, date, segment_count
                FROM files WHERE job_id = ?1 ORDER BY file_index ASC"#,
         )
         .bind(job_id)
@@ -742,12 +751,53 @@ impl QueueManager {
                 job_id: r.get("job_id"),
                 file_index: r.get::<i64, _>("file_index") as u32,
                 filename: r.get("filename"),
+                yenc_name: r.get("yenc_name"),
                 subject: r.get("subject"),
                 poster: r.get("poster"),
                 date: r.get::<i64, _>("date") as u64,
                 segment_count: r.get::<i64, _>("segment_count") as u32,
             })
             .collect())
+    }
+
+    /// Fetch a single file by id (fresh from the DB).
+    pub async fn get_file(&self, file_id: i64) -> Result<QueueFile> {
+        let row = sqlx::query(
+            r#"SELECT id, job_id, file_index, filename, yenc_name, subject, poster, date, segment_count
+               FROM files WHERE id = ?1"#,
+        )
+        .bind(file_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| CoreError::Other(anyhow::anyhow!("get file: {e}")))?;
+
+        Ok(QueueFile {
+            id: row.get("id"),
+            job_id: row.get("job_id"),
+            file_index: row.get::<i64, _>("file_index") as u32,
+            filename: row.get("filename"),
+            yenc_name: row.get("yenc_name"),
+            subject: row.get("subject"),
+            poster: row.get("poster"),
+            date: row.get::<i64, _>("date") as u64,
+            segment_count: row.get::<i64, _>("segment_count") as u32,
+        })
+    }
+
+    /// Store the real filename discovered from the articles' yEnc headers
+    /// for a file. Only latches once: once `yenc_name` is set it is never
+    /// overwritten, so concurrent workers racing on the same file are safe.
+    pub async fn set_file_yenc_name(&self, file_id: i64, name: &str) -> Result<()> {
+        sqlx::query(
+            r#"UPDATE files SET yenc_name = ?1
+               WHERE id = ?2 AND (yenc_name IS NULL OR yenc_name = '')"#,
+        )
+        .bind(name)
+        .bind(file_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CoreError::Other(anyhow::anyhow!("set file yenc name: {e}")))?;
+        Ok(())
     }
 
     /// List all segments for a file, in number order.
@@ -848,7 +898,7 @@ impl QueueManager {
     ) -> Result<Vec<(QueueFile, Vec<QueueSegment>)>> {
         let rows = sqlx::query(
             r#"SELECT f.id AS file_id, f.job_id, f.file_index, f.filename,
-                      f.subject, f.poster, f.date, f.segment_count,
+                      f.yenc_name, f.subject, f.poster, f.date, f.segment_count,
                       s.id AS seg_id, s.number, s.message_id, s.bytes,
                       s.missing, s.state
                FROM files f
@@ -879,6 +929,7 @@ impl QueueManager {
                         job_id: r.get("job_id"),
                         file_index: r.get::<i64, _>("file_index") as u32,
                         filename: r.get("filename"),
+                        yenc_name: r.get("yenc_name"),
                         subject: r.get("subject"),
                         poster: r.get("poster"),
                         date: r.get::<i64, _>("date") as u64,

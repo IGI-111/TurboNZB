@@ -535,7 +535,7 @@ impl Engine {
     async fn run_worker(
         &self,
         worker_id: usize,
-        _queue: &Arc<QueueManager>,
+        queue: &Arc<QueueManager>,
         pool: &Arc<ConnectionPool>,
         work_queue: &Arc<Mutex<VecDeque<(usize, QueueSegment)>>>,
         files: &Arc<Vec<QueueFile>>,
@@ -548,8 +548,13 @@ impl Engine {
         // Per-worker cache of parts directories (no lock needed — each
         // worker has its own HashMap). Most downloads have many segments
         // per file, so after the first segment the dir is already cached.
-        let mut parts_dirs: std::collections::HashMap<String, PathBuf> =
+        // Keyed by file id so a real-name discovery (see below) never
+        // strands an already-created parts dir under the old name.
+        let mut parts_dirs: std::collections::HashMap<i64, PathBuf> =
             std::collections::HashMap::new();
+        // Files whose real name (from `=ybegin name=`) we've already
+        // persisted, to avoid re-writing the DB on every segment.
+        let mut name_latched: std::collections::HashSet<i64> = std::collections::HashSet::new();
 
         loop {
             // Pop the next segment (timed — high average = workers
@@ -597,14 +602,14 @@ impl Engine {
             }
 
             // Ensure the parts directory exists for this file.
-            let parts_dir = match parts_dirs.get(&file.filename) {
+            let parts_dir = match parts_dirs.get(&file.id) {
                 Some(p) => p.clone(),
                 None => {
                     let p = output_dir.join(format!("{}.parts", file.filename));
                     tokio::fs::create_dir_all(&p)
                         .await
                         .map_err(CoreError::from)?;
-                    parts_dirs.insert(file.filename.clone(), p.clone());
+                    parts_dirs.insert(file.id, p.clone());
                     p
                 }
             };
@@ -644,6 +649,24 @@ impl Engine {
                                 SegmentState::CrcMismatch
                             };
                             if seg_state == SegmentState::Done {
+                                // Obfuscated posts put a hash in the subject
+                                // but the real filename in `=ybegin name=`.
+                                // Latch the real name (once per file) so the
+                                // assembled file is identifiable on disk.
+                                let real = sanitize_yenc_name(&decoded.name);
+                                if !real.is_empty()
+                                    && real != file.filename
+                                    && file.yenc_name.as_deref() != Some(real.as_str())
+                                    && name_latched.insert(file.id)
+                                {
+                                    if let Err(e) = queue.set_file_yenc_name(file.id, &real).await {
+                                        tracing::warn!(
+                                            file_id = file.id,
+                                            error = %e,
+                                            "failed to record yenc filename"
+                                        );
+                                    }
+                                }
                                 let part_path = parts_dir.join(format!("seg{:06}", seg.number));
                                 let t_write = std::time::Instant::now();
                                 tokio::fs::write(&part_path, &decoded.data)
@@ -926,6 +949,15 @@ struct FileOutcome {
     crc_mismatches: u32,
 }
 
+/// Clean a filename from a `=ybegin name=` header for use as a file name:
+/// strip whitespace and anything that could act as a path separator.
+fn sanitize_yenc_name(name: &str) -> String {
+    name.trim()
+        .chars()
+        .map(|c| if c == '/' || c == '\\' { '_' } else { c })
+        .collect::<String>()
+}
+
 /// Assemble a file from per-segment part files. Reads all segments from
 /// the DB, concatenates the done parts in order, and writes the final
 /// file. Also calls `refresh_job_counts` to update aggregate counters.
@@ -935,15 +967,22 @@ async fn assemble_file(
     output_dir: &Path,
     _tx: &mpsc::UnboundedSender<ProgressEvent>,
 ) -> Result<FileOutcome> {
+    // Reload the file so a real name latched during the download (from the
+    // yEnc headers) is picked up even though we were handed a snapshot.
+    let file = queue.get_file(file.id).await?;
+
     // Refresh job-level aggregate counters now that all segments for this
     // file are done.
     if let Err(e) = queue.refresh_job_counts(file.id).await {
         tracing::warn!(error = %e, "failed to refresh job counts");
     }
 
-    let filename = file.filename.clone();
+    let filename = file
+        .yenc_name
+        .clone()
+        .unwrap_or_else(|| file.filename.clone());
     let final_path = output_dir.join(&filename);
-    let parts_dir = output_dir.join(format!("{}.parts", filename));
+    let parts_dir = output_dir.join(format!("{}.parts", file.filename));
 
     let all_segments = queue.list_segments(file.id).await?;
     let mut out = tokio::fs::File::create(&final_path)
