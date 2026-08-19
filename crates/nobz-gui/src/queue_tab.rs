@@ -505,24 +505,31 @@ fn speed_graph_pane(ui: &mut egui::Ui, state: &QueueState) {
 
 /// Bottom pane: tabbed details (General / Files / Speed).
 fn details_tabbed_pane(ui: &mut egui::Ui, state: &mut QueueState, icons: Option<&Icons>) {
+    let has_selection = state.selected_job.is_some();
+
+    // Default to Speed tab when no job is selected.
+    let active_tab = if has_selection {
+        state.details_tab
+    } else {
+        DetailsTab::Speed
+    };
+
     // Tab bar at the top of the bottom pane.
     ui.horizontal(|ui| {
         if ui
-            .add(Win95TabButton::new(
-                None,
-                "General",
-                state.details_tab == DetailsTab::General,
-            ))
+            .add(
+                Win95TabButton::new(None, "General", active_tab == DetailsTab::General)
+                    .enabled(has_selection),
+            )
             .clicked()
         {
             state.details_tab = DetailsTab::General;
         }
         if ui
-            .add(Win95TabButton::new(
-                None,
-                "Files",
-                state.details_tab == DetailsTab::Files,
-            ))
+            .add(
+                Win95TabButton::new(None, "Files", active_tab == DetailsTab::Files)
+                    .enabled(has_selection),
+            )
             .clicked()
         {
             state.details_tab = DetailsTab::Files;
@@ -531,7 +538,7 @@ fn details_tabbed_pane(ui: &mut egui::Ui, state: &mut QueueState, icons: Option<
             .add(Win95TabButton::new(
                 None,
                 "Speed",
-                state.details_tab == DetailsTab::Speed,
+                active_tab == DetailsTab::Speed,
             ))
             .clicked()
         {
@@ -541,7 +548,7 @@ fn details_tabbed_pane(ui: &mut egui::Ui, state: &mut QueueState, icons: Option<
 
     let _ = icons;
 
-    match state.details_tab {
+    match active_tab {
         DetailsTab::General => {
             general_pane(ui, state);
         }

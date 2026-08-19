@@ -30,6 +30,7 @@ use crate::settings_tab::SettingsState;
 use crate::theme::{Icons, apply_theme};
 use crate::win95_widgets::{Win95TabButton, status_segment};
 use crate::wizard::Wizard;
+use nobz_core::queue::JobState;
 
 const ORG_NAME: &str = "nobz";
 const APP_NAME: &str = "nobz";
@@ -156,15 +157,6 @@ impl NobzApp {
             let job_count = self.queue.jobs.len();
             let jobs_text = format!("{job_count} job(s)");
             status_segment(ui, 120.0, 22.0, &jobs_text, None);
-
-            let engine_text = if self.queue.engine_paused {
-                "Paused"
-            } else if self.queue.current_job_id.is_some() {
-                "Downloading"
-            } else {
-                "Ready"
-            };
-            status_segment(ui, 120.0, 22.0, engine_text, None);
         });
     }
 }
@@ -174,8 +166,19 @@ impl eframe::App for NobzApp {
         // Poll backend events every frame.
         self.handle_events();
 
-        // Auto-refresh jobs every 2 seconds while there's an active download.
-        ctx.request_repaint_after(std::time::Duration::from_millis(500));
+        // Only request periodic repaints when there's an active download
+        // or post-processing — avoids keeping the app awake when idle
+        // (which causes OS "stalled" notifications when unfocused).
+        let has_active = self.queue.current_job_id.is_some()
+            || !self.queue.pp_in_progress.is_empty()
+            || self
+                .queue
+                .jobs
+                .iter()
+                .any(|j| matches!(j.state, JobState::Downloading | JobState::Fetching));
+        if has_active {
+            ctx.request_repaint_after(std::time::Duration::from_millis(500));
+        }
 
         // Wizard takes over the whole window if active.
         if let Some(ref mut wizard) = self.wizard {

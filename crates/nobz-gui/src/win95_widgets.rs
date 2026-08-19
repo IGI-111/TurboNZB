@@ -519,6 +519,7 @@ pub struct Win95TabButton {
     icon: Option<egui::TextureHandle>,
     label: &'static str,
     selected: bool,
+    enabled: bool,
     icon_size: Vec2,
 }
 
@@ -528,8 +529,14 @@ impl Win95TabButton {
             icon,
             label,
             selected,
+            enabled: true,
             icon_size: Vec2::new(16.0, 16.0),
         }
+    }
+
+    pub fn enabled(mut self, e: bool) -> Self {
+        self.enabled = e;
+        self
     }
 
     pub fn icon_size(mut self, s: Vec2) -> Self {
@@ -542,23 +549,33 @@ impl Widget for Win95TabButton {
     fn ui(self, ui: &mut Ui) -> Response {
         let padding = Vec2::new(8.0, 4.0);
         let icon_w = self.icon.as_ref().map_or(0.0, |_| self.icon_size.x + 4.0);
+        let text_color = if self.enabled {
+            colors::WINDOW_TEXT
+        } else {
+            colors::DISABLED_TEXT
+        };
         let label_galley = ui.painter().layout_no_wrap(
             self.label.to_string(),
             FontId::proportional(16.0),
-            colors::WINDOW_TEXT,
+            text_color,
         );
         let text_w = label_galley.size().x;
         let h = 28.0_f32;
         let w = icon_w + text_w + 2.0 * padding.x;
 
-        let (rect, response) = ui.allocate_exact_size(Vec2::new(w, h), Sense::click());
-        response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, true, self.label));
+        let sense = if self.enabled {
+            Sense::click()
+        } else {
+            Sense::hover()
+        };
+        let (rect, response) = ui.allocate_exact_size(Vec2::new(w, h), sense);
+        response.widget_info(|| WidgetInfo::labeled(WidgetType::Button, self.enabled, self.label));
 
         if ui.is_rect_visible(rect) {
             let painter = ui.painter();
             painter.rect_filled(rect, 0.0, colors::BUTTON_FACE);
 
-            let pressed = response.is_pointer_button_down_on();
+            let pressed = self.enabled && response.is_pointer_button_down_on();
 
             if self.selected {
                 // Selected tab: raised outer, but the bottom border is the
@@ -591,19 +608,38 @@ impl Widget for Win95TabButton {
                     Pos2::new(x + self.icon_size.x / 2.0, cy),
                     self.icon_size,
                 );
+                let tint = if self.enabled {
+                    Color32::WHITE
+                } else {
+                    colors::DISABLED_TEXT
+                };
                 painter.image(
                     tex.id(),
                     ir,
                     egui::Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                    Color32::WHITE,
+                    tint,
                 );
                 x += self.icon_size.x + 4.0;
             }
-            painter.galley(
-                Pos2::new(x, cy - label_galley.size().y / 2.0),
-                label_galley,
-                colors::WINDOW_TEXT,
-            );
+            if self.enabled {
+                painter.galley(
+                    Pos2::new(x, cy - label_galley.size().y / 2.0),
+                    label_galley,
+                    text_color,
+                );
+            } else {
+                // Embossed disabled text: white shadow then gray.
+                painter.galley(
+                    Pos2::new(x + 1.0, cy - label_galley.size().y / 2.0 + 1.0),
+                    label_galley.clone(),
+                    colors::DISABLED_TEXT_SHADOW,
+                );
+                painter.galley(
+                    Pos2::new(x, cy - label_galley.size().y / 2.0),
+                    label_galley,
+                    text_color,
+                );
+            }
         }
 
         response
