@@ -143,7 +143,11 @@ impl NobzApp {
     fn status_bar(&self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             let speed_text = if self.queue.current_job_id.is_some() {
-                format!("{}/s", format_speed(self.queue.current_speed as u64))
+                format!(
+                    "{}/s  {} conn",
+                    format_speed(self.queue.current_speed as u64),
+                    self.queue.active_connections
+                )
             } else {
                 "Idle".to_string()
             };
@@ -152,7 +156,7 @@ impl NobzApp {
             } else {
                 None
             };
-            status_segment(ui, 200.0, 22.0, &speed_text, speed_icon);
+            status_segment(ui, 240.0, 22.0, &speed_text, speed_icon);
 
             let job_count = self.queue.jobs.len();
             let jobs_text = format!("{job_count} job(s)");

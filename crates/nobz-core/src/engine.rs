@@ -16,6 +16,7 @@
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
@@ -24,6 +25,71 @@ use crate::error::{CoreError, Result};
 use crate::nntp::{NntpClient, ServerConfig, StatResult};
 use crate::queue::{QueueFile, QueueManager, QueueSegment, SegmentState};
 use crate::yenc;
+
+/// Aggregate download performance counters for one job run. Shared between
+/// workers, the connection pool, and a sampler task that logs a summary
+/// every couple of seconds so real-world behavior can be inspected without
+/// a profiler attached.
+#[derive(Default)]
+pub struct PerfStats {
+    /// Articles processed.
+    pub articles: AtomicU64,
+    /// Raw (yEnc) bytes received.
+    pub bytes: AtomicU64,
+    /// Microseconds spent waiting to pop work from the shared queue.
+    pub queue_wait_us: AtomicU64,
+    /// Microseconds spent acquiring a connection from the pool.
+    pub acquire_us: AtomicU64,
+    /// Microseconds spent on the full BODY exchange (acquire + cmd + read).
+    pub fetch_us: AtomicU64,
+    /// Microseconds spent decoding yEnc.
+    pub decode_us: AtomicU64,
+    /// Microseconds spent writing segment parts to disk.
+    pub write_us: AtomicU64,
+    /// Connections established (TLS handshake counts).
+    pub conn_created: AtomicU64,
+    /// Connections dropped due to errors.
+    pub conn_dropped: AtomicU64,
+    // Full-article BODY round-trip time buckets. These reveal whether the
+    // server is dribbling data (high % in the big buckets ⇒ server-side
+    // throttle) or the client is creating gaps (high % in small buckets
+    // while throughput stays low ⇒ client-side serialization).
+    pub fetch_le_20ms: AtomicU64,
+    pub fetch_le_100ms: AtomicU64,
+    pub fetch_le_500ms: AtomicU64,
+    pub fetch_le_2000ms: AtomicU64,
+    pub fetch_gt_2000ms: AtomicU64,
+}
+
+impl PerfStats {
+    fn bucket(&self, us: u64) {
+        if us <= 20_000 {
+            self.fetch_le_20ms.fetch_add(1, Ordering::Relaxed);
+        } else if us <= 100_000 {
+            self.fetch_le_100ms.fetch_add(1, Ordering::Relaxed);
+        } else if us <= 500_000 {
+            self.fetch_le_500ms.fetch_add(1, Ordering::Relaxed);
+        } else if us <= 2_000_000 {
+            self.fetch_le_2000ms.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.fetch_gt_2000ms.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// The download engine. Owns the server list and concurrency limit.
+pub struct Engine {
+    servers: Vec<ServerConfig>,
+    /// Concurrency limit = number of worker tasks.
+    max_connections: usize,
+    /// Shared connection pool, created eagerly in [`Engine::new`] so it can
+    /// be warmed up and kept alive across jobs (connection establishment is
+    /// the expensive, throttle-prone part of talking to a provider — we hold
+    /// onto connections as long as possible and never rebuild them per job).
+    pool: Arc<std::sync::Mutex<Option<Arc<ConnectionPool>>>>,
+    /// Shared performance counters.
+    stats: Arc<PerfStats>,
+}
 
 /// Progress events emitted by [`Engine::run_job`]. The CLI/GUI consumes
 /// these to render a progress bar / activity panel.
@@ -55,22 +121,70 @@ pub enum ProgressEvent {
     },
 }
 
-/// The download engine. Owns the server list and concurrency limit.
-pub struct Engine {
-    servers: Vec<ServerConfig>,
-    /// Concurrency limit = number of worker tasks.
-    max_connections: usize,
-}
-
 impl Engine {
     /// Create an engine for a set of servers. `total_connections` is the
-    /// number of worker tasks to spawn — each owns a persistent NNTP
-    /// connection that's reused across articles.
+    /// number of worker tasks to spawn — each borrows a live connection
+    /// from the (persistent) pool.
     pub fn new(servers: Vec<ServerConfig>, total_connections: usize) -> Self {
+        let stats = Arc::new(PerfStats::default());
+        let pool = Arc::new(ConnectionPool::new(&servers, Arc::clone(&stats)));
         Self {
             servers,
             max_connections: total_connections,
+            pool: Arc::new(std::sync::Mutex::new(Some(pool))),
+            stats,
         }
+    }
+
+    /// Current total live connection count (idle in pool + in use).
+    pub fn active_connections(&self) -> usize {
+        self.pool
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|p| p.active_count()))
+            .unwrap_or(0)
+    }
+
+    /// The shared performance counters (for the final summary etc).
+    pub fn stats(&self) -> Arc<PerfStats> {
+        Arc::clone(&self.stats)
+    }
+
+    /// A clone of the shared connection pool, if created.
+    pub fn pool(&self) -> Option<Arc<ConnectionPool>> {
+        self.pool.lock().ok().and_then(|g| g.clone())
+    }
+
+    /// Server list (for pool warm-up / keep-alive).
+    pub fn servers(&self) -> &[ServerConfig] {
+        &self.servers
+    }
+
+    /// Spawn the background pool keeper: paces connection warm-up (so we
+    /// never blast a provider's setup throttle) and NOOPs idle connections
+    /// every 30s so they stay alive across jobs and idle periods.
+    pub fn spawn_pool_keeper(self: &Arc<Self>) {
+        let engine = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut warm = tokio::time::interval(std::time::Duration::from_millis(350));
+            warm.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut keep = tokio::time::interval(std::time::Duration::from_secs(30));
+            keep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = warm.tick() => {
+                        if let Some(p) = engine.pool() {
+                            p.try_open_one(engine.servers()).await;
+                        }
+                    }
+                    _ = keep.tick() => {
+                        if let Some(p) = engine.pool() {
+                            p.keep_idle_alive().await;
+                        }
+                    }
+                }
+            }
+        });
     }
 
     /// Run a job to completion, reading pending segments from the queue and
@@ -91,6 +205,8 @@ impl Engine {
         queue
             .set_job_state(job_id, crate::queue::JobState::Downloading)
             .await?;
+
+        let t0 = std::time::Instant::now();
 
         let job = queue.get_job(job_id).await?;
         tracing::info!(
@@ -113,20 +229,22 @@ impl Engine {
         );
 
         // Flatten all segments across all files into a single work queue.
-        // Each item is (file, segment) so the worker knows which file's
-        // parts directory to write to.
-        let work_queue: Arc<Mutex<VecDeque<(QueueFile, QueueSegment)>>> =
+        // Each item is (file_index, segment) so the worker can look up
+        // the file via the shared `files` Arc without cloning the full
+        // QueueFile for every segment (saves ~150 bytes per segment).
+        let files: Arc<Vec<QueueFile>> = Arc::new(pending.iter().map(|(f, _)| f.clone()).collect());
+        let work_queue: Arc<Mutex<VecDeque<(usize, QueueSegment)>>> =
             Arc::new(Mutex::new(VecDeque::new()));
         let total_segments: usize = {
             let mut wq = work_queue.lock().await;
             let mut count = 0usize;
-            for (file, segments) in &pending {
+            for (file_idx, (file, segments)) in pending.iter().enumerate() {
                 let _ = tx.send(ProgressEvent::FileStarted {
                     filename: file.filename.clone(),
                     segments: segments.len() as u32,
                 });
                 for seg in segments {
-                    wq.push_back((file.clone(), seg.clone()));
+                    wq.push_back((file_idx, seg.clone()));
                     count += 1;
                 }
             }
@@ -134,9 +252,14 @@ impl Engine {
         };
         tracing::info!(total_segments, "engine: work queue populated");
 
-        // Per-server connection pool. Workers check out a connection,
-        // use it, and return it. Broken connections are dropped.
-        let pool: Arc<ConnectionPool> = Arc::new(ConnectionPool::new(&self.servers));
+        // Shared pool (warmed + kept alive by the keeper task) and perf
+        // counters are owned by the engine, so they persist across jobs.
+        let pool = self.pool.lock().expect("pool lock").clone();
+        let Some(pool) = pool else {
+            // Pool dropped (shouldn't happen) — fall back to creating one.
+            unreachable!("pool should never be cleared after new()")
+        };
+        let stats = Arc::clone(&self.stats);
 
         // Shared counters for completed/failed files.
         let completed = Arc::new(Mutex::new(0usize));
@@ -195,6 +318,8 @@ impl Engine {
             let queue = Arc::clone(&queue);
             let pool = Arc::clone(&pool);
             let work_queue = Arc::clone(&work_queue);
+            let files = Arc::clone(&files);
+            let stats = Arc::clone(&stats);
             let tx = tx.clone();
             let state_tx = state_tx.clone();
             let output_dir = job.output_dir.clone();
@@ -205,6 +330,8 @@ impl Engine {
                         &queue,
                         &pool,
                         &work_queue,
+                        &files,
+                        &stats,
                         &output_dir,
                         &tx,
                         &state_tx,
@@ -280,6 +407,43 @@ impl Engine {
             completed: completed_count,
             failed: failed_count,
         });
+
+        // Final perf summary (opt-in; only visible with
+        // RUST_LOG=nobz_core=info).
+        {
+            let articles = stats.articles.load(Ordering::Relaxed);
+            let bytes = stats.bytes.load(Ordering::Relaxed);
+            let wall = t0.elapsed().as_secs_f64();
+            let avg = |x: u64| {
+                if articles == 0 {
+                    0.0
+                } else {
+                    x as f64 / articles as f64
+                }
+            };
+            tracing::info!(
+                articles,
+                bytes,
+                elapsed_s = wall,
+                avg_queue_us = avg(stats.queue_wait_us.load(Ordering::Relaxed)),
+                avg_acquire_us = avg(stats.acquire_us.load(Ordering::Relaxed)),
+                avg_fetch_us = avg(stats.fetch_us.load(Ordering::Relaxed)),
+                avg_decode_us = avg(stats.decode_us.load(Ordering::Relaxed)),
+                avg_write_us = avg(stats.write_us.load(Ordering::Relaxed)),
+                conn_created = stats.conn_created.load(Ordering::Relaxed),
+                conn_dropped = stats.conn_dropped.load(Ordering::Relaxed),
+                fetch_bucket_le20ms = stats.fetch_le_20ms.load(Ordering::Relaxed),
+                fetch_bucket_20_100ms = stats.fetch_le_100ms.load(Ordering::Relaxed),
+                fetch_bucket_100_500ms = stats.fetch_le_500ms.load(Ordering::Relaxed),
+                fetch_bucket_500_2000ms = stats.fetch_le_2000ms.load(Ordering::Relaxed),
+                fetch_bucket_gt2s = stats.fetch_gt_2000ms.load(Ordering::Relaxed),
+                "engine final perf summary"
+            );
+        }
+
+        // NOTE: pool is intentionally kept alive across jobs — connection
+        // establishment is the throttled, expensive part, so we hold.
+
         Ok(())
     }
 
@@ -291,97 +455,115 @@ impl Engine {
         worker_id: usize,
         _queue: &Arc<QueueManager>,
         pool: &Arc<ConnectionPool>,
-        work_queue: &Arc<Mutex<VecDeque<(QueueFile, QueueSegment)>>>,
+        work_queue: &Arc<Mutex<VecDeque<(usize, QueueSegment)>>>,
+        files: &Arc<Vec<QueueFile>>,
+        stats: &Arc<PerfStats>,
         output_dir: &Path,
         tx: &mpsc::UnboundedSender<ProgressEvent>,
         state_tx: &mpsc::UnboundedSender<(i64, u32, SegmentState)>,
     ) -> Result<()> {
-        let parts_dirs: Arc<Mutex<std::collections::HashMap<String, PathBuf>>> =
-            Arc::new(Mutex::new(std::collections::HashMap::new()));
+        // Per-worker cache of parts directories (no lock needed — each
+        // worker has its own HashMap). Most downloads have many segments
+        // per file, so after the first segment the dir is already cached.
+        let mut parts_dirs: std::collections::HashMap<String, PathBuf> =
+            std::collections::HashMap::new();
 
         loop {
-            // Pop the next segment from the queue.
-            let (file, seg) = {
+            // Pop the next segment (timed — high average = workers
+            // fighting for work).
+            let (file_idx, seg) = {
+                let t = std::time::Instant::now();
                 let mut wq = work_queue.lock().await;
-                match wq.pop_front() {
+                let item = wq.pop_front();
+                stats
+                    .queue_wait_us
+                    .fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+                match item {
                     Some(item) => item,
                     None => break, // Queue empty — worker is done.
                 }
             };
-
-            tracing::trace!(
-                worker_id,
-                file = %file.filename,
-                segment = seg.number,
-                "worker: processing segment"
-            );
+            let file = &files[file_idx];
 
             // Ensure the parts directory exists for this file.
-            let parts_dir = {
-                let mut dirs = parts_dirs.lock().await;
-                if let Some(p) = dirs.get(&file.filename) {
-                    p.clone()
-                } else {
+            let parts_dir = match parts_dirs.get(&file.filename) {
+                Some(p) => p.clone(),
+                None => {
                     let p = output_dir.join(format!("{}.parts", file.filename));
                     tokio::fs::create_dir_all(&p)
                         .await
                         .map_err(CoreError::from)?;
-                    dirs.insert(file.filename.clone(), p.clone());
+                    parts_dirs.insert(file.filename.clone(), p.clone());
                     p
                 }
             };
 
-            // Fetch the article using the connection pool.
-            let fetch_result = pool_fetch_with_fallback(pool, &self.servers, &seg.message_id).await;
+            let t_fetch = std::time::Instant::now();
+            let outcome = pool_fetch(pool, &self.servers, &seg.message_id, stats).await;
+            let fetch_us = t_fetch.elapsed().as_micros() as u64;
+            stats.fetch_us.fetch_add(fetch_us, Ordering::Relaxed);
+            stats.bucket(fetch_us);
 
-            let state = match &fetch_result {
-                Ok(body) => match yenc::decode_article(body) {
-                    Ok(decoded) => {
-                        let seg_state = if decoded.crc_ok || decoded.crc_unknown {
-                            SegmentState::Done
-                        } else {
-                            SegmentState::CrcMismatch
-                        };
-                        if seg_state == SegmentState::Done {
-                            let part_path = parts_dir.join(format!("seg{:06}", seg.number));
-                            tokio::fs::write(&part_path, &decoded.data)
-                                .await
-                                .map_err(CoreError::from)?;
-                        }
-                        seg_state
-                    }
-                    Err(e) => {
-                        let _ = tx.send(ProgressEvent::ArticleError {
-                            filename: file.filename.clone(),
-                            segment: seg.number,
-                            error: e.to_string(),
-                        });
-                        SegmentState::Failed
-                    }
-                },
-                Err(PoolFetchError::Missing) => SegmentState::Missing,
-                Err(PoolFetchError::Other(e)) => {
-                    let _ = tx.send(ProgressEvent::ArticleError {
-                        filename: file.filename.clone(),
-                        segment: seg.number,
-                        error: e.to_string(),
-                    });
-                    SegmentState::Failed
+            let outcome = match outcome {
+                ArticleOutcome::Retry => {
+                    // Connection problem — put the segment back for another
+                    // worker (never mark it failed on a transient issue).
+                    let mut wq = work_queue.lock().await;
+                    wq.push_front((file_idx, seg));
+                    continue;
                 }
+                o => o,
             };
 
-            // Queue the segment state update for the batch writer (no
-            // individual DB write — the writer flushes periodically).
-            let _ = state_tx.send((file.id, seg.number, state));
-
-            let bytes = match &fetch_result {
-                Ok(b) => b.len() as u64,
-                Err(_) => 0,
+            let (seg_state, bytes) = match outcome {
+                ArticleOutcome::OkBytes(body) => {
+                    let t_decode = std::time::Instant::now();
+                    let state = match yenc::decode_article(&body) {
+                        Ok(decoded) => {
+                            stats.decode_us.fetch_add(
+                                t_decode.elapsed().as_micros() as u64,
+                                Ordering::Relaxed,
+                            );
+                            let seg_state = if decoded.crc_ok || decoded.crc_unknown {
+                                SegmentState::Done
+                            } else {
+                                SegmentState::CrcMismatch
+                            };
+                            if seg_state == SegmentState::Done {
+                                let part_path = parts_dir.join(format!("seg{:06}", seg.number));
+                                let t_write = std::time::Instant::now();
+                                tokio::fs::write(&part_path, &decoded.data)
+                                    .await
+                                    .map_err(CoreError::from)?;
+                                stats.write_us.fetch_add(
+                                    t_write.elapsed().as_micros() as u64,
+                                    Ordering::Relaxed,
+                                );
+                            }
+                            seg_state
+                        }
+                        Err(e) => {
+                            let _ = tx.send(ProgressEvent::ArticleError {
+                                filename: file.filename.clone(),
+                                segment: seg.number,
+                                error: e.to_string(),
+                            });
+                            SegmentState::Failed
+                        }
+                    };
+                    (state, body.len() as u64)
+                }
+                ArticleOutcome::Missing => (SegmentState::Missing, 0),
+                ArticleOutcome::Retry => unreachable!(),
             };
+
+            stats.articles.fetch_add(1, Ordering::Relaxed);
+            stats.bytes.fetch_add(bytes, Ordering::Relaxed);
+            let _ = state_tx.send((file.id, seg.number, seg_state));
             let _ = tx.send(ProgressEvent::SegmentDone {
                 filename: file.filename.clone(),
                 segment: seg.number,
-                status: state,
+                status: seg_state,
                 bytes,
             });
         }
@@ -397,106 +579,220 @@ impl Engine {
 pub struct ConnectionPool {
     /// One deque per server, indexed by server priority order.
     servers: Vec<Mutex<VecDeque<NntpClient>>>,
+    /// One gate per server: a permit represents the right to have one
+    /// connection checked out (idle in deque OR actively in use). Permits
+    /// are bounded by each server's configured max, so `get` *waits* for
+    /// a free slot instead of stampeding new connections when the deque is
+    /// momentarily empty — which providers at their connection cap reject.
+    gate: Vec<Arc<tokio::sync::Semaphore>>,
+    /// Total number of live connections (idle in pool + actively in use).
+    /// Incremented on connect, decremented when a connection is dropped.
+    active: std::sync::atomic::AtomicUsize,
+    /// Performance counters (connection create/drop).
+    stats: Arc<PerfStats>,
 }
 
 impl ConnectionPool {
-    fn new(servers: &[ServerConfig]) -> Self {
+    fn new(servers: &[ServerConfig], stats: Arc<PerfStats>) -> Self {
         let server_pools = servers
             .iter()
             .map(|_| Mutex::new(VecDeque::new()))
             .collect();
+        let gate = servers
+            .iter()
+            .map(|s| {
+                Arc::new(tokio::sync::Semaphore::new(
+                    s.max_connections.max(1) as usize
+                ))
+            })
+            .collect();
         Self {
             servers: server_pools,
+            gate,
+            active: std::sync::atomic::AtomicUsize::new(0),
+            stats,
         }
     }
 
-    /// Get a connection from the pool for `server_idx`, or create a new
-    /// one if the pool is empty.
-    async fn get(&self, server_idx: usize, servers: &[ServerConfig]) -> Result<NntpClient> {
+    /// Current total live connection count (idle + in use).
+    pub fn active_count(&self) -> usize {
+        self.active.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Check out a connection for `server_idx`, waiting for a free slot
+    /// if all are in use. Returns the connection plus its slot permit.
+    async fn get(
+        &self,
+        server_idx: usize,
+        servers: &[ServerConfig],
+    ) -> Result<(NntpClient, tokio::sync::OwnedSemaphorePermit)> {
+        // Wait for the right to have one connection checked out.
+        let permit = self.gate[server_idx]
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("pool gate semaphore never closed");
         {
             let mut pool = self.servers[server_idx].lock().await;
             if let Some(conn) = pool.pop_front() {
-                return Ok(conn);
+                return Ok((conn, permit));
             }
         }
-        // Pool empty — create a new connection.
-        NntpClient::connect(&servers[server_idx]).await
+        // Deque empty but we hold a slot — create a new connection.
+        self.active
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.stats.conn_created.fetch_add(1, Ordering::Relaxed);
+        match NntpClient::connect(&servers[server_idx]).await {
+            Ok(conn) => Ok((conn, permit)),
+            Err(e) => {
+                self.active
+                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                // Dropping the permit frees the slot (connection never opened).
+                Err(e)
+            }
+        }
     }
 
-    /// Return a healthy connection to the pool for later reuse.
-    async fn put(&self, server_idx: usize, conn: NntpClient) {
-        let mut pool = self.servers[server_idx].lock().await;
-        pool.push_back(conn);
+    /// Return a healthy connection to the pool for reuse (releases its slot).
+    async fn put(
+        &self,
+        server_idx: usize,
+        conn: NntpClient,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) {
+        // Push the connection BEFORE releasing the permit so a waiting worker
+        // that grabs the slot also finds the connection available.
+        self.servers[server_idx].lock().await.push_back(conn);
+        drop(permit);
+    }
+
+    /// Drop a connection (releases its slot).
+    fn drop_connection(&self, permit: tokio::sync::OwnedSemaphorePermit) {
+        self.active
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        self.stats.conn_dropped.fetch_add(1, Ordering::Relaxed);
+        drop(permit);
+    }
+
+    /// Open one new connection and place it in the idle pool — unless the
+    /// pool is already at full capacity. The caller paces this (a keeper
+    /// task) so connection establishment doesn't burst into a provider's
+    /// setup throttle.
+    async fn try_open_one(&self, servers: &[ServerConfig]) {
+        let capacity: usize = servers
+            .iter()
+            .map(|s| s.max_connections.max(1) as usize)
+            .sum();
+        if self.active_count() >= capacity {
+            return;
+        }
+        for (idx, srv) in servers.iter().enumerate() {
+            if let Ok(conn) = NntpClient::connect(srv).await {
+                self.active
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.stats.conn_created.fetch_add(1, Ordering::Relaxed);
+                self.servers[idx].lock().await.push_back(conn);
+                return;
+            }
+            // connect failed — try the next server; caller retries later.
+        }
+    }
+
+    /// Keep idle connections alive: send a `NOOP` on exactly ONE idle
+    /// connection per call (the keeper paces this), so a busy download
+    /// is never starved: at most one connection is briefly checked out.
+    async fn keep_idle_alive(&self) {
+        // Drain one connection from the first server that has any idle.
+        let found: Option<(usize, NntpClient)> = {
+            let mut found = None;
+            for (i, pool) in self.servers.iter().enumerate() {
+                let Some(conn) = pool.lock().await.pop_front() else {
+                    continue;
+                };
+                found = Some((i, conn));
+                break;
+            }
+            found
+        };
+        let Some((idx, mut conn)) = found else { return };
+        if conn.noop().await.is_ok() {
+            self.servers[idx].lock().await.push_back(conn);
+        } else {
+            self.active
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            self.stats.conn_dropped.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
-/// Error type for pool-aware fetch.
-#[derive(Debug)]
-enum PoolFetchError {
-    /// Article missing on all servers (430/423 from every server).
+/// Outcome of fetching a single article.
+enum ArticleOutcome {
+    /// Article fetched successfully (raw yEnc bytes, dot-unstuffed).
+    OkBytes(Vec<u8>),
+    /// Article is genuinely missing (430/423) — mark it Missing.
     Missing,
-    Other(CoreError),
+    /// A connection-level problem — caller should retry later (re-queue).
+    Retry,
 }
 
-/// Fetch an article using the connection pool. Tries servers in priority
-/// order. Connections are reused across calls — no per-article TLS handshake.
+/// Fetch one article using the gated connection pool, trying servers in
+/// priority order.
 ///
-/// On success, the connection is returned to the pool. On connection
-/// error, the connection is dropped (not returned) so the next fetch
-/// creates a fresh one.
-async fn pool_fetch_with_fallback(
+/// - On success the connection is returned to the pool for reuse.
+/// - An article missing (430/423) on every server → `Missing`.
+/// - Any connection break (mid-read) → `Retry` so the segment is
+///   re-queued rather than failed; the broken connection is dropped.
+async fn pool_fetch(
     pool: &Arc<ConnectionPool>,
     servers: &[ServerConfig],
     message_id: &str,
-) -> std::result::Result<Vec<u8>, PoolFetchError> {
-    let mut all_missing = true;
-    let mut last_error: Option<CoreError> = None;
+    stats: &PerfStats,
+) -> ArticleOutcome {
+    let mut saw_missing = false;
+    let mut saw_conn_error = false;
 
     for (idx, _server) in servers.iter().enumerate() {
-        // Get a connection (from pool or create new).
-        let mut client = match pool.get(idx, servers).await {
-            Ok(c) => c,
+        let t_acquire = std::time::Instant::now();
+        let (mut client, permit) = match pool.get(idx, servers).await {
+            Ok(t) => t,
             Err(e) => {
                 tracing::warn!(server_idx = idx, error = %e, "connect failed; trying next");
-                last_error = Some(e);
-                all_missing = false;
                 continue;
             }
         };
+        stats
+            .acquire_us
+            .fetch_add(t_acquire.elapsed().as_micros() as u64, Ordering::Relaxed);
 
         match client.body(message_id).await {
             Ok(Ok(body)) => {
-                // Success — return connection to pool for reuse.
-                pool.put(idx, client).await;
-                return Ok(body.bytes);
+                pool.put(idx, client, permit).await;
+                return ArticleOutcome::OkBytes(body.bytes);
             }
             Ok(Err(StatResult::Missing)) => {
-                // Article not on this server — return connection, try next.
-                pool.put(idx, client).await;
-                continue;
+                // Not on this server — return the connection, try the next.
+                pool.put(idx, client, permit).await;
+                saw_missing = true;
             }
             Ok(Err(StatResult::Present)) => {
-                // BODY never returns Present; protocol oddity. Return conn.
-                pool.put(idx, client).await;
-                continue;
+                // BODY never returns Present; protocol oddity. Try next.
+                pool.put(idx, client, permit).await;
+                saw_missing = true;
             }
             Err(e) => {
-                // Connection error — drop the connection (don't return to
-                // pool). The next fetch will create a fresh one.
+                // Connection error — drop it, try next server. Next fetch
+                // creates a fresh one (under the gate's slot count).
                 tracing::warn!(server_idx = idx, error = %e, "BODY error; dropping connection");
-                last_error = Some(e);
-                all_missing = false;
-                continue;
+                pool.drop_connection(permit);
+                saw_conn_error = true;
             }
         }
     }
 
-    if all_missing {
-        Err(PoolFetchError::Missing)
+    if saw_missing && !saw_conn_error {
+        ArticleOutcome::Missing
     } else {
-        Err(PoolFetchError::Other(last_error.unwrap_or_else(|| {
-            CoreError::Nntp(format!("no server could fetch {message_id}"))
-        })))
+        ArticleOutcome::Retry
     }
 }
 

@@ -112,6 +112,8 @@ pub enum BackendEvent {
         total_bytes: u64,
         /// Recent speed history (most recent last), for the speed graph.
         history: Vec<f64>,
+        /// Number of active NNTP connections (0 when idle).
+        active_connections: usize,
     },
     /// A job was added to the queue (returns job id).
     JobAdded { job_id: i64 },
@@ -270,6 +272,16 @@ pub struct Backend {
     config: Arc<std::sync::RwLock<AppConfig>>,
     ctx: Option<egui::Context>,
     event_tx: mpsc::UnboundedSender<BackendEvent>,
+    /// Long-lived download engine + its warm connection pool, created once
+    /// and reused across jobs so connection establishment (provider-tolerant)
+    /// happens up front, once, gently.
+    engine: Arc<Engine>,
+    /// Archive password for the most recently added job, remembered so
+    /// post-processing can unlock encrypted archives after the download
+    /// (passwords come from the NZB's `<meta type="password">` or a
+    /// user-supplied archive password). Consumed by the post-process
+    /// step via `take()`.
+    pending_password: Arc<std::sync::Mutex<Option<String>>>,
     /// Cancellation token for the single running download, if any.
     cancel_token: Arc<std::sync::Mutex<Option<CancellationToken>>>,
     /// Speed tracker for the single active download.
@@ -301,6 +313,21 @@ impl Backend {
             .expect("tokio runtime build");
 
         let config = Arc::new(std::sync::RwLock::new(config));
+
+        // Long-lived engine with a warm connection pool. Spawn the pool
+        // keeper so connections are established up front, spread out, and
+        // kept alive — never re-established per download.
+        let engine = {
+            let c = config.read().expect("config lock");
+            Arc::new(Engine::new(
+                c.server_configs(),
+                c.effective_max_connections(),
+            ))
+        };
+        {
+            let _guard = runtime.enter();
+            engine.spawn_pool_keeper();
+        }
         let db_path = {
             let c = config.read().expect("config lock");
             c.db_path.clone()
@@ -333,6 +360,8 @@ impl Backend {
             config: Arc::clone(&config),
             ctx: Some(ctx),
             event_tx,
+            engine: Arc::clone(&engine),
+            pending_password: Arc::new(std::sync::Mutex::new(None)),
             cancel_token: Arc::new(std::sync::Mutex::new(None)),
             speed: Arc::new(std::sync::Mutex::new(SpeedTracker::new())),
             selected_job: Arc::new(std::sync::Mutex::new(None)),
@@ -494,6 +523,8 @@ impl Backend {
         let selected_job = Arc::clone(&self.selected_job);
         let speed = Arc::clone(&self.speed);
         let engine_paused = Arc::clone(&self.engine_paused);
+        let engine = Arc::clone(&self.engine);
+        let pending_password = Arc::clone(&self.pending_password);
 
         tokio::spawn(async move {
             let emit = |ev: BackendEvent| {
@@ -520,6 +551,13 @@ impl Backend {
                     return;
                 }
             };
+
+            // Remember the NZB's declared password so post-processing can
+            // unlock the encrypted archives after the download.
+            if let Some(pw) = nzb.passwords().first() {
+                let mut slot = pending_password.lock().expect("pending_password lock");
+                *slot = Some(pw.clone());
+            }
 
             if let Err(e) = queue
                 .populate_job(job_id, &nzb, &job_dir, Some(&title))
@@ -556,10 +594,6 @@ impl Backend {
                                 let c = config.read().expect("config lock");
                                 c.server_configs()
                             };
-                            let max_conn = {
-                                let c = config.read().expect("config lock");
-                                c.max_connections
-                            };
                             if !servers.is_empty() {
                                 let new_cancel = CancellationToken::new();
                                 {
@@ -568,8 +602,7 @@ impl Backend {
                                 }
                                 spawn_engine_task(
                                     job_id,
-                                    servers,
-                                    max_conn,
+                                    Arc::clone(&engine),
                                     Arc::clone(&queue),
                                     Arc::clone(&config),
                                     event_tx.clone(),
@@ -578,6 +611,7 @@ impl Backend {
                                     Arc::clone(&cancel_token),
                                     Arc::clone(&selected_job),
                                     Arc::clone(&engine_paused),
+                                    Arc::clone(&pending_password),
                                     new_cancel,
                                 );
                             }
@@ -633,6 +667,13 @@ impl Backend {
         );
 
         let pw = archive_password.or_else(|| nzb.passwords().first().map(|s| s.to_string()));
+
+        // Remember the password so post-processing (after the download)
+        // can unlock encrypted archives.
+        {
+            let mut slot = self.pending_password.lock().expect("pending_password lock");
+            *slot = pw.clone();
+        }
 
         let job_id = match self.queue.add_job(&nzb, &output_dir, 0, display_name).await {
             Ok(id) => id,
@@ -696,6 +737,8 @@ impl Backend {
         let selected_job = Arc::clone(&self.selected_job);
         let speed = Arc::clone(&self.speed);
         let engine_paused = Arc::clone(&self.engine_paused);
+        let engine = Arc::clone(&self.engine);
+        let pending_password = Arc::clone(&self.pending_password);
 
         tokio::spawn(async move {
             let emit = |ev: BackendEvent| {
@@ -813,10 +856,6 @@ impl Backend {
                                 let c = config.read().expect("config lock");
                                 c.server_configs()
                             };
-                            let max_conn = {
-                                let c = config.read().expect("config lock");
-                                c.max_connections
-                            };
                             if !servers.is_empty() {
                                 let new_cancel = CancellationToken::new();
                                 {
@@ -825,8 +864,7 @@ impl Backend {
                                 }
                                 spawn_engine_task(
                                     job_id,
-                                    servers,
-                                    max_conn,
+                                    Arc::clone(&engine),
                                     Arc::clone(&queue),
                                     Arc::clone(&config),
                                     event_tx.clone(),
@@ -835,6 +873,7 @@ impl Backend {
                                     Arc::clone(&cancel_token),
                                     Arc::clone(&selected_job),
                                     Arc::clone(&engine_paused),
+                                    Arc::clone(&pending_password),
                                     new_cancel,
                                 );
                             }
@@ -950,10 +989,6 @@ impl Backend {
             let c = self.config.read().expect("config lock");
             c.server_configs()
         };
-        let max_conn = {
-            let c = self.config.read().expect("config lock");
-            c.max_connections
-        };
         if servers.is_empty() {
             self.emit(BackendEvent::Error(
                 "No NNTP servers configured. Add one in Settings.".into(),
@@ -974,7 +1009,7 @@ impl Backend {
             return;
         }
 
-        tracing::info!(job_id, servers = servers.len(), max_conn, "starting engine");
+        tracing::info!(job_id, servers = servers.len(), "starting engine");
 
         let cancel_token = CancellationToken::new();
         {
@@ -984,8 +1019,7 @@ impl Backend {
 
         spawn_engine_task(
             job_id,
-            servers,
-            max_conn,
+            Arc::clone(&self.engine),
             Arc::clone(&self.queue),
             Arc::clone(&self.config),
             self.event_tx.clone(),
@@ -994,6 +1028,7 @@ impl Backend {
             Arc::clone(&self.cancel_token),
             Arc::clone(&self.selected_job),
             Arc::clone(&self.engine_paused),
+            Arc::clone(&self.pending_password),
             cancel_token,
         );
     }
@@ -1287,8 +1322,7 @@ fn append_api_key(url: &str, indexers: &[IndexerConfig]) -> String {
 #[allow(clippy::too_many_arguments)]
 fn spawn_engine_task(
     job_id: i64,
-    servers: Vec<ServerConfig>,
-    max_conn: usize,
+    engine: Arc<Engine>,
     queue: Arc<QueueManager>,
     config: Arc<std::sync::RwLock<AppConfig>>,
     event_tx: mpsc::UnboundedSender<BackendEvent>,
@@ -1297,14 +1331,10 @@ fn spawn_engine_task(
     cancel_token_slot: Arc<std::sync::Mutex<Option<CancellationToken>>>,
     selected_job: Arc<std::sync::Mutex<Option<i64>>>,
     engine_paused: Arc<std::sync::Mutex<bool>>,
+    pending_password: Arc<std::sync::Mutex<Option<String>>>,
     cancel_token: CancellationToken,
 ) {
-    tracing::info!(
-        job_id,
-        servers = servers.len(),
-        max_conn,
-        "spawning engine task"
-    );
+    tracing::info!(job_id, "spawning engine task");
     tokio::spawn(async move {
         let total_bytes = queue
             .get_job(job_id)
@@ -1319,7 +1349,10 @@ fn spawn_engine_task(
             speed.start(total_bytes);
         }
 
-        let engine = Arc::new(Engine::new(servers, max_conn));
+        let fwd_engine = Arc::clone(&engine);
+        // Extra clone so auto-start can reuse the same warm engine after this
+        // job completes (engine itself is moved into run_job below).
+        let engine_reuse = Arc::clone(&engine);
         let (tx, mut rx) = mpsc::unbounded_channel::<ProgressEvent>();
 
         // Forward progress events to the GUI + track speed.
@@ -1342,9 +1375,9 @@ fn spawn_engine_task(
                             }
                         }
                         let _ = fwd_event_tx.send(BackendEvent::Progress(ev));
-                        if let Some(ref ctx) = fwd_ctx {
-                            ctx.request_repaint();
-                        }
+                        // Don't request_repaint on every segment — the 100ms
+                        // tick below handles repaints. With 50 connections
+                        // this would cause hundreds of repaints/sec.
                     }
                     _ = interval.tick() => {
                         let (bps, downloaded) = fwd_speed
@@ -1362,6 +1395,7 @@ fn spawn_engine_task(
                             downloaded_bytes: downloaded,
                             total_bytes,
                             history,
+                            active_connections: fwd_engine.active_connections(),
                         });
 
                         if let Ok(jobs) = fwd_queue.list_jobs().await {
@@ -1451,7 +1485,10 @@ fn spawn_engine_task(
                                 completed_dir,
                                 category: None,
                                 cleanup_archives: pp_defaults.cleanup_archives,
-                                archive_password: None,
+                                archive_password: pending_password
+                                    .lock()
+                                    .expect("pending_password lock")
+                                    .take(),
                                 skip_verify: pp_defaults.skip_verify,
                             };
                             emit(BackendEvent::PostProcessStarted { job_id });
@@ -1514,6 +1551,7 @@ fn spawn_engine_task(
             downloaded_bytes: 0,
             total_bytes: 0,
             history: Vec::new(),
+            active_connections: 0,
         });
 
         // Refresh jobs list + auto-start next queued job (unless engine
@@ -1530,9 +1568,9 @@ fn spawn_engine_task(
                     tracing::info!(next_job_id = next.id, "auto-starting next queued job");
                     let next_id = next.id;
 
-                    let (next_servers, next_conn) = {
+                    let (next_servers, _next_conn) = {
                         let c = config.read().expect("config lock");
-                        (c.server_configs(), c.max_connections)
+                        (c.server_configs(), c.effective_max_connections())
                     };
                     if next_servers.is_empty() {
                         tracing::warn!("no servers configured, skipping auto-start");
@@ -1548,10 +1586,10 @@ fn spawn_engine_task(
                                         cancel_token_slot.lock().expect("cancel_token lock");
                                     *slot = Some(new_cancel.clone());
                                 }
+                                // Reuse the same long-lived engine (warm pool).
                                 spawn_engine_task(
                                     next_id,
-                                    next_servers,
-                                    next_conn,
+                                    Arc::clone(&engine_reuse),
                                     queue.clone(),
                                     config.clone(),
                                     event_tx.clone(),
@@ -1560,6 +1598,7 @@ fn spawn_engine_task(
                                     cancel_token_slot.clone(),
                                     selected_job.clone(),
                                     engine_paused.clone(),
+                                    pending_password.clone(),
                                     new_cancel,
                                 );
                             }

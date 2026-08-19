@@ -303,8 +303,8 @@ pub fn ui(
                         ui.label(config.db_path.display().to_string());
                     });
                     ui.horizontal(|ui| {
-                        ui.label("Max connections:");
-                        ui.add(egui::DragValue::new(&mut config.max_connections).range(1..=100));
+                        ui.label("Max connections (0 = use server totals):");
+                        ui.add(egui::DragValue::new(&mut config.max_connections).range(0..=100));
                     });
                 });
 

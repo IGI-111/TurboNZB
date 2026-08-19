@@ -22,6 +22,9 @@ pub mod colors {
     pub const TITLE_BAR_ACTIVE_TEXT: Color32 = Color32::from_rgb(255, 255, 255);
     pub const TITLE_BAR_INACTIVE: Color32 = Color32::from_rgb(127, 120, 127); // #7f787f
     pub const TITLE_BAR_INACTIVE_TEXT: Color32 = Color32::from_rgb(198, 198, 198); // #c6c6c6
+    /// Accent color — emerald green for fills (progress bars, graphs, dots).
+    pub const ACCENT: Color32 = Color32::from_rgb(0, 128, 96); // #008060
+    pub const ACCENT_LIGHT: Color32 = Color32::from_rgb(0, 168, 128); // #00a880
     pub const SELECTION: Color32 = Color32::from_rgb(0, 0, 128);
     pub const SELECTION_TEXT: Color32 = Color32::from_rgb(255, 255, 255);
     /// Lighter selection for text editing — black text must remain readable.

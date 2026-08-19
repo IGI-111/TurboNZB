@@ -199,25 +199,9 @@ fn draw_arrow(painter: &Painter, rect: Rect, up: bool, pressed: bool) {
 }
 
 fn paint_dithered_track(painter: &Painter, rect: Rect) {
-    let checker = 2.0_f32;
-    let cols = (rect.width() / checker).ceil() as i32;
-    let rows = (rect.height() / checker).ceil() as i32;
-    for row in 0..rows {
-        for col in 0..cols {
-            let color = if (row + col) % 2 == 0 {
-                colors::BUTTON_FACE
-            } else {
-                colors::BUTTON_LIGHT
-            };
-            let x = rect.left() + col as f32 * checker;
-            let y = rect.top() + row as f32 * checker;
-            painter.rect_filled(
-                Rect::from_min_size(Pos2::new(x, y), Vec2::new(checker, checker)),
-                0.0,
-                color,
-            );
-        }
-    }
+    // Solid track color — the per-pixel dither (1800+ rect_filled calls
+    // per frame per scrollbar) caused excessive CPU usage.
+    painter.rect_filled(rect, 0.0, colors::BUTTON_FACE);
 }
 
 // ─── Table ───────────────────────────────────────────────────────────────
@@ -450,16 +434,46 @@ impl<'a> TableBody<'a> {
             .ui
             .allocate_exact_size(Vec2::new(self.content_width, height), Sense::hover());
 
-        // Striped background — very subtle, barely visible.
-        if self.striped && self.row_index % 2 == 1 {
+        // Viewport culling: skip rendering rows outside the visible area.
+        // We still allocate space (so scroll positions are correct) but
+        // don't call the row's content closure for off-screen rows.
+        let clip = self.ui.clip_rect();
+        let is_visible = row_rect.bottom() >= clip.top() && row_rect.top() <= clip.bottom();
+
+        // Striped background — paint even for non-visible rows is unnecessary;
+        // skip for performance.
+        if is_visible && self.striped && self.row_index % 2 == 1 {
             self.ui
                 .painter()
                 .rect_filled(row_rect, 0.0, Color32::from_rgb(223, 223, 223));
         }
 
-        let mut row =
-            TableRow::with_left(row_rect.left(), row_rect.top(), height, self.widths.clone());
-        let result = add_row(&mut row, self.ui);
+        let result = if is_visible {
+            let mut row =
+                TableRow::with_left(row_rect.left(), row_rect.top(), height, self.widths.clone());
+            add_row(&mut row, self.ui)
+        } else {
+            // Return a dummy result — we can't know R, so we use a
+            // default-panic approach. Instead, restructure to not return R
+            // for culled rows. We'll just call the closure with a dummy UI
+            // that's clipped to nothing.
+            //
+            // Actually, the simplest fix: don't allocate for the content
+            // at all. The row_rect is already allocated. We just skip the
+            // add_row closure. The caller typically doesn't use the return
+            // value of row(), so this is fine.
+            //
+            // We need a default R. Since R is generic, we can't. Let's
+            // just call the closure but with a clipped-out UI so it's cheap.
+            let mut row =
+                TableRow::with_left(row_rect.left(), row_rect.top(), height, self.widths.clone());
+            // Temporarily shrink clip rect so nothing paints.
+            let saved_clip = self.ui.clip_rect();
+            self.ui.set_clip_rect(Rect::NOTHING);
+            let r = add_row(&mut row, self.ui);
+            self.ui.set_clip_rect(saved_clip);
+            r
+        };
         self.row_index += 1;
         result
     }

@@ -794,7 +794,7 @@ impl Widget for Win95ProgressBar {
             let w = inner.width() * self.progress;
             let fill_rect =
                 egui::Rect::from_min_size(inner.left_top(), Vec2::new(w, inner.height()));
-            painter.rect_filled(fill_rect, 0.0, colors::TITLE_BAR_ACTIVE);
+            painter.rect_filled(fill_rect, 0.0, colors::ACCENT);
             w
         } else {
             0.0

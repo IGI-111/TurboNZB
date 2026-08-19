@@ -12,7 +12,8 @@
 
 use egui::Color32;
 use nobz_core::PostProcessReport;
-use nobz_core::queue::{JobState, QueueJob};
+use nobz_core::engine::ProgressEvent;
+use nobz_core::queue::{JobState, QueueJob, SegmentState};
 
 use crate::backend::{BackendCmd, BackendEvent, BackendHandle, JobFileDetail};
 use crate::theme::Icons;
@@ -42,6 +43,8 @@ pub struct QueueState {
     pub current_downloaded: u64,
     /// Total bytes of the current download.
     pub current_total: u64,
+    /// Number of active NNTP connections (0 when idle).
+    pub active_connections: usize,
     /// Job id of the currently-downloading job (None when idle).
     pub current_job_id: Option<i64>,
     /// Whether the download engine is paused (global Play/Pause).
@@ -89,13 +92,47 @@ impl QueueState {
                     downloaded_bytes,
                     total_bytes,
                     history,
+                    active_connections,
                 } => {
                     self.current_job_id = *job_id;
                     self.current_speed = *bytes_per_sec;
                     self.speed_history = history.clone();
                     self.current_downloaded = *downloaded_bytes;
                     self.current_total = *total_bytes;
+                    self.active_connections = *active_connections;
                 }
+                BackendEvent::Progress(ev) => match ev {
+                    // Live segment progress — so the bar moves in real-time
+                    // instead of waiting for the 100ms DB poll (which a very
+                    // fast download can outrun entirely).
+                    ProgressEvent::SegmentDone { status, bytes, .. }
+                        if self.current_job_id.is_some() =>
+                    {
+                        let transferred =
+                            matches!(status, SegmentState::Done | SegmentState::CrcMismatch);
+                        if transferred {
+                            self.current_downloaded =
+                                self.current_downloaded.saturating_add(*bytes);
+                            if let Some(job) = self
+                                .jobs
+                                .iter_mut()
+                                .find(|j| Some(j.id) == self.current_job_id)
+                            {
+                                job.segments_done = job.segments_done.saturating_add(1);
+                            }
+                        }
+                    }
+                    // A file finished assembling — bump the file counter so
+                    // "N / M files" reflects very fast completions too.
+                    ProgressEvent::FileCompleted { .. } => {
+                        if let Some(id) = self.current_job_id {
+                            if let Some(job) = self.jobs.iter_mut().find(|j| j.id == id) {
+                                job.files_done = (job.files_done + 1).min(job.file_count);
+                            }
+                        }
+                    }
+                    _ => {}
+                },
                 BackendEvent::JobDetails { job_id, files } => {
                     if self.selected_job == Some(*job_id) {
                         self.job_details = files.clone();
@@ -255,7 +292,7 @@ fn job_list_pane(
     backend: &BackendHandle,
     icons: Option<&Icons>,
 ) {
-    let state_w = 80.0;
+    let state_w = 100.0;
     let progress_w = 220.0;
     let actions_w = 90.0;
 
@@ -413,7 +450,7 @@ fn speed_graph_pane(ui: &mut egui::Ui, state: &QueueState) {
 
     let bg = Color32::from_rgb(255, 255, 255);
     let grid = Color32::from_rgb(200, 200, 200);
-    let line = crate::theme::colors::TITLE_BAR_ACTIVE;
+    let line = crate::theme::colors::ACCENT;
     let text = Color32::from_rgb(0, 0, 0);
 
     painter.rect_filled(inner, 0.0, bg);
@@ -740,7 +777,7 @@ fn file_segment_grid(ui: &mut egui::Ui, file: &JobFileDetail) {
         let x = rect.left() + col as f32 * (dot_size + gap);
         let y = rect.top() + row as f32 * (dot_size + gap);
         let color = if i < done {
-            Color32::from_rgb(0, 0, 128) // navy = done (Win95 blue)
+            Color32::from_rgb(0, 128, 96) // emerald = done
         } else if i < done + missing {
             Color32::from_rgb(200, 60, 60) // red = missing
         } else {

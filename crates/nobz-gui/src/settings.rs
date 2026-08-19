@@ -153,7 +153,7 @@ impl AppConfig {
                     subfolder: "books".into(),
                 },
             ],
-            max_connections: 8,
+            max_connections: 0,
             post_process: PostProcessDefaults::default(),
         }
     }
@@ -168,5 +168,23 @@ impl AppConfig {
         let mut servers: Vec<ServerConfig> = self.servers.iter().map(Into::into).collect();
         servers.sort_by_key(|s| s.priority);
         servers
+    }
+
+    /// Compute the effective total connection count.
+    ///
+    /// If `max_connections` is 0 (infinite), the total is the sum of all
+    /// servers' `max_connections`. Otherwise, `max_connections` acts as a
+    /// ceiling: `min(sum_of_server_connections, max_connections)`.
+    pub fn effective_max_connections(&self) -> usize {
+        let server_total: usize = self
+            .servers
+            .iter()
+            .map(|s| s.max_connections as usize)
+            .sum();
+        if self.max_connections == 0 {
+            server_total.max(1)
+        } else {
+            server_total.min(self.max_connections).max(1)
+        }
     }
 }

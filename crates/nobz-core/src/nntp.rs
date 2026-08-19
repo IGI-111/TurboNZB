@@ -134,6 +134,17 @@ impl NntpClient {
         let stream = TcpStream::connect((cfg.host.as_str(), cfg.port))
             .await
             .map_err(|e| CoreError::NntpConnect(format!("{}: {e}", cfg.host)))?;
+        // Disable Nagle's algorithm — NNTP is request/response and each
+        // command is small. Without TCP_NODELAY, the OS buffers the tiny
+        // `BODY <id>\r\n` command behind Nagle, adding up to 40ms latency
+        // per article (the classic "Nagle + delayed ACK" stall).
+        let _ = stream.set_nodelay(true);
+
+        // A 256KB read buffer amortizes TLS record overhead and reduces
+        // syscall count for large article bodies (~500KB each). The default
+        // 8KB BufReader would do ~60 read() syscalls per article; 256KB
+        // does 2-3.
+        const READ_BUF: usize = 256 * 1024;
 
         let transport = if cfg.tls {
             let connector = build_tls_connector()?;
@@ -143,9 +154,9 @@ impl NntpClient {
                 .connect(server_name, stream)
                 .await
                 .map_err(|e| CoreError::NntpConnect(format!("TLS: {e}")))?;
-            Transport::Tls(Box::new(BufReader::new(tls_stream)))
+            Transport::Tls(Box::new(BufReader::with_capacity(READ_BUF, tls_stream)))
         } else {
-            Transport::Plain(BufReader::new(stream))
+            Transport::Plain(BufReader::with_capacity(READ_BUF, stream))
         };
 
         let mut client = Self {
@@ -199,18 +210,41 @@ impl NntpClient {
         &mut self,
         message_id: &str,
     ) -> Result<std::result::Result<ArticleBody, StatResult>> {
-        self.send_cmd(&format!("BODY <{message_id}>")).await?;
+        self.send_body(message_id).await?;
+        self.read_body_response().await
+    }
+
+    /// Write a `BODY <id>` command without waiting for the response.
+    ///
+    /// Used for NNTP command pipelining: write N commands, then read N
+    /// responses in order. Servers that support pipelining buffer the
+    /// outgoing article bodies and stream them back‑to‑back, keeping the
+    /// connection's send pipe full (no per‑article command round‑trip).
+    ///
+    /// Do NOT call this casually without subsequently reading responses —
+    /// an NNTP server is allowed to (and eventually will) stop reading
+    /// commands when its input buffer fills.
+    pub async fn send_body(&mut self, message_id: &str) -> Result<()> {
+        self.send_cmd(&format!("BODY <{message_id}>")).await
+    }
+
+    /// Read the response to a previously issued `BODY` command.
+    ///
+    /// `222` → read and return the body; `423`/`430` → `Missing`;
+    /// anything else is an error.
+    pub async fn read_body_response(
+        &mut self,
+    ) -> Result<std::result::Result<ArticleBody, StatResult>> {
         let status = self.read_response_line().await?;
         let code = ResponseCode::parse(&status)
             .ok_or_else(|| CoreError::Nntp(format!("bad response: {status}")))?;
         match code.0 {
-            222 => {}
-            423 | 430 => return Ok(Err(StatResult::Missing)),
-            _ => return Err(CoreError::Nntp(format!("BODY failed: {status}"))),
+            222 => Ok(Ok(ArticleBody {
+                bytes: self.read_dot_body().await?,
+            })),
+            423 | 430 => Ok(Err(StatResult::Missing)),
+            _ => Err(CoreError::Nntp(format!("BODY failed: {status}"))),
         }
-        Ok(Ok(ArticleBody {
-            bytes: self.read_dot_body().await?,
-        }))
     }
 
     /// Check article presence via `STAT <id>` (cheaper than BODY: no payload).
@@ -226,16 +260,29 @@ impl NntpClient {
         }
     }
 
-    /// Send a single command line (CRLF-terminated).
+    /// Send a `NOOP` — a cheap keep-alive so the provider doesn't close
+    /// connections that sit idle in the pool.
+    pub async fn noop(&mut self) -> Result<()> {
+        self.send_cmd("NOOP").await?;
+        let line = self.read_response_line().await?;
+        let code = ResponseCode::parse(&line)
+            .ok_or_else(|| CoreError::Nntp(format!("bad response: {line}")))?;
+        if code.0 == 200 || code.class() == 2 {
+            Ok(())
+        } else {
+            Err(CoreError::Nntp(format!("NOOP failed: {line}")))
+        }
+    }
+
+    /// Send a single command line (CRLF-terminated). The command and CRLF
+    /// are combined into a single `write_all` to produce one TLS record and
+    /// one packet — splitting them caused an extra TLS record and potential
+    /// Nagle/delayed-ACK interaction.
     async fn send_cmd(&mut self, cmd: &str) -> Result<()> {
-        self.reader
-            .write_all(cmd.as_bytes())
-            .await
-            .map_err(CoreError::from)?;
-        self.reader
-            .write_all(b"\r\n")
-            .await
-            .map_err(CoreError::from)?;
+        let mut buf = Vec::with_capacity(cmd.len() + 2);
+        buf.extend_from_slice(cmd.as_bytes());
+        buf.extend_from_slice(b"\r\n");
+        self.reader.write_all(&buf).await.map_err(CoreError::from)?;
         self.reader.flush().await.map_err(CoreError::from)?;
         tracing::trace!(cmd, "nntp ->");
         Ok(())
@@ -268,7 +315,10 @@ impl NntpClient {
     /// status line), until the terminating `.\r\n`. Returns the unstuffed
     /// bytes.
     async fn read_dot_body(&mut self) -> Result<Vec<u8>> {
-        let mut out = Vec::new();
+        // Most article bodies are ~500KB (yEnc-encoded segments). Pre-
+        // allocating avoids repeated Vec growth (doubling from 0 would
+        // involve ~19 reallocations for a 500KB body).
+        let mut out = Vec::with_capacity(512 * 1024);
         loop {
             self.line_buf.clear();
             let n = self

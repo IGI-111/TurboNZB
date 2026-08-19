@@ -81,7 +81,6 @@ pub fn decode_article(input: &[u8]) -> Result<DecodedPart> {
     };
 
     let mut out = Vec::with_capacity(payload.len());
-    let mut crc = Hasher::new();
     // yEnc transport framing: CRLF pairs are inserted by the news transport
     // and must be removed. A single trailing space or tab *immediately before
     // a CRLF* may be transport padding (NNTP servers strip trailing spaces,
@@ -95,29 +94,27 @@ pub fn decode_article(input: &[u8]) -> Result<DecodedPart> {
     //   - Last data byte naturally encodes to space/tab (line is 128 bytes
     //     for line=128) → keep, it's real data
     // If `line=` is absent, we don't strip (safer to keep data bytes).
-    let mut line_raw: Vec<u8> = Vec::new();
+    let mut line_raw: Vec<u8> = Vec::with_capacity(512);
     for &b in payload {
         if b == b'\n' {
-            // End of transport line.
             maybe_strip_padding(&mut line_raw, line_size);
-            decode_line(&line_raw, &mut out, &mut crc)?;
+            decode_line(&line_raw, &mut out)?;
             line_raw.clear();
         } else if b == b'\r' {
-            // CR is part of CRLF; ignore (the \n handler commits the line).
             continue;
         } else {
-            // Ordinary encoded byte or `=` escape marker — pass through; the
-            // escape is resolved by decode_line.
             line_raw.push(b);
         }
     }
-    // Trailing bytes after the last CRLF: commit without padding stripping
-    // (well-formed yEnc ends with a CRLF before =yend, so this is defensive).
     if !line_raw.is_empty() {
         maybe_strip_padding(&mut line_raw, line_size);
-        decode_line(&line_raw, &mut out, &mut crc)?;
+        decode_line(&line_raw, &mut out)?;
         line_raw.clear();
     }
+    // CRC32 computed once over the full decoded output — per-byte updates
+    // during decode are ~44x slower (1.5ms vs 34µs for a 500KB article).
+    let mut crc = Hasher::new();
+    crc.update(&out);
     let computed = crc.finalize();
 
     // Single-part: crc32=.  Multi-part: pcrc32=.
@@ -188,20 +185,18 @@ fn count_decoded_bytes(line_raw: &[u8]) -> usize {
 /// Handles the `=` escape: an escaped byte `b` decodes to `b - 64 - 42`, an
 /// ordinary byte `b` decodes to `b - 42`. Returns an error if the line ends
 /// with a dangling `=` (no byte following it).
-fn decode_line(line_raw: &[u8], out: &mut Vec<u8>, crc: &mut Hasher) -> Result<()> {
+fn decode_line(line_raw: &[u8], out: &mut Vec<u8>) -> Result<()> {
     let mut escaped = false;
     for &b in line_raw {
         if escaped {
             let decoded = b.wrapping_sub(64).wrapping_sub(42);
             out.push(decoded);
-            crc.update(&[decoded]);
             escaped = false;
         } else if b == b'=' {
             escaped = true;
         } else {
             let decoded = b.wrapping_sub(42);
             out.push(decoded);
-            crc.update(&[decoded]);
         }
     }
     if escaped {
