@@ -15,9 +15,9 @@ use nobz_core::PostProcessReport;
 use nobz_core::engine::ProgressEvent;
 use nobz_core::queue::{JobState, QueueJob, SegmentState};
 
-use crate::backend::{BackendCmd, BackendEvent, BackendHandle, JobFileDetail};
+use crate::backend::{BackendCmd, BackendEvent, BackendHandle, JobFileDetail, JobSegmentDetail};
 use crate::theme::Icons;
-use crate::win95_scroll::Win95Table;
+use crate::win95_scroll::{Win95Table, vertical};
 use crate::win95_widgets::{
     Win95Button, Win95IconButton, Win95ProgressBar, Win95TabButton, paint_sunken_bevel,
 };
@@ -28,6 +28,7 @@ pub enum DetailsTab {
     #[default]
     General,
     Files,
+    Segments,
     Speed,
 }
 
@@ -331,6 +332,11 @@ fn job_list_pane(
                         row.col(ui, |ui| {
                             if state.pp_in_progress.contains(&job.id) {
                                 ui.colored_label(Color32::from_rgb(80, 180, 80), "Verifying...");
+                            } else if let Some(err) = &job.error {
+                                // Salient error state — red "Error" with the
+                                // reason on hover.
+                                ui.colored_label(Color32::from_rgb(200, 60, 60), "Error")
+                                    .on_hover_text(err.as_str());
                             } else {
                                 let (color, text) = state_color(&job.state);
                                 ui.colored_label(color, text);
@@ -572,6 +578,15 @@ fn details_tabbed_pane(ui: &mut egui::Ui, state: &mut QueueState, icons: Option<
             state.details_tab = DetailsTab::Files;
         }
         if ui
+            .add(
+                Win95TabButton::new(None, "Segments", active_tab == DetailsTab::Segments)
+                    .enabled(has_selection),
+            )
+            .clicked()
+        {
+            state.details_tab = DetailsTab::Segments;
+        }
+        if ui
             .add(Win95TabButton::new(
                 None,
                 "Speed",
@@ -591,6 +606,9 @@ fn details_tabbed_pane(ui: &mut egui::Ui, state: &mut QueueState, icons: Option<
         }
         DetailsTab::Files => {
             files_pane(ui, state);
+        }
+        DetailsTab::Segments => {
+            segments_pane(ui, state);
         }
         DetailsTab::Speed => {
             speed_graph_pane(ui, state);
@@ -614,8 +632,22 @@ fn general_pane(ui: &mut egui::Ui, state: &QueueState) {
     ui.horizontal(|ui| {
         ui.heading(&job.name);
         let (color, text) = state_color(&job.state);
-        ui.colored_label(color, text);
+        if let Some(err) = &job.error {
+            ui.colored_label(color, "Error").on_hover_text(err.as_str());
+        } else {
+            ui.colored_label(color, text);
+        }
     });
+
+    // Salient error box for failed jobs (download or post-process).
+    if let Some(err) = &job.error {
+        ui.add_space(4.0);
+        egui::Frame::group(ui.style())
+            .inner_margin(egui::Margin::same(6.0))
+            .show(ui, |ui| {
+                ui.colored_label(Color32::from_rgb(200, 60, 60), format!("Error: {err}"));
+            });
+    }
 
     ui.horizontal(|ui| {
         ui.label(format!("ID: {}", job.id));
@@ -706,7 +738,6 @@ fn files_pane(ui: &mut egui::Ui, state: &QueueState) {
     // File list table — Filename stretches with the window.
     let segs_w = 80.0;
     let size_w = 140.0;
-    let grid_w = 170.0;
 
     Win95Table::new()
         .striped(true)
@@ -715,12 +746,11 @@ fn files_pane(ui: &mut egui::Ui, state: &QueueState) {
         .column_remainder()
         .column(segs_w)
         .column(size_w)
-        .column(grid_w)
         .header_body(
             ui,
             20.0,
             |row, ui| {
-                for label in ["File", "Segs", "Size", "Segments"] {
+                for label in ["File", "Segs", "Size"] {
                     row.col(ui, |ui| {
                         ui.strong(label);
                     });
@@ -742,53 +772,124 @@ fn files_pane(ui: &mut egui::Ui, state: &QueueState) {
                                 format_size(file.total_bytes)
                             ));
                         });
-                        row.col(ui, |ui| {
-                            file_segment_grid(ui, file);
-                        });
                     });
                 }
             },
         );
 }
 
-/// High-granularity per-file segment dot grid.
-/// Shows one dot per segment (up to 200), colored by status.
-fn file_segment_grid(ui: &mut egui::Ui, file: &JobFileDetail) {
-    let total = file.segment_count.min(200) as usize;
-    if total == 0 {
+/// Color + short label for a segment's state.
+fn segment_style(seg: &JobSegmentDetail, downloading: bool) -> (Color32, &'static str) {
+    match seg.state {
+        SegmentState::Done => (Color32::from_rgb(0, 128, 96), "done"),
+        SegmentState::CrcMismatch => (Color32::from_rgb(190, 130, 30), "bad CRC"),
+        SegmentState::Missing => (Color32::from_rgb(200, 60, 60), "missing"),
+        SegmentState::Failed => (Color32::from_rgb(150, 30, 30), "failed"),
+        SegmentState::Pending => {
+            if downloading {
+                // The current job is downloading — pending segments are
+                // queued to be fetched very soon.
+                (Color32::from_rgb(60, 110, 190), "fetching")
+            } else {
+                (Color32::from_rgb(140, 140, 140), "pending")
+            }
+        }
+    }
+}
+
+/// Segments tab: full-job block map in the style of the classic disk
+/// defragmenter. Every segment is a colored tile; watch the download
+/// fill the map live. Scrollable when the map is taller than the pane.
+fn segments_pane(ui: &mut egui::Ui, state: &QueueState) {
+    let Some(job_id) = state.selected_job else {
+        ui.label("Select a job to see its segments.");
+        return;
+    };
+    if state.job_details.is_empty() {
+        ui.label("No segment data available.");
         return;
     }
-    let done = (file.segments_done as usize * total) / file.segment_count as usize;
-    let missing = (file.segments_missing as usize * total) / file.segment_count as usize;
+    let downloading = state.current_job_id == Some(job_id);
 
-    let dot_size = 4.0;
-    let gap = 1.0;
-    let dots_per_row = 28usize;
-    let rows = total.div_ceil(dots_per_row);
-    let width = dots_per_row as f32 * (dot_size + gap);
-    let height = rows as f32 * (dot_size + gap);
-
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
-    let painter = ui.painter_at(rect);
-
-    for i in 0..total {
-        let col = i % dots_per_row;
-        let row = i / dots_per_row;
-        let x = rect.left() + col as f32 * (dot_size + gap);
-        let y = rect.top() + row as f32 * (dot_size + gap);
-        let color = if i < done {
-            Color32::from_rgb(0, 128, 96) // emerald = done
-        } else if i < done + missing {
-            Color32::from_rgb(200, 60, 60) // red = missing
-        } else {
-            Color32::from_rgb(160, 160, 160) // gray = pending
-        };
-        painter.rect_filled(
-            egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(dot_size, dot_size)),
-            0.0,
-            color,
-        );
+    let total: usize = state.job_details.iter().map(|f| f.segments.len()).sum();
+    if total == 0 {
+        ui.label("No segments yet.");
+        return;
     }
+
+    // Padded frame so the map isn't cramped against the pane edges.
+    egui::Frame::none()
+        .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+        .show(ui, |ui| {
+            vertical(ui, "seg_block_map", |ui| {
+                let avail_w = ui.available_width();
+                let tile = 10.0;
+                let gap = 1.0;
+                let margin = 8.0;
+                // Tiles per row: fill the width, but never stretch a tiny
+                // job across the whole window.
+                let per_row = ((avail_w - margin * 2.0) / (tile + gap)) as usize;
+                let per_row = per_row.max(1).min(total);
+                let rows = total.div_ceil(per_row);
+                let w = margin * 2.0 + per_row as f32 * (tile + gap);
+                let h = margin * 2.0 + rows as f32 * (tile + gap);
+                let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::hover());
+
+                let painter = ui.painter_at(rect);
+                // Dark background like the defragmenter view.
+                painter.rect_filled(rect, 2.0, Color32::from_rgb(24, 24, 28));
+
+                let mut hover_idx: Option<usize> = None;
+                let mut i = 0usize;
+                'outer: for file in &state.job_details {
+                    for seg in &file.segments {
+                        if i >= total {
+                            break 'outer;
+                        }
+                        let (color, _) = segment_style(seg, downloading);
+                        let col = i % per_row;
+                        let row = i / per_row;
+                        let x = rect.left() + margin + col as f32 * (tile + gap);
+                        let y = rect.top() + margin + row as f32 * (tile + gap);
+                        let t = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(tile, tile));
+                        painter.rect_filled(t, 1.0, color);
+                        if hover_idx.is_none() && ui.rect_contains_pointer(t) {
+                            hover_idx = Some(i);
+                        }
+                        i += 1;
+                    }
+                }
+
+                // Tooltip: file + segment number + status.
+                if let Some(idx) = hover_idx {
+                    let mut cursor = 0usize;
+                    let hit: Option<(&str, &JobSegmentDetail)> = 'find: {
+                        for file in &state.job_details {
+                            for seg in &file.segments {
+                                if cursor == idx {
+                                    break 'find Some((file.filename.as_str(), seg));
+                                }
+                                cursor += 1;
+                            }
+                        }
+                        None
+                    };
+                    if let Some((name, seg)) = hit {
+                        let (_, status) = segment_style(seg, downloading);
+                        let _ = resp.clone();
+                        egui::show_tooltip_at_pointer(
+                            ui.ctx(),
+                            resp.layer_id,
+                            ui.id().with("seg_tooltip"),
+                            |ui| {
+                                ui.label(format!("{name} · segment #{} — {status}", seg.number));
+                                ui.small(format!("size: {}", format_size(seg.bytes)));
+                            },
+                        );
+                    }
+                }
+            });
+        });
 }
 
 fn state_color(state: &JobState) -> (Color32, &'static str) {

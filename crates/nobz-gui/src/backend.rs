@@ -25,7 +25,9 @@ use std::time::Instant;
 use nobz_core::engine::{Engine, ProgressEvent};
 use nobz_core::nntp::ServerConfig;
 use nobz_core::nzb;
-use nobz_core::postprocess::{PostProcessConfig, PostProcessReport, post_process};
+use nobz_core::postprocess::{
+    PostProcessConfig, PostProcessReport, PostProcessStatus, post_process,
+};
 use nobz_core::queue::{JobState, QueueJob, QueueManager};
 use nobz_index::types::{IndexerConfig, SearchQuery};
 use nobz_index::{AggregatedResult, NewznabClient, SearchAggregator};
@@ -158,14 +160,26 @@ pub enum BackendEvent {
 }
 
 /// Per-file detail for the details pane.
+/// A single segment's per-file detail, for the segment view.
+#[derive(Debug, Clone)]
+pub struct JobSegmentDetail {
+    pub number: u32,
+    pub bytes: u64,
+    pub state: nobz_core::queue::SegmentState,
+}
+
+/// Per-file entry for the queue's details pane.
 #[derive(Debug, Clone)]
 pub struct JobFileDetail {
+    pub id: i64,
     pub filename: String,
     pub segment_count: u32,
     pub segments_done: u32,
     pub segments_missing: u32,
     pub total_bytes: u64,
     pub downloaded_bytes: u64,
+    /// All segments of this file (for the segment grid + segment view).
+    pub segments: Vec<JobSegmentDetail>,
 }
 
 /// Handle held by the GUI to send commands and receive events.
@@ -276,12 +290,6 @@ pub struct Backend {
     /// and reused across jobs so connection establishment (provider-tolerant)
     /// happens up front, once, gently.
     engine: Arc<Engine>,
-    /// Archive password for the most recently added job, remembered so
-    /// post-processing can unlock encrypted archives after the download
-    /// (passwords come from the NZB's `<meta type="password">` or a
-    /// user-supplied archive password). Consumed by the post-process
-    /// step via `take()`.
-    pending_password: Arc<std::sync::Mutex<Option<String>>>,
     /// Cancellation token for the single running download, if any.
     cancel_token: Arc<std::sync::Mutex<Option<CancellationToken>>>,
     /// Speed tracker for the single active download.
@@ -361,7 +369,6 @@ impl Backend {
             ctx: Some(ctx),
             event_tx,
             engine: Arc::clone(&engine),
-            pending_password: Arc::new(std::sync::Mutex::new(None)),
             cancel_token: Arc::new(std::sync::Mutex::new(None)),
             speed: Arc::new(std::sync::Mutex::new(SpeedTracker::new())),
             selected_job: Arc::new(std::sync::Mutex::new(None)),
@@ -524,7 +531,6 @@ impl Backend {
         let speed = Arc::clone(&self.speed);
         let engine_paused = Arc::clone(&self.engine_paused);
         let engine = Arc::clone(&self.engine);
-        let pending_password = Arc::clone(&self.pending_password);
 
         tokio::spawn(async move {
             let emit = |ev: BackendEvent| {
@@ -552,13 +558,6 @@ impl Backend {
                 }
             };
 
-            // Remember the NZB's declared password so post-processing can
-            // unlock the encrypted archives after the download.
-            if let Some(pw) = nzb.passwords().first() {
-                let mut slot = pending_password.lock().expect("pending_password lock");
-                *slot = Some(pw.clone());
-            }
-
             if let Err(e) = queue
                 .populate_job(job_id, &nzb, &job_dir, Some(&title))
                 .await
@@ -566,6 +565,15 @@ impl Backend {
                 emit(BackendEvent::Error(format!("Populate job error: {e}")));
                 let _ = queue.delete_job(job_id).await;
                 return;
+            }
+
+            // Store the NZB's declared password on the job itself, so
+            // post-processing can unlock encrypted archives regardless of
+            // which other jobs get added later.
+            if let Some(pw) = nzb.passwords().first() {
+                let _ = queue
+                    .set_job_archive_password(job_id, Some(pw.as_str()))
+                    .await;
             }
 
             emit(BackendEvent::JobStateChanged {
@@ -611,7 +619,6 @@ impl Backend {
                                     Arc::clone(&cancel_token),
                                     Arc::clone(&selected_job),
                                     Arc::clone(&engine_paused),
-                                    Arc::clone(&pending_password),
                                     new_cancel,
                                 );
                             }
@@ -668,13 +675,6 @@ impl Backend {
 
         let pw = archive_password.or_else(|| nzb.passwords().first().map(|s| s.to_string()));
 
-        // Remember the password so post-processing (after the download)
-        // can unlock encrypted archives.
-        {
-            let mut slot = self.pending_password.lock().expect("pending_password lock");
-            *slot = pw.clone();
-        }
-
         let job_id = match self.queue.add_job(&nzb, &output_dir, 0, display_name).await {
             Ok(id) => id,
             Err(e) => {
@@ -682,6 +682,14 @@ impl Backend {
                 return;
             }
         };
+        // Store the archive password on the job so post-processing can
+        // unlock encrypted archives later (survives queueing + restarts).
+        if let Some(ref p) = pw {
+            let _ = self
+                .queue
+                .set_job_archive_password(job_id, Some(p.as_str()))
+                .await;
+        }
         self.emit(BackendEvent::JobAdded { job_id });
 
         // Refresh the queue immediately so the new job shows up.
@@ -738,7 +746,6 @@ impl Backend {
         let speed = Arc::clone(&self.speed);
         let engine_paused = Arc::clone(&self.engine_paused);
         let engine = Arc::clone(&self.engine);
-        let pending_password = Arc::clone(&self.pending_password);
 
         tokio::spawn(async move {
             let emit = |ev: BackendEvent| {
@@ -827,6 +834,15 @@ impl Backend {
                 return;
             }
 
+            // Store the NZB's declared password on the job (same as the
+            // file-open path) so post-processing can unlock encrypted
+            // archives after the download.
+            if let Some(pw) = nzb.passwords().first() {
+                let _ = queue
+                    .set_job_archive_password(job_id, Some(pw.as_str()))
+                    .await;
+            }
+
             emit(BackendEvent::JobStateChanged {
                 job_id,
                 state: JobState::Queued,
@@ -873,7 +889,6 @@ impl Backend {
                                     Arc::clone(&cancel_token),
                                     Arc::clone(&selected_job),
                                     Arc::clone(&engine_paused),
-                                    Arc::clone(&pending_password),
                                     new_cancel,
                                 );
                             }
@@ -1028,7 +1043,6 @@ impl Backend {
             Arc::clone(&self.cancel_token),
             Arc::clone(&self.selected_job),
             Arc::clone(&self.engine_paused),
-            Arc::clone(&self.pending_password),
             cancel_token,
         );
     }
@@ -1258,24 +1272,55 @@ async fn build_job_details(
     _files: &[nobz_core::queue::QueueFile],
     job_id: i64,
 ) -> Vec<JobFileDetail> {
-    let stats = match queue.job_file_stats(job_id).await {
-        Ok(s) => s,
+    let files = match queue.list_files(job_id).await {
+        Ok(f) => f,
         Err(e) => {
-            warn!(error = %e, "job_file_stats failed");
+            warn!(error = %e, "list_files failed");
             return Vec::new();
         }
     };
-    let details: Vec<JobFileDetail> = stats
-        .into_iter()
-        .map(|s| JobFileDetail {
-            filename: s.filename,
-            segment_count: s.segment_count,
-            segments_done: s.segments_done,
-            segments_missing: s.segments_missing,
-            total_bytes: s.total_bytes,
-            downloaded_bytes: s.downloaded_bytes,
-        })
-        .collect();
+
+    let mut details = Vec::with_capacity(files.len());
+    for file in &files {
+        let segments = match queue.list_segments(file.id).await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, "list_segments failed");
+                Vec::new()
+            }
+        };
+        let done = segments
+            .iter()
+            .filter(|s| s.state != nobz_core::queue::SegmentState::Pending)
+            .count() as u32;
+        let missing = segments
+            .iter()
+            .filter(|s| s.state == nobz_core::queue::SegmentState::Missing || s.missing)
+            .count() as u32;
+        let total_bytes = segments.iter().map(|s| s.bytes).sum();
+        let down = segments
+            .iter()
+            .filter(|s| s.state == nobz_core::queue::SegmentState::Done)
+            .map(|s| s.bytes)
+            .sum();
+        details.push(JobFileDetail {
+            id: file.id,
+            filename: file.filename.clone(),
+            segment_count: file.segment_count,
+            segments_done: done,
+            segments_missing: missing,
+            total_bytes,
+            downloaded_bytes: down,
+            segments: segments
+                .into_iter()
+                .map(|s| JobSegmentDetail {
+                    number: s.number,
+                    bytes: s.bytes,
+                    state: s.state,
+                })
+                .collect(),
+        });
+    }
     tracing::trace!(job_id, files = details.len(), "built job details");
     details
 }
@@ -1331,7 +1376,6 @@ fn spawn_engine_task(
     cancel_token_slot: Arc<std::sync::Mutex<Option<CancellationToken>>>,
     selected_job: Arc<std::sync::Mutex<Option<i64>>>,
     engine_paused: Arc<std::sync::Mutex<bool>>,
-    pending_password: Arc<std::sync::Mutex<Option<String>>>,
     cancel_token: CancellationToken,
 ) {
     tracing::info!(job_id, "spawning engine task");
@@ -1485,10 +1529,9 @@ fn spawn_engine_task(
                                 completed_dir,
                                 category: None,
                                 cleanup_archives: pp_defaults.cleanup_archives,
-                                archive_password: pending_password
-                                    .lock()
-                                    .expect("pending_password lock")
-                                    .take(),
+                                // Password stored on the job itself when it
+                                // was added (NZB meta or user-supplied).
+                                archive_password: job.archive_password.clone(),
                                 skip_verify: pp_defaults.skip_verify,
                             };
                             emit(BackendEvent::PostProcessStarted { job_id });
@@ -1504,21 +1547,70 @@ fn spawn_engine_task(
                             .await;
                             match pp_result {
                                 Ok(Ok(report)) => {
+                                    // Persist a human-readable failure so the
+                                    // job shows as "Failed" with a reason
+                                    // (unpack errors, damaged files, ...).
+                                    let err = match &report.status {
+                                        PostProcessStatus::Complete
+                                        | PostProcessStatus::UnpackedWithoutVerify
+                                        | PostProcessStatus::NoArchives => None,
+                                        PostProcessStatus::Damaged {
+                                            healthy,
+                                            damaged,
+                                            missing,
+                                        } => Some(format!(
+                                            "PAR2 verify: {healthy} ok, {damaged} damaged, {missing} missing — repair needed"
+                                        )),
+                                        PostProcessStatus::UnpackFailed(msg) => {
+                                            Some(format!("Unpack failed: {msg}"))
+                                        }
+                                    };
+                                    if err.is_some() {
+                                        let _ = queue.set_job_state(job_id, JobState::Failed).await;
+                                    }
+                                    let _ = queue.set_job_error(job_id, err.as_deref()).await;
+                                    emit(BackendEvent::JobStateChanged {
+                                        job_id,
+                                        state: if err.is_some() {
+                                            JobState::Failed
+                                        } else {
+                                            JobState::Complete
+                                        },
+                                    });
                                     emit(BackendEvent::PostProcessDone {
                                         job_id: Some(job_id),
                                         report,
                                     });
                                 }
                                 Ok(Err(e)) => {
+                                    let msg = e.to_string();
+                                    let _ = queue.set_job_state(job_id, JobState::Failed).await;
+                                    let _ = queue
+                                        .set_job_error(
+                                            job_id,
+                                            Some(&format!("Post-process: {msg}")),
+                                        )
+                                        .await;
+                                    emit(BackendEvent::JobStateChanged {
+                                        job_id,
+                                        state: JobState::Failed,
+                                    });
                                     emit(BackendEvent::PostProcessFailed {
                                         job_id: Some(job_id),
-                                        error: e.to_string(),
+                                        error: msg,
                                     });
                                 }
                                 Err(e) => {
+                                    let msg = format!("post-process task panicked: {e}");
+                                    let _ = queue.set_job_state(job_id, JobState::Failed).await;
+                                    let _ = queue.set_job_error(job_id, Some(&msg)).await;
+                                    emit(BackendEvent::JobStateChanged {
+                                        job_id,
+                                        state: JobState::Failed,
+                                    });
                                     emit(BackendEvent::PostProcessFailed {
                                         job_id: Some(job_id),
-                                        error: format!("post-process task panicked: {e}"),
+                                        error: msg,
                                     });
                                 }
                             }
@@ -1529,7 +1621,9 @@ fn spawn_engine_task(
             Err(e) => {
                 // Engine errored — release the slot to Failed.
                 let _ = queue.release_download_slot(job_id, JobState::Failed).await;
-                emit(BackendEvent::Error(format!("Engine error: {e}")));
+                let msg = format!("Engine error: {e}");
+                let _ = queue.set_job_error(job_id, Some(&msg)).await;
+                emit(BackendEvent::Error(msg));
             }
         }
 
@@ -1598,7 +1692,6 @@ fn spawn_engine_task(
                                     cancel_token_slot.clone(),
                                     selected_job.clone(),
                                     engine_paused.clone(),
-                                    pending_password.clone(),
                                     new_cancel,
                                 );
                             }

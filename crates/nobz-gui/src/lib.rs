@@ -59,6 +59,9 @@ pub struct NobzApp {
     queue: QueueState,
     settings: SettingsState,
     icons: Option<Icons>,
+    /// Recent app-level errors for the dismissible banner (most recent
+    /// first). Errors that are job-scoped are also persisted to the job.
+    errors: std::collections::VecDeque<String>,
 }
 
 impl NobzApp {
@@ -96,6 +99,7 @@ impl NobzApp {
             queue: QueueState::default(),
             settings: SettingsState::default(),
             icons: Some(icons),
+            errors: std::collections::VecDeque::new(),
         }
     }
 
@@ -121,9 +125,11 @@ impl NobzApp {
             match ev {
                 BackendEvent::Error(msg) => {
                     tracing::warn!("{msg}");
+                    self.push_error(msg.clone());
                 }
                 BackendEvent::PostProcessFailed { job_id, error } => {
                     tracing::warn!("Post-process failed (job {job_id:?}): {error}");
+                    self.push_error(format!("Job post-process failed: {error}"));
                 }
                 BackendEvent::JobsList(jobs) => {
                     // On first job list: switch to Search if queue is empty.
@@ -137,6 +143,20 @@ impl NobzApp {
                 _ => {}
             }
         }
+    }
+
+    /// Record an app-level error for the dismissible banner. Dedupes
+    /// consecutive identical messages; keeps only the most recent few.
+    fn push_error(&mut self, msg: String) {
+        let trimmed = msg.trim().to_string();
+        if trimmed.is_empty() {
+            return;
+        }
+        if self.errors.front().map(String::as_str) == Some(trimmed.as_str()) {
+            return;
+        }
+        self.errors.push_front(trimmed);
+        self.errors.truncate(5);
     }
 
     /// Render the status bar at the bottom.
@@ -247,6 +267,35 @@ impl eframe::App for NobzApp {
                     }
                 });
             });
+
+        // --- Error banner (red, dismissible; shows the latest error) ---
+        if let Some(err) = self.errors.front() {
+            let err = err.clone();
+            egui::TopBottomPanel::top("error_banner")
+                .resizable(false)
+                .show_separator_line(false)
+                .frame(
+                    egui::Frame::none()
+                        .fill(egui::Color32::from_rgb(170, 34, 34))
+                        .inner_margin(egui::Margin::symmetric(8.0, 4.0)),
+                )
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.colored_label(egui::Color32::WHITE, format!("⚠ {err}"));
+                        if ui
+                            .add(
+                                egui::Button::new("✖")
+                                    .small()
+                                    .fill(egui::Color32::from_rgb(90, 20, 20)),
+                            )
+                            .on_hover_text("Dismiss")
+                            .clicked()
+                        {
+                            self.errors.pop_front();
+                        }
+                    });
+                });
+        }
 
         // --- Bottom: status bar ---
         egui::TopBottomPanel::bottom("status_bar")

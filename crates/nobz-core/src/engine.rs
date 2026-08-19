@@ -187,6 +187,40 @@ impl Engine {
         });
     }
 
+    /// Try one connection per server. Returns an error string if EVERY
+    /// server failed with a deterministic DNS-style error (bad hostname),
+    /// so the job can fail fast instead of retrying each segment.
+    async fn precheck_server_dns(&self) -> Option<String> {
+        let mut last_err: Option<String> = None;
+        let mut any_ok = false;
+        for s in &self.servers {
+            match NntpClient::connect(s).await {
+                Ok(c) => {
+                    drop(c);
+                    any_ok = true;
+                    break;
+                }
+                Err(e) => last_err = Some(e.to_string()),
+            }
+        }
+        if any_ok {
+            return None;
+        }
+        let err = last_err?;
+        let low = err.to_lowercase();
+        if low.contains("lookup")
+            || low.contains("name or service not known")
+            || low.contains("resolve")
+            || low.contains("dns")
+        {
+            Some(err)
+        } else {
+            // Not a deterministic DNS failure (e.g. refused/timeout) —
+            // let the normal retry logic handle it.
+            None
+        }
+    }
+
     /// Run a job to completion, reading pending segments from the queue and
     /// writing per-segment state back. Emits progress events on `tx`.
     ///
@@ -205,6 +239,39 @@ impl Engine {
         queue
             .set_job_state(job_id, crate::queue::JobState::Downloading)
             .await?;
+        // Clear stale error from a previous (failed) attempt — it's being
+        // redownloaded now.
+        queue.set_job_error(job_id, None).await?;
+
+        // Fail fast if every configured server is unreachable for a
+        // *deterministic* reason (DNS resolution failure — e.g. a typo in
+        // the server hostname). Transient errors (refused/timeout) are
+        // left to the per-segment retry logic. Only probe when no
+        // connections are already established (a warm pool proves DNS OK).
+        {
+            let pool_opt = self.pool();
+            let need_probe = pool_opt.map(|p| p.active_count() == 0).unwrap_or(true);
+            if need_probe {
+                if let Some(err) = self.precheck_server_dns().await {
+                    let msg =
+                        format!("Cannot reach NNTP server — check the hostname in Settings: {err}");
+                    queue
+                        .set_job_state(job_id, crate::queue::JobState::Failed)
+                        .await?;
+                    queue.set_job_error(job_id, Some(&msg)).await?;
+                    let _ = tx.send(ProgressEvent::ArticleError {
+                        filename: String::new(),
+                        segment: 0,
+                        error: msg,
+                    });
+                    let _ = tx.send(ProgressEvent::JobFinished {
+                        completed: 0,
+                        failed: 0,
+                    });
+                    return Ok(());
+                }
+            }
+        }
 
         let t0 = std::time::Instant::now();
 
@@ -312,6 +379,11 @@ impl Engine {
         });
 
         // Spawn worker tasks.
+        // Per-segment attempt counter (keyed by segment DB id) so that a
+        // permanently unreachable server fails the job instead of retrying
+        // every segment forever.
+        let seg_attempts: Arc<Mutex<std::collections::HashMap<i64, u32>>> =
+            Arc::new(Mutex::new(std::collections::HashMap::new()));
         let mut workers: JoinSet<Result<()>> = JoinSet::new();
         for worker_id in 0..self.max_connections {
             let engine = Arc::clone(&self);
@@ -320,6 +392,7 @@ impl Engine {
             let work_queue = Arc::clone(&work_queue);
             let files = Arc::clone(&files);
             let stats = Arc::clone(&stats);
+            let seg_attempts = Arc::clone(&seg_attempts);
             let tx = tx.clone();
             let state_tx = state_tx.clone();
             let output_dir = job.output_dir.clone();
@@ -332,6 +405,7 @@ impl Engine {
                         &work_queue,
                         &files,
                         &stats,
+                        &seg_attempts,
                         &output_dir,
                         &tx,
                         &state_tx,
@@ -396,12 +470,20 @@ impl Engine {
         *failed.lock().await = failed_count;
 
         // Determine final job state.
-        let final_state = if failed_count == 0 {
-            crate::queue::JobState::Complete
+        let (final_state, error_msg) = if failed_count == 0 {
+            (crate::queue::JobState::Complete, None)
         } else {
-            crate::queue::JobState::Failed
+            (
+                crate::queue::JobState::Failed,
+                Some(format!(
+                    "{failed_count} of {file_count_total} files with missing/corrupt segments",
+                    file_count_total = pending.len()
+                )),
+            )
         };
         queue.set_job_state(job_id, final_state).await?;
+        // Persist the human-readable reason (or clear a stale one).
+        queue.set_job_error(job_id, error_msg.as_deref()).await?;
 
         let _ = tx.send(ProgressEvent::JobFinished {
             completed: completed_count,
@@ -458,6 +540,7 @@ impl Engine {
         work_queue: &Arc<Mutex<VecDeque<(usize, QueueSegment)>>>,
         files: &Arc<Vec<QueueFile>>,
         stats: &Arc<PerfStats>,
+        seg_attempts: &Arc<Mutex<std::collections::HashMap<i64, u32>>>,
         output_dir: &Path,
         tx: &mpsc::UnboundedSender<ProgressEvent>,
         state_tx: &mpsc::UnboundedSender<(i64, u32, SegmentState)>,
@@ -485,6 +568,34 @@ impl Engine {
             };
             let file = &files[file_idx];
 
+            // Bounded retry: count attempts per segment; a server that is
+            // permanently unreachable must eventually fail the job rather
+            // than retrying forever (which burns CPU and floods logs).
+            let attempts = {
+                let mut map = seg_attempts.lock().await;
+                let e = map.entry(seg.id).or_insert(0);
+                *e += 1;
+                *e
+            };
+            if attempts > MAX_SEGMENT_ATTEMPTS {
+                let _ = state_tx.send((file.id, seg.number, SegmentState::Failed));
+                stats.articles.fetch_add(1, Ordering::Relaxed);
+                let _ = tx.send(ProgressEvent::SegmentDone {
+                    filename: file.filename.clone(),
+                    segment: seg.number,
+                    status: SegmentState::Failed,
+                    bytes: 0,
+                });
+                let _ = tx.send(ProgressEvent::ArticleError {
+                    filename: file.filename.clone(),
+                    segment: seg.number,
+                    error: format!(
+                        "fetch failed after {MAX_SEGMENT_ATTEMPTS} attempts (server unreachable?)"
+                    ),
+                });
+                continue;
+            }
+
             // Ensure the parts directory exists for this file.
             let parts_dir = match parts_dirs.get(&file.filename) {
                 Some(p) => p.clone(),
@@ -507,7 +618,10 @@ impl Engine {
             let outcome = match outcome {
                 ArticleOutcome::Retry => {
                     // Connection problem — put the segment back for another
-                    // worker (never mark it failed on a transient issue).
+                    // worker (never mark it failed on a transient issue),
+                    // with a short backoff so a dead server doesn't cause
+                    // a hot retry loop.
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                     let mut wq = work_queue.lock().await;
                     wq.push_front((file_idx, seg));
                     continue;
@@ -551,7 +665,12 @@ impl Engine {
                             SegmentState::Failed
                         }
                     };
-                    (state, body.len() as u64)
+                    // Report the *declared* size of the segment (from the
+                    // NZB), not the raw yEnc body length. The body's on-wire
+                    // size includes transport overhead (headers, CRLFs,
+                    // dot-stuffing), which made live progress overshoot the
+                    // job's total before snapping back at completion.
+                    (state, seg.bytes)
                 }
                 ArticleOutcome::Missing => (SegmentState::Missing, 0),
                 ArticleOutcome::Retry => unreachable!(),
@@ -724,6 +843,10 @@ impl ConnectionPool {
         }
     }
 }
+
+/// How many times a segment is retried before being marked failed. Bounds
+/// the retry loop when a server is permanently unreachable.
+const MAX_SEGMENT_ATTEMPTS: u32 = 4;
 
 /// Outcome of fetching a single article.
 enum ArticleOutcome {

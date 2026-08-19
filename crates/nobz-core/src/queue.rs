@@ -112,6 +112,11 @@ pub struct QueueJob {
     pub total_bytes: u64,
     /// Bytes downloaded so far (sum of done segment sizes).
     pub downloaded_bytes: u64,
+    /// Human-readable error for failed jobs (download or post-process).
+    /// `None` when the job succeeded.
+    pub error: Option<String>,
+    /// Archive password for this job's encrypted archives (if any).
+    pub archive_password: Option<String>,
 }
 
 /// A persisted file belonging to a job.
@@ -242,6 +247,15 @@ impl QueueManager {
         self.migrate_add_column("jobs", "total_bytes", "INTEGER NOT NULL DEFAULT 0")
             .await?;
         self.migrate_add_column("jobs", "downloaded_bytes", "INTEGER NOT NULL DEFAULT 0")
+            .await?;
+        // Human-readable error for failed jobs (download or post-process).
+        // NULL when the job succeeded.
+        self.migrate_add_column("jobs", "error", "TEXT").await?;
+        // Archive password for this job (from the NZB's
+        // `<meta type="password">` or a user-supplied one). Stored per job
+        // so queued jobs keep their own password through auto-start and
+        // post-processing.
+        self.migrate_add_column("jobs", "archive_password", "TEXT")
             .await?;
 
         debug!("queue schema initialized");
@@ -501,7 +515,8 @@ impl QueueManager {
     pub async fn list_jobs(&self) -> Result<Vec<QueueJob>> {
         let rows = sqlx::query(
             r#"SELECT id, name, output_dir, state, priority, file_count, files_done,
-                      total_segments, segments_done, total_bytes, downloaded_bytes
+                      total_segments, segments_done, total_bytes, downloaded_bytes,
+                      error, archive_password
                FROM jobs ORDER BY priority ASC, id ASC"#,
         )
         .fetch_all(&self.pool)
@@ -522,6 +537,8 @@ impl QueueManager {
                 segments_done: r.get::<i64, _>("segments_done") as u32,
                 total_bytes: r.get::<i64, _>("total_bytes") as u64,
                 downloaded_bytes: r.get::<i64, _>("downloaded_bytes") as u64,
+                error: r.get::<Option<String>, _>("error"),
+                archive_password: r.get::<Option<String>, _>("archive_password"),
             })
             .collect();
         Ok(jobs)
@@ -531,7 +548,8 @@ impl QueueManager {
     pub async fn get_job(&self, job_id: i64) -> Result<QueueJob> {
         let row = sqlx::query(
             r#"SELECT id, name, output_dir, state, priority, file_count, files_done,
-                      total_segments, segments_done, total_bytes, downloaded_bytes
+                      total_segments, segments_done, total_bytes, downloaded_bytes,
+                      error, archive_password
                FROM jobs WHERE id = ?1"#,
         )
         .bind(job_id)
@@ -551,6 +569,8 @@ impl QueueManager {
             segments_done: row.get::<i64, _>("segments_done") as u32,
             total_bytes: row.get::<i64, _>("total_bytes") as u64,
             downloaded_bytes: row.get::<i64, _>("downloaded_bytes") as u64,
+            error: row.get::<Option<String>, _>("error"),
+            archive_password: row.get::<Option<String>, _>("archive_password"),
         })
     }
 
@@ -562,6 +582,35 @@ impl QueueManager {
             .execute(&self.pool)
             .await
             .map_err(|e| CoreError::Other(anyhow::anyhow!("set job state: {e}")))?;
+        Ok(())
+    }
+
+    /// Set (or clear) a job's human-readable error message. Cleared jobs
+    /// have no error (i.e. succeeded).
+    pub async fn set_job_error(&self, job_id: i64, error: Option<&str>) -> Result<()> {
+        sqlx::query(r#"UPDATE jobs SET error = ?1 WHERE id = ?2"#)
+            .bind(error)
+            .bind(job_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| CoreError::Other(anyhow::anyhow!("set job error: {e}")))?;
+        Ok(())
+    }
+
+    /// Set (or clear) the archive password for a job. Stored per job so
+    /// queued downloads keep their own password through auto-start and
+    /// post-processing.
+    pub async fn set_job_archive_password(
+        &self,
+        job_id: i64,
+        password: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query(r#"UPDATE jobs SET archive_password = ?1 WHERE id = ?2"#)
+            .bind(password)
+            .bind(job_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| CoreError::Other(anyhow::anyhow!("set job password: {e}")))?;
         Ok(())
     }
 
@@ -938,7 +987,8 @@ impl QueueManager {
     pub async fn next_queued_job(&self) -> Result<Option<QueueJob>> {
         let row = sqlx::query(
             r#"SELECT id, name, output_dir, state, priority, file_count, files_done,
-                      total_segments, segments_done, total_bytes, downloaded_bytes
+                      total_segments, segments_done, total_bytes, downloaded_bytes,
+                      error, archive_password
                FROM jobs WHERE state = 'queued'
                ORDER BY priority ASC, id ASC LIMIT 1"#,
         )
@@ -958,6 +1008,8 @@ impl QueueManager {
             segments_done: r.get::<i64, _>("segments_done") as u32,
             total_bytes: r.get::<i64, _>("total_bytes") as u64,
             downloaded_bytes: r.get::<i64, _>("downloaded_bytes") as u64,
+            error: r.get::<Option<String>, _>("error"),
+            archive_password: r.get::<Option<String>, _>("archive_password"),
         }))
     }
 
