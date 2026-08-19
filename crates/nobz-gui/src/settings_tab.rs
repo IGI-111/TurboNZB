@@ -66,7 +66,7 @@ pub fn ui(
 ) -> bool {
     let mut changed = false;
 
-    egui::ScrollArea::vertical().show(ui, |ui| {
+    crate::win95_scroll::vertical(ui, "settings_scroll", |ui| {
         egui::Frame::none()
             .inner_margin(egui::Margin {
                 left: 8.0,

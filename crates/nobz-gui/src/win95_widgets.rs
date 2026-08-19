@@ -303,7 +303,7 @@ impl Win95IconButton {
 
 impl Widget for Win95IconButton {
     fn ui(self, ui: &mut Ui) -> Response {
-        let size = Vec2::new(self.icon_size.x + 10.0, self.icon_size.y + 8.0);
+        let size = Vec2::new(self.icon_size.x + 10.0, self.icon_size.y + 4.0);
         let (rect, mut response) = ui.allocate_exact_size(size, Sense::click());
         if !self.enabled {
             response = response.on_hover_cursor(egui::CursorIcon::NotAllowed);

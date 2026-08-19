@@ -11,12 +11,12 @@
 //! high-granularity segment dot grid.
 
 use egui::Color32;
-use egui_extras::{Column, TableBuilder};
 use nobz_core::PostProcessReport;
 use nobz_core::queue::{JobState, QueueJob};
 
 use crate::backend::{BackendCmd, BackendEvent, BackendHandle, JobFileDetail};
 use crate::theme::Icons;
+use crate::win95_scroll::Win95Table;
 use crate::win95_widgets::{
     Win95Button, Win95IconButton, Win95ProgressBar, Win95TabButton, paint_sunken_bevel,
 };
@@ -257,151 +257,146 @@ fn job_list_pane(
 ) {
     let state_w = 80.0;
     let progress_w = 220.0;
-    let actions_w = 90.0; // 3 icon buttons: up, down, delete
-    let name_width = (ui.available_width() - state_w - progress_w - actions_w).max(100.0);
+    let actions_w = 90.0;
 
-    let avail_h = ui.available_height();
-    let table = TableBuilder::new(ui)
+    Win95Table::new()
         .striped(true)
-        .resizable(true)
-        .auto_shrink(false)
-        .vscroll(true)
-        .min_scrolled_height(avail_h)
-        .column(Column::exact(name_width).clip(true)) // Name (stretches)
-        .column(Column::exact(state_w)) // State
-        .column(Column::exact(progress_w)) // Progress
-        .column(Column::exact(actions_w)); // Actions
-
-    table
-        .header(20.0, |mut header| {
-            for label in ["Name", "State", "Progress", "Actions"] {
-                header.col(|ui| {
-                    ui.strong(label);
-                });
-            }
-        })
-        .body(|mut body| {
-            let jobs = state.jobs.clone();
-            let selected = state.selected_job;
-            let current_job_id = state.current_job_id;
-            let job_count = jobs.len();
-            for (row_idx, job) in jobs.iter().enumerate() {
-                let is_selected = selected == Some(job.id);
-                let row_height = 28.0;
-                body.row(row_height, |mut row| {
-                    row.col(|ui| {
-                        if ui.selectable_label(is_selected, &job.name).clicked() {
-                            state.select_job(job.id, backend);
-                        }
+        .id_salt("job_list")
+        .min_scrolled_height(ui.available_height())
+        .column_remainder()
+        .column(state_w)
+        .column(progress_w)
+        .column(actions_w)
+        .header_body(
+            ui,
+            20.0,
+            |row, ui| {
+                for label in ["Name", "State", "Progress", "Actions"] {
+                    row.col(ui, |ui| {
+                        ui.strong(label);
                     });
-                    row.col(|ui| {
-                        if state.pp_in_progress.contains(&job.id) {
-                            ui.colored_label(Color32::from_rgb(80, 180, 80), "Verifying...");
-                        } else {
-                            let (color, text) = state_color(&job.state);
-                            ui.colored_label(color, text);
-                        }
-                    });
-                    row.col(|ui| {
-                        // Use live downloaded bytes for the active job,
-                        // fall back to DB-stored values for others.
-                        let downloaded = if current_job_id == Some(job.id) {
-                            state.current_downloaded
-                        } else {
-                            job.downloaded_bytes
-                        };
-
-                        let (pct, bar_text) = if job.total_bytes > 0 && downloaded > 0 {
-                            let p = (downloaded as f64 / job.total_bytes as f64).min(1.0);
-                            (
-                                p as f32,
-                                format!(
-                                    "{} / {} ({}%)",
-                                    format_size(downloaded),
-                                    format_size(job.total_bytes),
-                                    (p * 100.0) as u32
-                                ),
-                            )
-                        } else if job.total_segments > 0 {
-                            let p = job.segments_done as f32 / job.total_segments as f32;
-                            (
-                                p,
-                                format!(
-                                    "{} / {} seg  ({} / {} files)",
-                                    job.segments_done,
-                                    job.total_segments,
-                                    job.files_done,
-                                    job.file_count
-                                ),
-                            )
-                        } else {
-                            (0.0, "—".into())
-                        };
-                        ui.add(Win95ProgressBar::new(pct).text(bar_text));
-                    });
-                    row.col(|ui| {
-                        ui.horizontal(|ui| {
-                            if let Some(icons) = icons {
-                                // Up button — disabled for first row.
-                                if ui
-                                    .add(
-                                        Win95IconButton::new(icons.tb_up.clone())
-                                            .enabled(row_idx > 0)
-                                            .tooltip("Move up"),
-                                    )
-                                    .clicked()
-                                {
-                                    backend.send(BackendCmd::MoveJobUp { job_id: job.id });
-                                }
-                                // Down button — disabled for last row.
-                                if ui
-                                    .add(
-                                        Win95IconButton::new(icons.tb_download.clone())
-                                            .enabled(row_idx < job_count - 1)
-                                            .tooltip("Move down"),
-                                    )
-                                    .clicked()
-                                {
-                                    backend.send(BackendCmd::MoveJobDown { job_id: job.id });
-                                }
-                                // Delete button.
-                                if ui
-                                    .add(
-                                        Win95IconButton::new(icons.tb_delete.clone())
-                                            .tooltip("Delete"),
-                                    )
-                                    .clicked()
-                                {
-                                    backend.send(BackendCmd::DeleteJob { job_id: job.id });
-                                    if selected == Some(job.id) {
-                                        state.clear_selection(backend);
-                                    }
-                                }
-                            } else {
-                                if ui
-                                    .add_enabled(row_idx > 0, Win95Button::new("Up"))
-                                    .clicked()
-                                {
-                                    backend.send(BackendCmd::MoveJobUp { job_id: job.id });
-                                }
-                                if ui
-                                    .add_enabled(row_idx < job_count - 1, Win95Button::new("Down"))
-                                    .clicked()
-                                {
-                                    backend.send(BackendCmd::MoveJobDown { job_id: job.id });
-                                }
-                                if ui.add(Win95Button::new("Delete")).clicked() {
-                                    backend.send(BackendCmd::DeleteJob { job_id: job.id });
-                                    if selected == Some(job.id) {
-                                        state.clear_selection(backend);
-                                    }
-                                }
+                }
+            },
+            |body| {
+                let jobs = state.jobs.clone();
+                let selected = state.selected_job;
+                let current_job_id = state.current_job_id;
+                let job_count = jobs.len();
+                for (row_idx, job) in jobs.iter().enumerate() {
+                    let is_selected = selected == Some(job.id);
+                    let row_height = 28.0;
+                    body.row(row_height, |row, ui| {
+                        row.col(ui, |ui| {
+                            if ui.selectable_label(is_selected, &job.name).clicked() {
+                                state.select_job(job.id, backend);
                             }
                         });
+                        row.col(ui, |ui| {
+                            if state.pp_in_progress.contains(&job.id) {
+                                ui.colored_label(Color32::from_rgb(80, 180, 80), "Verifying...");
+                            } else {
+                                let (color, text) = state_color(&job.state);
+                                ui.colored_label(color, text);
+                            }
+                        });
+                        row.col(ui, |ui| {
+                            let downloaded = if current_job_id == Some(job.id) {
+                                state.current_downloaded
+                            } else {
+                                job.downloaded_bytes
+                            };
+                            let (pct, bar_text) = if job.total_bytes > 0 && downloaded > 0 {
+                                let p = (downloaded as f64 / job.total_bytes as f64).min(1.0);
+                                (
+                                    p as f32,
+                                    format!(
+                                        "{} / {} ({}%)",
+                                        format_size(downloaded),
+                                        format_size(job.total_bytes),
+                                        (p * 100.0) as u32
+                                    ),
+                                )
+                            } else if job.total_segments > 0 {
+                                let p = job.segments_done as f32 / job.total_segments as f32;
+                                (
+                                    p,
+                                    format!(
+                                        "{} / {} seg  ({} / {} files)",
+                                        job.segments_done,
+                                        job.total_segments,
+                                        job.files_done,
+                                        job.file_count
+                                    ),
+                                )
+                            } else {
+                                (0.0, "—".into())
+                            };
+                            ui.add(Win95ProgressBar::new(pct).text(bar_text));
+                        });
+                        row.col(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                if let Some(icons) = icons {
+                                    if ui
+                                        .add(
+                                            Win95IconButton::new(icons.tb_up.clone())
+                                                .enabled(row_idx > 0)
+                                                .tooltip("Move up"),
+                                        )
+                                        .clicked()
+                                    {
+                                        backend.send(BackendCmd::MoveJobUp { job_id: job.id });
+                                    }
+                                    if ui
+                                        .add(
+                                            Win95IconButton::new(icons.tb_download.clone())
+                                                .enabled(row_idx < job_count - 1)
+                                                .tooltip("Move down"),
+                                        )
+                                        .clicked()
+                                    {
+                                        backend.send(BackendCmd::MoveJobDown { job_id: job.id });
+                                    }
+                                    if ui
+                                        .add(
+                                            Win95IconButton::new(icons.tb_delete.clone())
+                                                .tooltip("Delete"),
+                                        )
+                                        .clicked()
+                                    {
+                                        backend.send(BackendCmd::DeleteJob { job_id: job.id });
+                                        if selected == Some(job.id) {
+                                            state.clear_selection(backend);
+                                        }
+                                    }
+                                } else {
+                                    if ui
+                                        .add_enabled(row_idx > 0, Win95Button::new("Up"))
+                                        .clicked()
+                                    {
+                                        backend.send(BackendCmd::MoveJobUp { job_id: job.id });
+                                    }
+                                    if ui
+                                        .add_enabled(
+                                            row_idx < job_count - 1,
+                                            Win95Button::new("Down"),
+                                        )
+                                        .clicked()
+                                    {
+                                        backend.send(BackendCmd::MoveJobDown { job_id: job.id });
+                                    }
+                                    if ui.add(Win95Button::new("Delete")).clicked() {
+                                        backend.send(BackendCmd::DeleteJob { job_id: job.id });
+                                        if selected == Some(job.id) {
+                                            state.clear_selection(backend);
+                                        }
+                                    }
+                                }
+                            });
+                        });
                     });
-                });
-            }
-        });
+                }
+            },
+        );
 }
 
 /// Middle pane: speed graph for the currently-downloading job.
@@ -668,50 +663,48 @@ fn files_pane(ui: &mut egui::Ui, state: &QueueState) {
     let segs_w = 80.0;
     let size_w = 140.0;
     let grid_w = 170.0;
-    let file_width = (ui.available_width() - segs_w - size_w - grid_w).max(100.0);
 
-    let avail_h = ui.available_height();
-    let table = TableBuilder::new(ui)
+    Win95Table::new()
         .striped(true)
-        .resizable(true)
-        .auto_shrink(false)
-        .vscroll(true)
-        .min_scrolled_height(avail_h)
-        .column(Column::exact(file_width).clip(true))
-        .column(Column::exact(segs_w))
-        .column(Column::exact(size_w))
-        .column(Column::exact(grid_w));
-
-    table
-        .header(20.0, |mut header| {
-            for label in ["File", "Segs", "Size", "Segments"] {
-                header.col(|ui| {
-                    ui.strong(label);
-                });
-            }
-        })
-        .body(|mut body| {
-            for file in &state.job_details {
-                body.row(24.0, |mut row| {
-                    row.col(|ui| {
-                        ui.label(&file.filename);
+        .id_salt("file_list")
+        .min_scrolled_height(ui.available_height())
+        .column_remainder()
+        .column(segs_w)
+        .column(size_w)
+        .column(grid_w)
+        .header_body(
+            ui,
+            20.0,
+            |row, ui| {
+                for label in ["File", "Segs", "Size", "Segments"] {
+                    row.col(ui, |ui| {
+                        ui.strong(label);
                     });
-                    row.col(|ui| {
-                        ui.label(format!("{} / {}", file.segments_done, file.segment_count));
+                }
+            },
+            |body| {
+                for file in &state.job_details {
+                    body.row(24.0, |row, ui| {
+                        row.col(ui, |ui| {
+                            ui.label(&file.filename);
+                        });
+                        row.col(ui, |ui| {
+                            ui.label(format!("{} / {}", file.segments_done, file.segment_count));
+                        });
+                        row.col(ui, |ui| {
+                            ui.label(format!(
+                                "{} / {}",
+                                format_size(file.downloaded_bytes),
+                                format_size(file.total_bytes)
+                            ));
+                        });
+                        row.col(ui, |ui| {
+                            file_segment_grid(ui, file);
+                        });
                     });
-                    row.col(|ui| {
-                        ui.label(format!(
-                            "{} / {}",
-                            format_size(file.downloaded_bytes),
-                            format_size(file.total_bytes)
-                        ));
-                    });
-                    row.col(|ui| {
-                        file_segment_grid(ui, file);
-                    });
-                });
-            }
-        });
+                }
+            },
+        );
 }
 
 /// High-granularity per-file segment dot grid.

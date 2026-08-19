@@ -1,13 +1,13 @@
 //! Search tab: unified search bar, filters, results table, and
 //! "Send to queue" action.
 
-use egui_extras::{Column, TableBuilder};
 use nobz_index::AggregatedResult;
 use nobz_index::types::SearchQuery;
 
 use crate::backend::{BackendCmd, BackendEvent, BackendHandle};
 use crate::settings::AppConfig;
 use crate::theme::Icons;
+use crate::win95_scroll::Win95Table;
 use crate::win95_widgets::Win95Button;
 
 /// State for the search tab.
@@ -196,142 +196,165 @@ pub fn ui(
 
             crate::win95_widgets::etched_separator(ui, true);
 
-            // Results table
-            let other_cols: f32 = 100.0 + 80.0 + 50.0 + 80.0 + 50.0 + 36.0;
-            let title_width = (ui.available_width() - other_cols).max(150.0);
-            let avail_h = ui.available_height();
-            let table = TableBuilder::new(ui)
-                .striped(true)
-                .resizable(true)
-                .auto_shrink(false)
-                .vscroll(true)
-                .min_scrolled_height(avail_h)
-                .column(Column::exact(title_width).clip(true))
-                .column(Column::exact(100.0).clip(true))
-                .column(Column::exact(80.0))
-                .column(Column::exact(50.0))
-                .column(Column::exact(80.0).clip(true))
-                .column(Column::exact(50.0))
-                .column(Column::exact(36.0));
-
-            table
-                .header(24.0, |mut header| {
-                    header.col(|ui| {
-                        sort_button(ui, &mut state.sort, SortColumn::Title, "Title");
-                    });
-                    header.col(|ui| {
-                        sort_button(ui, &mut state.sort, SortColumn::Sources, "Sources");
-                    });
-                    header.col(|ui| {
-                        sort_button(ui, &mut state.sort, SortColumn::Size, "Size");
-                    });
-                    header.col(|ui| {
-                        ui.strong("Parts");
-                    });
-                    header.col(|ui| {
-                        sort_button(ui, &mut state.sort, SortColumn::Category, "Cat");
-                    });
-                    header.col(|ui| {
-                        sort_button(ui, &mut state.sort, SortColumn::Age, "Age");
-                    });
-                    header.col(|ui| {
-                        ui.strong("");
-                    });
-                })
-                .body(|mut body| {
-                    let downloaded = state.downloaded.clone();
-                    for (i, result) in state.results.iter().enumerate() {
-                        let already_downloaded = downloaded.contains(&i);
-                        let row_height = 22.0;
-                        body.row(row_height, |mut row| {
-                            row.col(|ui| {
-                                ui.label(&result.result.title);
-                            });
-                            row.col(|ui| {
-                                ui.label(result.sources.join(", "));
-                            });
-                            row.col(|ui| {
-                                ui.label(format_size(result.result.size));
-                            });
-                            row.col(|ui| {
-                                if result.result.files > 0 {
-                                    ui.label(result.result.files.to_string());
-                                } else {
-                                    ui.label("?");
-                                }
-                            });
-                            row.col(|ui| {
-                                ui.label(&result.result.category_name);
-                            });
-                            row.col(|ui| {
-                                ui.label(format_age(result.result.post_date));
-                            });
-                            row.col(|ui| {
-                                if let Some(icons) = icons {
-                                    let (img, tooltip) = if already_downloaded {
-                                        (
-                                            egui::Image::from_texture(&icons.tab_tick)
-                                                .fit_to_exact_size(egui::vec2(16.0, 16.0)),
-                                            "Added to queue",
-                                        )
-                                    } else {
-                                        (
-                                            egui::Image::from_texture(&icons.tab_download)
-                                                .fit_to_exact_size(egui::vec2(16.0, 16.0)),
-                                            "Download",
-                                        )
-                                    };
-                                    let btn = egui::Button::image(img).small();
-                                    if ui
-                                        .add_enabled(!already_downloaded, btn)
-                                        .on_hover_text(tooltip)
-                                        .clicked()
-                                    {
-                                        let url = result.result.nzb_url.clone();
-                                        let title = result.result.title.clone();
-                                        let category = if state.category == "All" {
-                                            None
-                                        } else {
-                                            Some(state.category.clone())
-                                        };
-                                        let download_dir = config.download_dir.clone();
-                                        backend.send(BackendCmd::DownloadFromUrl {
-                                            url,
-                                            title,
-                                            download_dir,
-                                            category,
-                                        });
-                                        state.downloaded.insert(i);
-                                    }
-                                } else {
-                                    if ui
-                                        .add_enabled(
-                                            !already_downloaded,
-                                            Win95Button::new("Download"),
-                                        )
-                                        .clicked()
-                                    {
-                                        let url = result.result.nzb_url.clone();
-                                        let title = result.result.title.clone();
-                                        let category = if state.category == "All" {
-                                            None
-                                        } else {
-                                            Some(state.category.clone())
-                                        };
-                                        let download_dir = config.download_dir.clone();
-                                        backend.send(BackendCmd::DownloadFromUrl {
-                                            url,
-                                            title,
-                                            download_dir,
-                                            category,
-                                        });
-                                        state.downloaded.insert(i);
-                                    }
-                                }
-                            });
-                        });
-                    }
+            // Extract sort state into a local so the header closure can
+            // modify it without borrowing state mutably.
+            let mut sort = state.sort;
+            // Pre-sort results for the body closure.
+            let mut results = state.results.clone();
+            {
+                let asc = sort.asc;
+                results.sort_by(|a, b| {
+                    let ord = match sort.col {
+                        SortColumn::Title => a.result.title.cmp(&b.result.title),
+                        SortColumn::Sources => a.sources.len().cmp(&b.sources.len()),
+                        SortColumn::Size => a.result.size.cmp(&b.result.size),
+                        SortColumn::Age => a.result.post_date.cmp(&b.result.post_date),
+                        SortColumn::Category => a.result.category.cmp(&b.result.category),
+                    };
+                    if asc { ord } else { ord.reverse() }
                 });
+            }
+
+            // Results table
+            Win95Table::new()
+                .striped(true)
+                .id_salt("search_results")
+                .min_scrolled_height(ui.available_height())
+                .column_remainder()
+                .column(100.0)
+                .column(80.0)
+                .column(50.0)
+                .column(80.0)
+                .column(50.0)
+                .column(36.0)
+                .header_body(
+                    ui,
+                    24.0,
+                    |row, ui| {
+                        row.col(ui, |ui| {
+                            sort_button(ui, &mut sort, SortColumn::Title, "Title");
+                        });
+                        row.col(ui, |ui| {
+                            sort_button(ui, &mut sort, SortColumn::Sources, "Sources");
+                        });
+                        row.col(ui, |ui| {
+                            sort_button(ui, &mut sort, SortColumn::Size, "Size");
+                        });
+                        row.col(ui, |ui| {
+                            ui.strong("Parts");
+                        });
+                        row.col(ui, |ui| {
+                            sort_button(ui, &mut sort, SortColumn::Category, "Cat");
+                        });
+                        row.col(ui, |ui| {
+                            sort_button(ui, &mut sort, SortColumn::Age, "Age");
+                        });
+                        row.col(ui, |ui| {
+                            ui.strong("");
+                        });
+                    },
+                    |body| {
+                        let downloaded = state.downloaded.clone();
+                        for (i, result) in results.iter().enumerate() {
+                            let already_downloaded = downloaded.contains(&i);
+                            let row_height = 22.0;
+                            body.row(row_height, |row, ui| {
+                                row.col(ui, |ui| {
+                                    ui.label(&result.result.title);
+                                });
+                                row.col(ui, |ui| {
+                                    ui.label(result.sources.join(", "));
+                                });
+                                row.col(ui, |ui| {
+                                    ui.label(format_size(result.result.size));
+                                });
+                                row.col(ui, |ui| {
+                                    if result.result.files > 0 {
+                                        ui.label(result.result.files.to_string());
+                                    } else {
+                                        ui.label("?");
+                                    }
+                                });
+                                row.col(ui, |ui| {
+                                    ui.label(&result.result.category_name);
+                                });
+                                row.col(ui, |ui| {
+                                    ui.label(format_age(result.result.post_date));
+                                });
+                                row.col(ui, |ui| {
+                                    if let Some(icons) = icons {
+                                        if already_downloaded {
+                                            ui.add(
+                                                crate::win95_widgets::Win95IconButton::new(
+                                                    icons.tb_tick.clone(),
+                                                )
+                                                .enabled(false)
+                                                .tooltip("Added to queue"),
+                                            );
+                                        } else {
+                                            if ui
+                                                .add(
+                                                    crate::win95_widgets::Win95IconButton::new(
+                                                        icons.tb_download.clone(),
+                                                    )
+                                                    .tooltip("Download"),
+                                                )
+                                                .clicked()
+                                            {
+                                                let url = result.result.nzb_url.clone();
+                                                let title = result.result.title.clone();
+                                                let category = if state.category == "All" {
+                                                    None
+                                                } else {
+                                                    Some(state.category.clone())
+                                                };
+                                                let download_dir = config.download_dir.clone();
+                                                backend.send(BackendCmd::DownloadFromUrl {
+                                                    url,
+                                                    title,
+                                                    download_dir,
+                                                    category,
+                                                });
+                                                state.downloaded.insert(i);
+                                            }
+                                        }
+                                    } else {
+                                        if ui
+                                            .add_enabled(
+                                                !already_downloaded,
+                                                Win95Button::new("Download"),
+                                            )
+                                            .clicked()
+                                        {
+                                            let url = result.result.nzb_url.clone();
+                                            let title = result.result.title.clone();
+                                            let category = if state.category == "All" {
+                                                None
+                                            } else {
+                                                Some(state.category.clone())
+                                            };
+                                            let download_dir = config.download_dir.clone();
+                                            backend.send(BackendCmd::DownloadFromUrl {
+                                                url,
+                                                title,
+                                                download_dir,
+                                                category,
+                                            });
+                                            state.downloaded.insert(i);
+                                        }
+                                    }
+                                });
+                            });
+                        }
+                    },
+                );
+
+            // Write back sort state and re-sort state.results so the next
+            // frame reflects the new ordering.
+            if state.sort != sort {
+                state.sort = sort;
+                state.sort_results();
+            }
         });
 }
 

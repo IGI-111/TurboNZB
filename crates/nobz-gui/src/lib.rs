@@ -12,6 +12,7 @@ pub mod search_tab;
 pub mod settings;
 pub mod settings_tab;
 pub mod theme;
+pub mod win95_scroll;
 pub mod win95_widgets;
 pub mod wizard;
 
@@ -21,7 +22,7 @@ use std::sync::Arc;
 
 use eframe::egui;
 
-use crate::backend::{Backend, BackendCmd, BackendEvent, BackendHandle};
+use crate::backend::{Backend, BackendEvent, BackendHandle};
 use crate::queue_tab::QueueState;
 use crate::search_tab::SearchState;
 use crate::settings::AppConfig;
@@ -57,8 +58,6 @@ pub struct NobzApp {
     queue: QueueState,
     settings: SettingsState,
     icons: Option<Icons>,
-    /// Show the About dialog.
-    show_about: bool,
 }
 
 impl NobzApp {
@@ -96,7 +95,6 @@ impl NobzApp {
             queue: QueueState::default(),
             settings: SettingsState::default(),
             icons: Some(icons),
-            show_about: false,
         }
     }
 
@@ -138,59 +136,6 @@ impl NobzApp {
                 _ => {}
             }
         }
-    }
-
-    /// Render the menu bar (File / Queue / Settings / Help).
-    fn menu_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.horizontal(|ui| {
-            ui.add_space(4.0);
-            // File menu
-            ui.menu_button("File", |ui| {
-                if ui.button("Open NZB...").clicked() {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("NZB files", &["nzb"])
-                        .pick_file()
-                    {
-                        self.backend.send(BackendCmd::OpenNzbFile { path });
-                    }
-                }
-                ui.separator();
-                if ui.button("Exit").clicked() {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
-            });
-
-            // Queue menu
-            ui.menu_button("Queue", |ui| {
-                if self.queue.engine_paused {
-                    if ui.button("Resume downloads").clicked() {
-                        self.backend.send(BackendCmd::ResumeEngine);
-                    }
-                } else {
-                    if ui.button("Pause downloads").clicked() {
-                        self.backend.send(BackendCmd::PauseEngine);
-                    }
-                }
-                ui.separator();
-                if ui.button("Clear completed").clicked() {
-                    self.backend.send(BackendCmd::ClearCompleted);
-                }
-            });
-
-            // Settings menu
-            ui.menu_button("Settings", |ui| {
-                if ui.button("Go to Settings...").clicked() {
-                    self.tab = Tab::Settings;
-                }
-            });
-
-            // Help menu
-            ui.menu_button("Help", |ui| {
-                if ui.button("About Nobz").clicked() {
-                    self.show_about = true;
-                }
-            });
-        });
     }
 
     /// Render the status bar at the bottom.
@@ -249,16 +194,6 @@ impl eframe::App for NobzApp {
                 return;
             }
         }
-
-        // --- Menu bar ---
-        egui::TopBottomPanel::top("menu_bar")
-            .exact_height(22.0)
-            .resizable(false)
-            .show_separator_line(false)
-            .frame(egui::Frame::none().fill(crate::theme::colors::BUTTON_FACE))
-            .show(ctx, |ui| {
-                self.menu_bar(ui, ctx);
-            });
 
         // --- Tab bar ---
         egui::TopBottomPanel::top("tabs")
@@ -338,50 +273,6 @@ impl eframe::App for NobzApp {
                     }
                 }
             });
-
-        // --- About dialog ---
-        if self.show_about {
-            show_about_dialog(ctx, &mut self.show_about, self.icons.as_ref());
-        }
-    }
-}
-
-/// Show the About dialog as a Win95-style modal window.
-fn show_about_dialog(ctx: &egui::Context, open: &mut bool, icons: Option<&Icons>) {
-    let mut close = false;
-    egui::Window::new("About Nobz")
-        .open(open)
-        .resizable(false)
-        .collapsible(false)
-        .min_width(360.0)
-        .min_height(200.0)
-        .show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                if let Some(icons) = icons {
-                    ui.add(
-                        egui::Image::from_texture(&icons.tab_info)
-                            .fit_to_exact_size(egui::vec2(32.0, 32.0)),
-                    );
-                }
-                ui.vertical(|ui| {
-                    ui.heading("Nobz");
-                    ui.label("Usenet search & downloader");
-                    ui.label("Win95-themed desktop client");
-                    ui.add_space(8.0);
-                    ui.label("Built with Rust + egui");
-                    ui.label("Icons from Chicago95 (MIT/GPL) + React95 (MIT)");
-                });
-            });
-            ui.add_space(12.0);
-            ui.horizontal(|ui| {
-                ui.add_space(240.0);
-                if ui.button("OK").clicked() {
-                    close = true;
-                }
-            });
-        });
-    if close {
-        *open = false;
     }
 }
 
