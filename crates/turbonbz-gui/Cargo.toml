@@ -1,0 +1,33 @@
+[package]
+name = "turbonbz-gui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "TurboNBZ desktop GUI (eframe/egui single binary)"
+
+[[bin]]
+name = "turbonbz"
+path = "src/main.rs"
+
+[dependencies]
+turbonbz-core = { path = "../turbonbz-core" }
+turbonbz-index = { path = "../turbonbz-index" }
+tokio = { workspace = true }
+egui = { workspace = true }
+eframe = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+directories = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+url = { workspace = true }
+sqlx = { workspace = true }
+futures = { workspace = true }
+image = { version = "0.25", default-features = false, features = ["png"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+rfd = "0.15"

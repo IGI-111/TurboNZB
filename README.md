@@ -1,14 +1,12 @@
-<img src="logo.png" alt="Nobz logo" width="80">
-
-# Nobz
+# TurboNBZ
 
 A Usenet client that would have been right at home in 1995.
 
-Nobz is a native desktop Usenet downloader. Unified search across your Newznab
-indexers on one side, a serious multi-connection download engine on the other,
-all rendered in an interface that time-traveled forward from the mid-nineties.
-Written in Rust, aiming for SABnzbd-parity download behavior, and built
-NixOS-first.
+TurboNBZ is a native desktop Usenet downloader. Unified search across your
+Newznab indexers on one side, a serious multi-connection download engine on the
+other, all rendered in an interface that time-traveled forward from the
+mid-nineties. Written in Rust, aiming for SABnzbd-parity download behavior,
+and built NixOS-first.
 
 ## Screenshots
 
@@ -53,7 +51,7 @@ nix run
 With Cargo (Rust 1.85+):
 
 ```sh
-cargo run -p nobz-gui
+cargo run -p turbonbz-gui
 ```
 
 The first-run wizard will walk you through adding an NNTP server and at least
@@ -66,8 +64,8 @@ standard user directories, via the `directories` crate:
 
 | What | Linux | Windows | macOS |
 |------|-------|---------|-------|
-| Settings | `~/.config/nobz/config.json` | `%APPDATA%\nobz\config.json` | `~/Library/Application Support/nobz/config.json` |
-| Queue (SQLite) | `~/.local/share/nobz` | `%APPDATA%\nobz` | `~/Library/Application Support/nobz` |
+| Settings | `~/.config/turbonbz/config.json` | `%APPDATA%\turbonbz\config.json` | `~/Library/Application Support/turbonbz/config.json` |
+| Queue (SQLite) | `~/.local/share/turbonbz` | `%APPDATA%\turbonbz` | `~/Library/Application Support/turbonbz` |
 
 Downloads default to your OS download folder.
 

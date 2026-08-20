@@ -1,5 +1,5 @@
 {
-  description = "Nobz — a portable native desktop GUI for Usenet (Rust + egui)";
+  description = "TurboNBZ — a portable native desktop GUI for Usenet (Rust + egui)";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -93,27 +93,27 @@
         # crates don't bust the cargo-deps cache.
         cargoArtifacts = craneLib.buildDepsOnly commonArgs;
 
-        nobz-gui = craneLib.buildPackage (
+        turbonbz-gui = craneLib.buildPackage (
           commonArgs
           // {
             inherit cargoArtifacts;
             # The single binary the app ships.
-            cargoExtraArgs = "--bin nobz";
+            cargoExtraArgs = "--bin turbonbz";
             # Desktop entry + icon at runtime via a wrapProgram so `nix run`
             # behaves like a normal app on Linux.
             postInstall = pkgs.lib.optionalString pkgs.stdenv.isLinux ''
-              wrapProgram $out/bin/nobz \
+              wrapProgram $out/bin/turbonbz \
                 --prefix XDG_DATA_DIRS : "${pkgs.fontconfig}/share" \
                 --prefix LD_LIBRARY_PATH : "${pkgs.lib.makeLibraryPath commonArgs.buildInputs}"
             '';
             meta = with pkgs.lib; {
               description = "Portable native desktop GUI for Usenet";
-              homepage = "https://github.com/IGI-111/nobz";
+              homepage = "https://github.com/IGI-111/turboNBZ";
               license = with licenses; [
                 mit
                 asl20
               ];
-              mainProgram = "nobz";
+              mainProgram = "turbonbz";
               platforms = platforms.linux ++ platforms.darwin;
             };
           }
@@ -121,13 +121,13 @@
       in
       {
         packages = {
-          default = nobz-gui;
-          nobz = nobz-gui;
+          default = turbonbz-gui;
+          turbonbz = turbonbz-gui;
         };
 
         apps.default = flake-utils.lib.mkApp {
-          drv = nobz-gui;
-          name = "nobz";
+          drv = turbonbz-gui;
+          name = "turbonbz";
         };
 
         # `nix develop` shell: same native deps + toolchain + a few extras
