@@ -105,7 +105,31 @@ pub async fn post_process(config: PostProcessConfig) -> Result<PostProcessReport
         }
     }
 
-    // Step 3: Find archive files and unpack.
+    // Step 3: Restore real file names recorded in the PAR2 set.
+    //
+    // Obfuscated posts rename files after download (deobfuscation); the PAR2
+    // recovery set still knows the true names. Restoring them here gives
+    // correct, human-readable names AND proper archive volume names before
+    // unpacking. Only runs when verification passed (no early Damaged
+    // return above).
+    if let Some(ref vr) = verify_report {
+        rename_to_par2_names(download_dir, vr)?;
+    }
+
+    // Step 3b: Normalize deobfuscated RAR volumes.
+    //
+    // When no PAR2 provided real names, obfuscated RAR files were named
+    // `release.NNN.rar` — not a convention unrar can follow. Rename a
+    // multi-volume set to `{release}.rar` + `{release}.r00` … so the whole
+    // set can be unpacked.
+    let stem = download_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("release");
+    unpack::normalize_rar_volumes(download_dir, stem)
+        .map_err(|e| CoreError::Other(anyhow::anyhow!("rar normalize: {e}")))?;
+
+    // Step 4: Find archive files and unpack.
     let archives = find_archives(download_dir);
     let unpack_report = if archives.is_empty() {
         debug!("no archives found — files are already in final form");
@@ -142,7 +166,7 @@ pub async fn post_process(config: PostProcessConfig) -> Result<PostProcessReport
         last_report
     };
 
-    // Step 4: Move files to category folder.
+    // Step 5: Move files to category folder.
     let final_dir = if let Some(ref cat) = config.category {
         config.completed_dir.join(cat)
     } else {
@@ -158,8 +182,9 @@ pub async fn post_process(config: PostProcessConfig) -> Result<PostProcessReport
 
     move_files(&source_dir, &final_dir)?;
 
-    // Step 5: Cleanup.
-    if config.cleanup_archives && !archives.is_empty() {
+    // Step 5: Cleanup. Removes archive files, .parts dirs, and par2 files —
+    // never the already-final files (e.g. videos) themselves.
+    if config.cleanup_archives {
         cleanup_temp_files(download_dir)?;
     }
 
@@ -214,66 +239,197 @@ fn is_split_7z_first(name: &str) -> bool {
 }
 
 /// Check if a filename is an archive file we should process or skip
-/// (rar, 7z, split 7z parts, par2).
+/// (rar, rar volumes, 7z, split 7z parts, par2).
 fn is_archive_or_par2(name: &str) -> bool {
     let name = name.to_lowercase();
     name.ends_with(".rar")
         || name.ends_with(".7z")
         || is_split_archive_part(&name)
+        || rar_volume_base(&name).is_some()
         || name.ends_with(".par2")
 }
 
 /// Find all archive files (.rar, .7z, .7z.001) in a directory.
+///
+/// Multi-volume RAR sets are collapsed to their first volume, which the
+/// unrar library then follows by conventional volume naming:
+///   - `foo.part01.rar` … `foo.partNN.rar` → only `foo.part01.rar`
+///   - `foo.rar` + `foo.r00` … → only `foo.rar`
+///
+/// Truly independent archives (different base names, no volume parts) are
+/// all returned so each one gets unpacked. RAR volume parts (`.rNN`) are
+/// never returned themselves — they're followed from the first volume.
 /// For split 7z, only the first part (.7z.001) is returned.
 fn find_archives(dir: &Path) -> Vec<PathBuf> {
-    let mut archives = Vec::new();
+    let mut sevenz: Vec<PathBuf> = Vec::new();
+    // `.partNN.rar` volumes: (base, part number, path)
+    let mut part_volumes: Vec<(String, u32, PathBuf)> = Vec::new();
+    // plain `.rar` files: (base, path)
+    let mut rar_mains: Vec<(String, PathBuf)> = Vec::new();
+    // `.rNN` parts: (base, path)
+    let mut rnn_parts: Vec<(String, PathBuf)> = Vec::new();
+
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_file() {
-                let name = path.to_string_lossy().to_lowercase();
+            if !path.is_file() {
+                continue;
+            }
+            let name = path.to_string_lossy().to_lowercase();
 
-                // Skip .par2 files
-                if name.ends_with(".par2") {
-                    continue;
-                }
+            // Skip .par2 files
+            if name.ends_with(".par2") {
+                continue;
+            }
 
-                // Split 7z: only keep .7z.001, skip other parts
-                if is_split_7z_first(&name) {
-                    archives.push(path);
-                    continue;
-                }
-                if is_split_archive_part(&name) {
-                    continue;
-                }
+            // Split 7z: only keep .7z.001, skip other parts
+            if is_split_7z_first(&name) {
+                sevenz.push(path);
+                continue;
+            }
+            if is_split_archive_part(&name) {
+                continue;
+            }
+            if name.ends_with(".7z") {
+                sevenz.push(path);
+                continue;
+            }
 
-                if name.ends_with(".rar") || name.ends_with(".7z") {
-                    archives.push(path);
-                }
+            // `.partNN.rar` multi-volume naming.
+            if let Some((base, num)) = parse_part_rar(&name) {
+                part_volumes.push((base, num, path));
+                continue;
+            }
+            // `.rNN` continuation volumes.
+            if let Some(base) = rar_volume_base(&name) {
+                rnn_parts.push((base, path));
+                continue;
+            }
+            if name.ends_with(".rar") {
+                let base = name.strip_suffix(".rar").unwrap_or(&name).to_string();
+                rar_mains.push((base, path));
             }
         }
     }
-    // Sort to process .rar before .r00 etc (multi-part).
-    archives.sort();
-    // Only keep the first .rar (the main volume); the unrar library handles
-    // multi-part automatically.
-    if let Some(first_rar) = archives.iter().position(|a| {
-        a.extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.eq_ignore_ascii_case("rar"))
-            == Some(true)
-    }) {
-        // Keep only the main .rar file, drop other .rar parts.
-        let main = archives[first_rar].clone();
-        archives.retain(|a| {
-            a.extension()
-                .and_then(|e| e.to_str())
-                .map(|e| e.eq_ignore_ascii_case("7z"))
-                == Some(true)
-                || a == &main
-        });
+
+    let mut archives = sevenz;
+
+    // `.partNN.rar`: keep only the first part (lowest number) per base.
+    let mut part_firsts: std::collections::HashMap<String, (u32, PathBuf)> =
+        std::collections::HashMap::new();
+    for (base, num, path) in part_volumes {
+        match part_firsts.get(&base) {
+            Some((best_num, _)) if *best_num <= num => {}
+            _ => {
+                part_firsts.insert(base, (num, path));
+            }
+        }
     }
+    for (_, path) in part_firsts.values() {
+        archives.push(path.clone());
+    }
+    // `.rar` files with `.rNN` siblings are the main volume of a set
+    // (returned so unrar can follow); `.rar` files without volume parts
+    // are independent archives (each returned).
+    let rnn_bases: std::collections::HashSet<String> =
+        rnn_parts.into_iter().map(|(base, _)| base).collect();
+    for (base, path) in rar_mains {
+        if rnn_bases.contains(&base) || !part_firsts.contains_key(&base) {
+            archives.push(path);
+        }
+    }
+
+    archives.sort();
     archives
+}
+
+/// If `name` (lowercase) is `basename.part###.rar`, return `(basename,
+/// part number)`.
+fn parse_part_rar(name: &str) -> Option<(String, u32)> {
+    let stem = name.strip_suffix(".rar")?;
+    let idx = stem.rfind(".part")?;
+    let base = &stem[..idx];
+    let numstr = &stem[idx + ".part".len()..];
+    if numstr.is_empty() || !numstr.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some((base.to_string(), numstr.parse().ok()?))
+}
+
+/// If `name` (lowercase) is a RAR volume part (`foo.r00`, `foo.r01`, …),
+/// return its base (`foo`).
+fn rar_volume_base(name: &str) -> Option<String> {
+    let name = name.to_lowercase();
+    let bytes = name.as_bytes();
+    let len = bytes.len();
+    if len >= 4
+        && bytes[len - 1].is_ascii_digit()
+        && bytes[len - 2].is_ascii_digit()
+        && bytes[len - 3] == b'r'
+        && bytes[len - 4] == b'.'
+    {
+        Some(String::from_utf8_lossy(&bytes[..len - 4]).into_owned())
+    } else {
+        None
+    }
+}
+
+/// Rename downloaded files to the names recorded in the PAR2 set, but only
+/// when they differ from the current on-disk name (deobfuscated posts were
+/// renamed after download — the PAR2 knows their true names). Handles
+/// collisions with a numeric suffix.
+fn rename_to_par2_names(dir: &Path, report: &VerifyReport) -> Result<()> {
+    for (src, real) in &report.matches {
+        let real = sanitize_par2_name(real);
+        if real.is_empty() {
+            continue;
+        }
+        let src_name = src
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+        if src_name == real {
+            continue;
+        }
+        let dest = unique_child(dir, &real);
+        if dest == *src {
+            continue;
+        }
+        if src.exists() {
+            std::fs::rename(src, &dest).map_err(CoreError::from)?;
+            debug!(from = %src.display(), to = %dest.display(), "renamed to PAR2 name");
+        }
+    }
+    Ok(())
+}
+
+/// Clean a name from a PAR2 File Description packet for use as a file name:
+/// take the basename (PAR2 names may contain subdirectory components) and
+/// replace anything that could act as a path separator.
+fn sanitize_par2_name(name: &str) -> String {
+    name.rsplit('/').next().unwrap_or(name)
+        .trim()
+        .chars()
+        .map(|c| if c == '/' || c == '\\' { '_' } else { c })
+        .collect()
+}
+
+/// A path to a not-yet-existing child of `dir`, appending a numeric suffix
+/// on collision.
+fn unique_child(dir: &Path, name: &str) -> PathBuf {
+    let candidate = dir.join(name);
+    if !candidate.exists() {
+        return candidate;
+    }
+    let mut n = 2;
+    loop {
+        let alt = dir.join(format!("{name}.{n}"));
+        if !alt.exists() {
+            return alt;
+        }
+        n += 1;
+    }
 }
 
 /// Move all files from `source_dir` to `dest_dir`.
@@ -327,18 +483,166 @@ fn cleanup_temp_files(dir: &Path) -> Result<()> {
         for entry in entries.flatten() {
             let path = entry.path();
             let name = path.to_string_lossy().to_lowercase();
+            let file_name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default()
+                .to_lowercase();
 
-            if name.ends_with(".parts") && path.is_dir() {
+            if file_name.ends_with(".parts") && path.is_dir() {
                 debug!(path = %path.display(), "removing parts dir");
                 let _ = std::fs::remove_dir_all(&path);
             } else if is_archive_or_par2(&name) {
                 debug!(path = %path.display(), "removing archive/par2");
                 let _ = std::fs::remove_file(&path);
-            } else if name == "unpacked" && path.is_dir() {
+            } else if file_name == "unpacked" && path.is_dir() {
                 debug!(path = %path.display(), "removing unpacked dir");
                 let _ = std::fs::remove_dir_all(&path);
             }
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn tempfile_dir() -> PathBuf {
+        let n = DIR_COUNTER.fetch_add(1, Ordering::SeqCst);
+        std::env::temp_dir().join(format!("nobz-pp-test-{}-{n}", std::process::id()))
+    }
+
+    #[test]
+    fn find_archives_collapses_part_rar_sets() {
+        // `.partNN.rar` multi-volume sets → only the first part is unpacked.
+        let dir = tempfile_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        for n in 1..=5 {
+            std::fs::write(
+                dir.join(format!("Show.1080p.part{n:02}.rar")),
+                b"x",
+            )
+            .unwrap();
+        }
+        let archives = find_archives(&dir);
+        assert_eq!(
+            archives,
+            vec![dir.join("Show.1080p.part01.rar")],
+            "only the first part of a .partNN set is unpacked"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn find_archives_keeps_independent_rars() {
+        let dir = tempfile_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Episode1.rar"), b"x").unwrap();
+        std::fs::write(dir.join("Episode2.rar"), b"x").unwrap();
+        std::fs::write(dir.join("notes.txt"), b"x").unwrap();
+        let archives = find_archives(&dir);
+        // Sorted, both independent archives kept, non-archive ignored.
+        assert_eq!(
+            archives,
+            vec![dir.join("Episode1.rar"), dir.join("Episode2.rar")]
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn find_archives_keeps_only_main_of_rn_set() {
+        let dir = tempfile_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Set.rar"), b"x").unwrap();
+        std::fs::write(dir.join("Set.r00"), b"x").unwrap();
+        std::fs::write(dir.join("Set.r01"), b"x").unwrap();
+        let archives = find_archives(&dir);
+        assert_eq!(archives, vec![dir.join("Set.rar")]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn find_archives_mixes_independent_and_part_set() {
+        let dir = tempfile_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Movie.part01.rar"), b"x").unwrap();
+        std::fs::write(dir.join("Movie.part02.rar"), b"x").unwrap();
+        std::fs::write(dir.join("sample.rar"), b"x").unwrap();
+        let archives = find_archives(&dir);
+        assert_eq!(
+            archives,
+            vec![dir.join("Movie.part01.rar"), dir.join("sample.rar")]
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn obfuscated_files_verified_and_renamed_to_par2_names() {
+        // Mirrors the real failure: files were deobfuscated (named after
+        // the release), so PAR2 verification by name finds nothing. It must
+        // match by content, then restore the real names from the PAR2 and
+        // move the files out.
+        let dir = tempfile_dir();
+        let completed = tempfile_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&completed).unwrap();
+
+        let contents = [
+            b"episode-one-content".to_vec(),
+            b"episode-two-content".to_vec(),
+        ];
+        let real_names = [
+            "Mr.Robot.S04E01.1080p.mkv",
+            "Mr.Robot.S04E02.1080p.mkv",
+        ];
+        for (i, data) in contents.iter().enumerate() {
+            std::fs::write(dir.join(format!("Mr.Robot.S04.1080p.{i:03}.mkv")), data).unwrap();
+        }
+        // PAR2 whose File Description packets carry the *real* names.
+        let par2 = crate::par2::build_par2_set(&[
+            (&contents[0], real_names[0]),
+            (&contents[1], real_names[1]),
+        ]);
+        std::fs::write(dir.join("Mr.Robot.S04.1080p.002.par2"), &par2).unwrap();
+
+        let cfg = PostProcessConfig {
+            download_dir: dir.clone(),
+            completed_dir: completed.clone(),
+            category: None,
+            cleanup_archives: true,
+            archive_password: None,
+            skip_verify: false,
+        };
+        let report = futures::executor::block_on(post_process(cfg)).unwrap();
+        assert_eq!(report.status, PostProcessStatus::Complete);
+        assert_eq!(report.verify.as_ref().map(|v| v.healthy), Some(2));
+        assert_eq!(report.verify.as_ref().map(|v| v.missing), Some(0));
+
+        // Files moved out with their real names.
+        for real in &real_names {
+            assert!(
+                completed.join(real).exists(),
+                "{real} should be in completed dir"
+            );
+            let moved = std::fs::read(completed.join(real)).unwrap();
+            assert!(
+                contents.iter().any(|c| c == &moved),
+                "content of {real} must match"
+            );
+        }
+        // No leftover mkv or par2 in the download dir.
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(leftovers.is_empty(), "leftovers: {leftovers:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&completed);
+    }
 }

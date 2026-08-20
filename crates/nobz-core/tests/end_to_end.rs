@@ -378,6 +378,74 @@ async fn obfuscated_file_assembled_under_yenc_name() {
     assert_eq!(files[0].filename, hex_name);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fully_obfuscated_file_named_after_release() {
+    // Fully obfuscated post: the hash appears in BOTH the subject and the
+    // yEnc header, so no readable name exists in the data. The assembled
+    // file must be named after the job's release name, with the extension
+    // sniffed from the content.
+    let payload = b"\x1a\x45\xdf\xa3-obfuscated-mkv-like-binary-content";
+    let hash = "da2e2d71d5376d20cacce12c936da33e";
+    let release = "Mr.Robot.S02.1080p.10bit.BluRay.AAC5.1.HEVC-Vyndros";
+
+    let body = yenc_article_body(payload, hash);
+    let addr = spawn_fake_nntp(vec![("x@y".into(), body)]).await;
+
+    let mut xml = String::from(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+  <head><meta type="title">"#,
+    );
+    xml.push_str(release);
+    xml.push_str(
+        r#"</meta></head>
+  <file poster="t@t" date="1" subject="&quot;"#,
+    );
+    xml.push_str(hash);
+    xml.push_str(
+        r#"&quot; (1/1)">
+    <groups><group>alt.binaries.test</group></groups>
+    <segments>
+      <segment bytes="100" number="1">x@y</segment>
+    </segments></file></nzb>"#,
+    );
+    let nzb = nzb::parse(xml.as_bytes()).unwrap();
+    let tmp = tempfile_dir();
+
+    let queue = Arc::new(QueueManager::open_in_memory().await.unwrap());
+    let job_id = queue.add_job(&nzb, &tmp, 0, Some(release)).await.unwrap();
+
+    let mut cfg = ServerConfig::localhost();
+    cfg.port = addr.port();
+    let engine = Arc::new(Engine::new(vec![cfg], 2));
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let q = Arc::clone(&queue);
+    let runner = tokio::spawn(async move { engine.run_job(q, job_id, tx).await.unwrap() });
+
+    runner.await.unwrap();
+    let events = collect_events(&mut rx).await;
+    assert!(events.iter().any(|e| matches!(
+        e,
+        ProgressEvent::FileCompleted {
+            missing: 0,
+            crc_mismatches: 0,
+            ..
+        }
+    )));
+
+    // Named after the release with the sniffed .mkv extension.
+    let expected = tmp.join(format!("{release}.mkv"));
+    let assembled = tokio::fs::read(&expected)
+        .await
+        .expect("release-named file with sniffed extension");
+    assert_eq!(assembled, payload);
+    assert!(
+        !tmp.join(hash).exists(),
+        "hash filename should not be created"
+    );
+}
+
 /// Create a unique temp directory for a test.
 fn tempfile_dir() -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};

@@ -440,7 +440,15 @@ impl Engine {
         let mut completed_count = 0usize;
         let mut failed_count = 0usize;
         for (file, _segments) in &pending {
-            let outcome = assemble_file(&queue, file, &job.output_dir, &tx).await;
+            let outcome = assemble_file(
+                &queue,
+                file,
+                &job.output_dir,
+                &job.name,
+                job.file_count,
+                &tx,
+            )
+            .await;
             match outcome {
                 Ok(o) => {
                     if o.missing == 0 && o.crc_mismatches == 0 {
@@ -958,13 +966,95 @@ fn sanitize_yenc_name(name: &str) -> String {
         .collect::<String>()
 }
 
+/// True if a file name gives no human-readable information: a bare (up to the
+/// first dot) all-hexadecimal token of at least 16 characters. Both the NZB
+/// subject and the yEnc header are obfuscated for such posts.
+fn is_obfuscated_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or(name).to_ascii_lowercase();
+    stem.len() >= 16 && stem.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Sniff a file extension from the first bytes of a file's content.
+fn sniff_ext(head: &[u8]) -> Option<&'static str> {
+    let ext = if head.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]) {
+        "mkv"
+    } else if head.len() >= 12 && &head[4..8] == b"ftyp" {
+        "mp4"
+    } else if head.len() >= 12 && &head[0..4] == b"RIFF" && &head[8..12] == b"AVI " {
+        "avi"
+    } else if head.starts_with(b"OggS") {
+        "ogv"
+    } else if head.starts_with(b"Rar!\x1a\x07") {
+        "rar"
+    } else if head.starts_with(&[0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c]) {
+        "7z"
+    } else if head.starts_with(b"PK\x03\x04") {
+        "zip"
+    } else if head.starts_with(b"PAR2") {
+        "par2"
+    } else {
+        return None;
+    };
+    Some(ext)
+}
+
+/// Build a recognizable name for an obfuscated file from the job (release)
+/// name, with a content-sniffed extension. Multi-file jobs get a numeric
+/// suffix so each file stays distinguishable.
+fn obfuscated_final_name(
+    job_name: &str,
+    file_index: u32,
+    file_count: u32,
+    ext: Option<&str>,
+) -> String {
+    let stem = sanitize_yenc_name(job_name);
+    let stem = if stem.is_empty() {
+        format!("file{:03}", file_index + 1)
+    } else {
+        stem
+    };
+    let mut name = if file_count > 1 {
+        format!("{stem}.{file_index:03}")
+    } else {
+        stem.clone()
+    };
+    if let Some(ext) = ext {
+        name.push('.');
+        name.push_str(ext);
+    }
+    name
+}
+
+/// Avoid clobbering an existing file from a previous run.
+async fn unique_path(dir: &Path, name: &str) -> PathBuf {
+    let candidate = dir.join(name);
+    if tokio::fs::try_exists(&candidate).await.unwrap_or(false) {
+        let mut n = 2;
+        loop {
+            let alt = dir.join(format!("{name}.{n}"));
+            if !tokio::fs::try_exists(&alt).await.unwrap_or(false) {
+                return alt;
+            }
+            n += 1;
+        }
+    }
+    candidate
+}
+
 /// Assemble a file from per-segment part files. Reads all segments from
 /// the DB, concatenates the done parts in order, and writes the final
 /// file. Also calls `refresh_job_counts` to update aggregate counters.
+///
+/// Files whose name is obfuscated (bare hash in both subject and yEnc
+/// header) are renamed to the job's release name, with the extension
+/// sniffed from the assembled content and a numeric suffix for multi-file
+/// jobs — the article data itself carries no readable name.
 async fn assemble_file(
     queue: &Arc<QueueManager>,
     file: &QueueFile,
     output_dir: &Path,
+    job_name: &str,
+    file_count: u32,
     _tx: &mpsc::UnboundedSender<ProgressEvent>,
 ) -> Result<FileOutcome> {
     // Reload the file so a real name latched during the download (from the
@@ -977,18 +1067,27 @@ async fn assemble_file(
         tracing::warn!(error = %e, "failed to refresh job counts");
     }
 
-    let filename = file
+    let base_name = file
         .yenc_name
         .clone()
         .unwrap_or_else(|| file.filename.clone());
-    let final_path = output_dir.join(&filename);
-    let parts_dir = output_dir.join(format!("{}.parts", file.filename));
+    let obfuscated = is_obfuscated_name(&base_name);
 
+    // Obfuscated files are assembled to a temp name first so the content
+    // can be sniffed for the real extension, then renamed. Everything else
+    // is written straight to its final path (as before).
+    let write_path: PathBuf = if obfuscated {
+        output_dir.join(format!(".assemble-{:06}", file.id))
+    } else {
+        output_dir.join(&base_name)
+    };
+
+    let parts_dir = output_dir.join(format!("{}.parts", file.filename));
     let all_segments = queue.list_segments(file.id).await?;
-    let mut out = tokio::fs::File::create(&final_path)
+    let mut out = tokio::fs::File::create(&write_path)
         .await
         .map_err(CoreError::from)?;
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut missing = 0u32;
     let mut crc_mismatches = 0u32;
 
@@ -1029,6 +1128,25 @@ async fn assemble_file(
     }
     out.flush().await.map_err(CoreError::from)?;
     drop(out);
+
+    let final_path = if obfuscated {
+        // Sniff the content to recover a meaningful extension.
+        let mut fh = tokio::fs::File::open(&write_path)
+            .await
+            .map_err(CoreError::from)?;
+        let mut head = [0u8; 16];
+        let n = fh.read(&mut head).await.map_err(CoreError::from)?;
+        drop(fh);
+        let ext = sniff_ext(&head[..n]);
+        let name = obfuscated_final_name(job_name, file.file_index, file_count, ext);
+        let final_path = unique_path(output_dir, &name).await;
+        tokio::fs::rename(&write_path, &final_path)
+            .await
+            .map_err(CoreError::from)?;
+        final_path
+    } else {
+        write_path
+    };
 
     // Clean up parts dir if the file is complete (no holes).
     if missing == 0 && crc_mismatches == 0 {

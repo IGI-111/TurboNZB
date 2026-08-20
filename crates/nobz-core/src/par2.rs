@@ -21,7 +21,7 @@
 //! missing or unrecognizable.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use md5::{Digest, Md5};
 use tracing::debug;
@@ -105,6 +105,21 @@ pub struct VerifyReport {
     pub recovery_slices: u32,
     /// Whether the set could be repaired (damaged <= recovery_slices).
     pub repairable: bool,
+    /// Matches between on-disk files and recovery-set files, keyed by the
+    /// name recorded in the PAR2 (which may differ from the on-disk name
+    /// when files were deobfuscated/renamed after download).
+    pub matches: Vec<(PathBuf, String)>,
+}
+
+/// A file on disk that could satisfy a recovery-set entry. Hashes are
+/// computed lazily (only when a description's length matches) and cached so
+/// each file is read at most once.
+struct Candidate {
+    path: PathBuf,
+    len: u64,
+    full_md5: Option<[u8; 16]>,
+    md5_16k: Option<[u8; 16]>,
+    used: bool,
 }
 
 /// Parse one or more PAR2 files from disk. All files should belong to the
@@ -270,13 +285,19 @@ fn parse_ifsc_packet(body: &[u8], par2: &mut Par2File) {
 
 /// Verify downloaded files against a parsed PAR2 set.
 ///
-/// For each file description, checks the file at `dir/filename` (or
-/// `dir/basename` if the filename has subdirectory components).
+/// Files are matched **by content** (length + MD5), not by filename: the
+/// on-disk name may differ from the name recorded in the PAR2 (deobfuscated
+/// posts rename files after download), so name-based lookup would report
+/// every file missing. This mirrors how PAR2 clients actually verify — they
+/// match on hashes and tolerate renamed files.
 pub fn verify(par2: &Par2File, dir: &Path) -> VerifyReport {
+    let mut candidates = gather_candidates(dir);
+
     let mut files = Vec::new();
     let mut healthy = 0u32;
     let mut damaged = 0u32;
     let mut missing = 0u32;
+    let mut matches = Vec::new();
 
     for file_id in &par2.recovery_file_ids {
         let desc = match par2.file_descriptions.get(file_id) {
@@ -284,10 +305,10 @@ pub fn verify(par2: &Par2File, dir: &Path) -> VerifyReport {
             None => continue,
         };
 
-        let filename = desc.filename.rsplit('/').next().unwrap_or(&desc.filename);
-        let path = dir.join(filename);
-        let status = verify_file(desc, &path);
-
+        let (status, matched_path) = match_file(&mut candidates, desc);
+        if let Some(path) = matched_path {
+            matches.push((path, desc.filename.clone()));
+        }
         match status {
             VerifyStatus::Ok => healthy += 1,
             VerifyStatus::Damaged => damaged += 1,
@@ -316,37 +337,83 @@ pub fn verify(par2: &Par2File, dir: &Path) -> VerifyReport {
         missing,
         recovery_slices: par2.recovery_count,
         repairable,
+        matches,
     }
 }
 
-/// Verify a single file against its description.
-fn verify_file(desc: &FileDescription, path: &Path) -> VerifyStatus {
-    let data = match std::fs::read(path) {
-        Ok(d) => d,
-        Err(_) => return VerifyStatus::Missing,
-    };
-
-    // Check length first — quick rejection.
-    if data.len() as u64 != desc.length {
-        // Length mismatch — check if the first 16 kB at least matches.
-        if data.len() >= 16 * 1024 && md5_16k(&data) == desc.md5_16k {
-            return VerifyStatus::Damaged;
+/// Gather top-level files in `dir`, excluding `.par2` files themselves.
+fn gather_candidates(dir: &Path) -> Vec<Candidate> {
+    let mut candidates = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let is_par2 = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("par2"))
+                .unwrap_or(false);
+            if is_par2 {
+                continue;
+            }
+            let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            candidates.push(Candidate {
+                path,
+                len,
+                full_md5: None,
+                md5_16k: None,
+                used: false,
+            });
         }
-        return VerifyStatus::Unrecognized;
+    }
+    candidates
+}
+
+/// Try to match `desc` against the currently unused candidates. On a match
+/// the matching candidate is marked used and its on-disk path returned (so
+/// the caller can map it back to the real, PAR2-recorded name).
+fn match_file(
+    candidates: &mut [Candidate],
+    desc: &FileDescription,
+) -> (VerifyStatus, Option<PathBuf>) {
+    for cand in candidates.iter_mut() {
+        if cand.used {
+            continue;
+        }
+        // Quick length check before reading anything.
+        if cand.len != desc.length {
+            continue;
+        }
+        // Read (once) and hash this candidate.
+        if cand.full_md5.is_none() {
+            if let Ok(data) = std::fs::read(&cand.path) {
+                cand.full_md5 = Some(md5_full(&data));
+                cand.md5_16k = if data.len() >= 16 * 1024 {
+                    Some(md5_16k(&data))
+                } else {
+                    None
+                };
+            }
+        }
+        let Some(full) = cand.full_md5 else {
+            continue;
+        };
+
+        if full == desc.md5_full {
+            cand.used = true;
+            return (VerifyStatus::Ok, Some(cand.path.clone()));
+        }
+        // Damaged: same length and leading data, but full MD5 differs.
+        if cand.md5_16k == Some(desc.md5_16k) {
+            cand.used = true;
+            return (VerifyStatus::Damaged, Some(cand.path.clone()));
+        }
+        // Length matches but content is unrelated — keep looking.
     }
 
-    // Check full MD5.
-    let full_md5 = md5_full(&data);
-    if full_md5 == desc.md5_full {
-        return VerifyStatus::Ok;
-    }
-
-    // Full MD5 doesn't match — check 16 kB.
-    if data.len() >= 16 * 1024 && md5_16k(&data) == desc.md5_16k {
-        VerifyStatus::Damaged
-    } else {
-        VerifyStatus::Unrecognized
-    }
+    (VerifyStatus::Missing, None)
 }
 
 /// Compute MD5 of the first 16 kB of a file.
@@ -364,6 +431,112 @@ fn md5_full(data: &[u8]) -> [u8; 16] {
     hasher.finalize().into()
 }
 
+/// Write a single PAR2 packet with correct MD5 and padding.
+fn write_packet(out: &mut Vec<u8>, set_id: [u8; 16], pkt_type: [u8; 16], body: &[u8]) {
+    let total_len = 64 + body.len();
+    // Pad body to 4-byte alignment.
+    let padded_len = (total_len + 3) & !3;
+    let padding = padded_len - total_len;
+
+    // MD5 of (set_id + type + body + padding)
+    let mut md5_hasher = Md5::new();
+    md5_hasher.update(set_id);
+    md5_hasher.update(pkt_type);
+    md5_hasher.update(body);
+    for _ in 0..padding {
+        md5_hasher.update([0]);
+    }
+    let packet_md5: [u8; 16] = md5_hasher.finalize().into();
+
+    out.extend_from_slice(&PAR2_MAGIC);
+    out.extend_from_slice(&(padded_len as u64).to_le_bytes());
+    out.extend_from_slice(&packet_md5);
+    out.extend_from_slice(&set_id);
+    out.extend_from_slice(&pkt_type);
+    out.extend_from_slice(body);
+    for _ in 0..padding {
+        out.push(0);
+    }
+}
+
+/// Build a minimal single-set PAR2 in memory, describing `files`
+/// (`(content, filename)` pairs). Primarily for tests; the resulting
+/// archive is parsed by [`parse_par2_bytes`] and verified by [`verify`].
+pub fn build_par2_set(files: &[(&[u8], &str)]) -> Vec<u8> {
+    struct Entry {
+        file_id: [u8; 16],
+        md5_16k: [u8; 16],
+        md5_full: [u8; 16],
+        len: usize,
+        name: String,
+    }
+
+    // Compute file IDs = MD5 of (md5_16k + length + filename).
+    let details: Vec<Entry> = files
+        .iter()
+        .map(|(data, name)| {
+            let md5_16k_val = md5_16k(data);
+            let file_id: [u8; 16] = {
+                let mut h = Md5::new();
+                h.update(md5_16k_val);
+                h.update((data.len() as u64).to_le_bytes());
+                h.update(name.as_bytes());
+                h.finalize().into()
+            };
+            Entry {
+                file_id,
+                md5_16k: md5_16k_val,
+                md5_full: md5_full(data),
+                len: data.len(),
+                name: name.to_string(),
+            }
+        })
+        .collect();
+
+    // Build the main packet body.
+    let slice_size: u64 = 16 * 1024; // 16 kB slices
+    let recovery_count: u32 = 1;
+    let mut main_body = Vec::new();
+    main_body.extend_from_slice(&slice_size.to_le_bytes());
+    main_body.extend_from_slice(&recovery_count.to_le_bytes());
+    for entry in &details {
+        main_body.extend_from_slice(&entry.file_id);
+    }
+
+    // Main packet set ID = MD5 of main body.
+    let set_id: [u8; 16] = {
+        let mut h = Md5::new();
+        h.update(&main_body);
+        h.finalize().into()
+    };
+
+    let mut out = Vec::new();
+
+    // Main packet.
+    write_packet(&mut out, set_id, TYPE_MAIN, &main_body);
+
+    // File Description packets.
+    for entry in &details {
+        let mut file_desc_body = Vec::new();
+        file_desc_body.extend_from_slice(&entry.file_id);
+        file_desc_body.extend_from_slice(&entry.md5_full);
+        file_desc_body.extend_from_slice(&entry.md5_16k);
+        file_desc_body.extend_from_slice(&(entry.len as u64).to_le_bytes());
+        file_desc_body.extend_from_slice(entry.name.as_bytes());
+        // Pad to 4-byte alignment.
+        while file_desc_body.len() % 4 != 0 {
+            file_desc_body.push(0);
+        }
+        write_packet(&mut out, set_id, TYPE_FILE_DESC, &file_desc_body);
+    }
+
+    // Creator packet (required by spec).
+    let creator_body = b"nobz test\0\0\0";
+    write_packet(&mut out, set_id, TYPE_CREATOR, creator_body);
+
+    out
+}
+
 /// Errors that can occur during PAR2 parsing.
 #[derive(Debug, thiserror::Error)]
 pub enum ParseError {
@@ -375,94 +548,14 @@ pub enum ParseError {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
-
-    /// Build a minimal PAR2 file in memory for testing.
-    fn build_test_par2(file_data: &[u8], filename: &str) -> Vec<u8> {
-        // Compute the file's MD5 hashes.
-        let md5_16k_val = md5_16k(file_data);
-        let md5_full_val = md5_full(file_data);
-
-        // File ID = MD5 of (md5_16k + length + filename)
-        let mut file_id_hasher = Md5::new();
-        file_id_hasher.update(md5_16k_val);
-        file_id_hasher.update((file_data.len() as u64).to_le_bytes());
-        file_id_hasher.update(filename.as_bytes());
-        let file_id: [u8; 16] = file_id_hasher.finalize().into();
-
-        // Build the main packet body.
-        let slice_size: u64 = 16 * 1024; // 16 kB slices
-        let recovery_count: u32 = 1;
-        let mut main_body = Vec::new();
-        main_body.extend_from_slice(&slice_size.to_le_bytes());
-        main_body.extend_from_slice(&recovery_count.to_le_bytes());
-        main_body.extend_from_slice(&file_id);
-
-        // Main packet set ID = MD5 of main body.
-        let set_id: [u8; 16] = {
-            let mut h = Md5::new();
-            h.update(&main_body);
-            h.finalize().into()
-        };
-
-        let mut out = Vec::new();
-
-        // Main packet.
-        write_packet(&mut out, set_id, TYPE_MAIN, &main_body);
-
-        // File Description packet.
-        let mut file_desc_body = Vec::new();
-        file_desc_body.extend_from_slice(&file_id);
-        file_desc_body.extend_from_slice(&md5_full_val);
-        file_desc_body.extend_from_slice(&md5_16k_val);
-        file_desc_body.extend_from_slice(&(file_data.len() as u64).to_le_bytes());
-        file_desc_body.extend_from_slice(filename.as_bytes());
-        // Pad to 4-byte alignment.
-        while file_desc_body.len() % 4 != 0 {
-            file_desc_body.push(0);
-        }
-        write_packet(&mut out, set_id, TYPE_FILE_DESC, &file_desc_body);
-
-        // Creator packet (required by spec).
-        let creator_body = b"nobz test\0\0\0";
-        write_packet(&mut out, set_id, TYPE_CREATOR, creator_body);
-
-        out
-    }
-
-    fn write_packet(out: &mut Vec<u8>, set_id: [u8; 16], pkt_type: [u8; 16], body: &[u8]) {
-        let total_len = 64 + body.len();
-        // Pad body to 4-byte alignment.
-        let padded_len = (total_len + 3) & !3;
-        let padding = padded_len - total_len;
-
-        // MD5 of (set_id + type + body + padding)
-        let mut md5_hasher = Md5::new();
-        md5_hasher.update(set_id);
-        md5_hasher.update(pkt_type);
-        md5_hasher.update(body);
-        for _ in 0..padding {
-            md5_hasher.update([0]);
-        }
-        let packet_md5: [u8; 16] = md5_hasher.finalize().into();
-
-        out.extend_from_slice(&PAR2_MAGIC);
-        out.extend_from_slice(&(padded_len as u64).to_le_bytes());
-        out.extend_from_slice(&packet_md5);
-        out.extend_from_slice(&set_id);
-        out.extend_from_slice(&pkt_type);
-        out.extend_from_slice(body);
-        for _ in 0..padding {
-            out.push(0);
-        }
-    }
 
     #[test]
     fn test_parse_and_verify_healthy_file() {
         let file_data = b"Hello, this is a test file for PAR2 verification!";
         let filename = "test.bin";
-        let par2_data = build_test_par2(file_data, filename);
+        let par2_data = build_par2_set(&[(file_data, filename)]);
 
         let par2 = parse_par2_bytes(&par2_data).unwrap();
 
@@ -495,7 +588,7 @@ mod tests {
     fn test_verify_missing_file() {
         let file_data = b"some data here";
         let filename = "missing.bin";
-        let par2_data = build_test_par2(file_data, filename);
+        let par2_data = build_par2_set(&[(file_data, filename)]);
         let par2 = parse_par2_bytes(&par2_data).unwrap();
 
         let tmp = std::env::temp_dir().join("nobz-par2-test-missing");
@@ -510,10 +603,38 @@ mod tests {
     }
 
     #[test]
+    fn test_verify_matches_renamed_file_by_content() {
+        // Regression for obfuscated posts: the on-disk file was renamed
+        // (deobfuscated) so its name no longer matches the name recorded
+        // in the PAR2. Verification must match by content.
+        let file_data = b"Hello, this is a test file for PAR2 verification!";
+        let filename = "secret.bin";
+        let par2_data = build_par2_set(&[(file_data, filename)]);
+        let par2 = parse_par2_bytes(&par2_data).unwrap();
+
+        let tmp = std::env::temp_dir().join("nobz-par2-test-renamed");
+        std::fs::create_dir_all(&tmp).unwrap();
+        // Write the same content under a *different* name.
+        std::fs::write(tmp.join("release.000.rar"), file_data).unwrap();
+
+        let report = verify(&par2, &tmp);
+        assert_eq!(report.healthy, 1, "must match by content despite rename");
+        assert_eq!(report.damaged, 0);
+        assert_eq!(report.missing, 0);
+        // The real (PAR2-recorded) name must be exposed for renaming.
+        assert_eq!(
+            report.matches,
+            vec![(tmp.join("release.000.rar"), filename.to_string())]
+        );
+
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
     fn test_verify_damaged_file() {
         let original_data = vec![0xAA; 20_000]; // > 16 kB so 16k hash is meaningful
         let filename = "damaged.bin";
-        let par2_data = build_test_par2(&original_data, filename);
+        let par2_data = build_par2_set(&[(original_data.as_slice(), filename)]);
         let par2 = parse_par2_bytes(&par2_data).unwrap();
 
         let tmp = std::env::temp_dir().join("nobz-par2-test-damaged");

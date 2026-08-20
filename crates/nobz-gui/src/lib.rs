@@ -354,7 +354,7 @@ fn format_speed(bytes_per_sec: u64) -> String {
 
 /// Load the embedded window icon (RGBA) for the OS title bar and taskbar.
 fn window_icon() -> Option<egui::viewport::IconData> {
-    let bytes = include_bytes!("../icons/nobz_icon.png");
+    let bytes = include_bytes!("../../../logo.png");
     let img = image::load_from_memory(bytes).ok()?.to_rgba8();
     let (w, h) = img.dimensions();
     Some(egui::viewport::IconData {
