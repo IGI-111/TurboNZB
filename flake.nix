@@ -109,10 +109,7 @@
             meta = with pkgs.lib; {
               description = "Portable native desktop GUI for Usenet";
               homepage = "https://github.com/IGI-111/turboNBZ";
-              license = with licenses; [
-                mit
-                asl20
-              ];
+              license = licenses.mit;
               mainProgram = "turbonbz";
               platforms = platforms.linux ++ platforms.darwin;
             };
