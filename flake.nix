@@ -1,5 +1,5 @@
 {
-  description = "TurboNBZ — a portable native desktop GUI for Usenet (Rust + egui)";
+  description = "TurboNZB — a portable native desktop GUI for Usenet (Rust + egui)";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -93,24 +93,24 @@
         # crates don't bust the cargo-deps cache.
         cargoArtifacts = craneLib.buildDepsOnly commonArgs;
 
-        turbonbz-gui = craneLib.buildPackage (
+        turbonzb-gui = craneLib.buildPackage (
           commonArgs
           // {
             inherit cargoArtifacts;
             # The single binary the app ships.
-            cargoExtraArgs = "--bin turbonbz";
+            cargoExtraArgs = "--bin turbonzb";
             # Desktop entry + icon at runtime via a wrapProgram so `nix run`
             # behaves like a normal app on Linux.
             postInstall = pkgs.lib.optionalString pkgs.stdenv.isLinux ''
-              wrapProgram $out/bin/turbonbz \
+              wrapProgram $out/bin/turbonzb \
                 --prefix XDG_DATA_DIRS : "${pkgs.fontconfig}/share" \
                 --prefix LD_LIBRARY_PATH : "${pkgs.lib.makeLibraryPath commonArgs.buildInputs}"
             '';
             meta = with pkgs.lib; {
               description = "Portable native desktop GUI for Usenet";
-              homepage = "https://github.com/IGI-111/turboNBZ";
+              homepage = "https://github.com/IGI-111/TurboNZB";
               license = licenses.mit;
-              mainProgram = "turbonbz";
+              mainProgram = "turbonzb";
               platforms = platforms.linux ++ platforms.darwin;
             };
           }
@@ -118,13 +118,13 @@
       in
       {
         packages = {
-          default = turbonbz-gui;
-          turbonbz = turbonbz-gui;
+          default = turbonzb-gui;
+          turbonzb = turbonzb-gui;
         };
 
         apps.default = flake-utils.lib.mkApp {
-          drv = turbonbz-gui;
-          name = "turbonbz";
+          drv = turbonzb-gui;
+          name = "turbonzb";
         };
 
         # `nix develop` shell: same native deps + toolchain + a few extras

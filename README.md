@@ -1,8 +1,8 @@
-# TurboNBZ
+# TurboNZB
 
 A Usenet client that would have been right at home in 1995.
 
-TurboNBZ is a native desktop Usenet downloader. Unified search across your
+TurboNZB is a native desktop Usenet downloader. Unified search across your
 Newznab indexers on one side, a serious multi-connection download engine on the
 other, all rendered in an interface that time-traveled forward from the
 mid-nineties. Written in Rust, aiming for SABnzbd-parity download behavior,
@@ -51,7 +51,7 @@ nix run
 With Cargo (Rust 1.85+):
 
 ```sh
-cargo run -p turbonbz-gui
+cargo run -p turbonzb-gui
 ```
 
 The first-run wizard will walk you through adding an NNTP server and at least
@@ -64,8 +64,8 @@ standard user directories, via the `directories` crate:
 
 | What | Linux | Windows | macOS |
 |------|-------|---------|-------|
-| Settings | `~/.config/turbonbz/config.json` | `%APPDATA%\turbonbz\config.json` | `~/Library/Application Support/turbonbz/config.json` |
-| Queue (SQLite) | `~/.local/share/turbonbz` | `%APPDATA%\turbonbz` | `~/Library/Application Support/turbonbz` |
+| Settings | `~/.config/turbonzb/config.json` | `%APPDATA%\turbonzb\config.json` | `~/Library/Application Support/turbonzb/config.json` |
+| Queue (SQLite) | `~/.local/share/turbonzb` | `%APPDATA%\turbonzb` | `~/Library/Application Support/turbonzb` |
 
 Downloads default to your OS download folder.
 

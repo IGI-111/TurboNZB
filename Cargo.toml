@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/turbonbz-core",
-    "crates/turbonbz-index",
-    "crates/turbonbz-gui",
+    "crates/turbonzb-core",
+    "crates/turbonzb-index",
+    "crates/turbonzb-gui",
 ]
 
 [workspace.package]
@@ -11,8 +11,8 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
-repository = "https://github.com/IGI-111/turboNBZ"
-homepage = "https://github.com/IGI-111/turboNBZ"
+repository = "https://github.com/IGI-111/TurboNZB"
+homepage = "https://github.com/IGI-111/TurboNZB"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "fs", "sync", "time", "signal"] }
