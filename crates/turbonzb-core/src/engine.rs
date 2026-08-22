@@ -16,13 +16,13 @@
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 
 use crate::error::{CoreError, Result};
-use crate::nntp::{NntpClient, ServerConfig, StatResult};
+use crate::nntp::{NntpClient, ServerConfig};
 use crate::queue::{QueueFile, QueueManager, QueueSegment, SegmentState};
 use crate::yenc;
 
@@ -74,6 +74,17 @@ impl PerfStats {
         } else {
             self.fetch_gt_2000ms.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// Snapshot of all fetch-time buckets, for per-run deltas.
+    fn fetch_buckets(&self) -> [u64; 5] {
+        [
+            self.fetch_le_20ms.load(Ordering::Relaxed),
+            self.fetch_le_100ms.load(Ordering::Relaxed),
+            self.fetch_le_500ms.load(Ordering::Relaxed),
+            self.fetch_le_2000ms.load(Ordering::Relaxed),
+            self.fetch_gt_2000ms.load(Ordering::Relaxed),
+        ]
     }
 }
 
@@ -233,6 +244,32 @@ impl Engine {
         job_id: i64,
         tx: mpsc::UnboundedSender<ProgressEvent>,
     ) -> Result<()> {
+        self.run_job_inner(queue, job_id, tx, None).await
+    }
+
+    /// Like [`Engine::run_job`], but stops gracefully when `cancel` is set:
+    /// workers stop pulling new work, completed segments' state is flushed
+    /// and already-written bytes reach the file, then the job returns
+    /// **before** file finalization — so a paused job's already-downloaded
+    /// segments are persisted and NOT re-fetched when it's resumed.
+    pub async fn run_job_cancellable(
+        self: Arc<Self>,
+        queue: Arc<QueueManager>,
+        job_id: i64,
+        tx: mpsc::UnboundedSender<ProgressEvent>,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<()> {
+        self.run_job_inner(queue, job_id, tx, Some(cancel)).await
+    }
+
+    /// Shared implementation of both entry points.
+    async fn run_job_inner(
+        self: Arc<Self>,
+        queue: Arc<QueueManager>,
+        job_id: i64,
+        tx: mpsc::UnboundedSender<ProgressEvent>,
+        cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Result<()> {
         // Ensure the job is in 'downloading' state. The caller should have
         // already claimed the download slot via claim_download_slot, but
         // we set it here too for standalone use (CLI, tests).
@@ -290,6 +327,16 @@ impl Engine {
 
         // Get all files with pending segments.
         let pending = queue.pending_segments(job_id).await?;
+        if let Ok((done, missing, pending_here, crc, failed)) = queue.segment_state_counts(job_id).await {
+            tracing::info!(
+                pending = pending_here,
+                done,
+                missing,
+                crc_mismatches = crc,
+                failed,
+                "engine: segment state breakdown on job start"
+            );
+        }
         tracing::info!(
             pending_files = pending.len(),
             "engine: pending segments loaded"
@@ -327,6 +374,14 @@ impl Engine {
             unreachable!("pool should never be cleared after new()")
         };
         let stats = Arc::clone(&self.stats);
+        // Snapshot cumulative counters so the end-of-run perf summary reports
+        // just this run's bytes/articles, not the process-wide total
+        // (stats are shared across runs and jobs).
+        let stats_articles_start = stats.articles.load(Ordering::Relaxed);
+        let stats_bytes_start = stats.bytes.load(Ordering::Relaxed);
+        let stats_conn_created_start = stats.conn_created.load(Ordering::Relaxed);
+        let stats_conn_dropped_start = stats.conn_dropped.load(Ordering::Relaxed);
+        let stats_fetch_buckets_start = stats.fetch_buckets();
 
         // Shared counters for completed/failed files.
         let completed = Arc::new(Mutex::new(0usize));
@@ -384,6 +439,16 @@ impl Engine {
         // every segment forever.
         let seg_attempts: Arc<Mutex<std::collections::HashMap<i64, u32>>> =
             Arc::new(Mutex::new(std::collections::HashMap::new()));
+
+        // Direct-write (Pillar 3): one output file per NZB file, segments
+        // `pwrite`d at their offset. `writers` maps a file id to the sender
+        // of its dedicated writer task; `writer_tasks` holds those tasks so we
+        // can wait for them to drain before finalizing each file.
+        let writers: Arc<tokio::sync::Mutex<OutputWriterMap>> =
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let writer_tasks: Arc<tokio::sync::Mutex<WriterTaskMap>> =
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+
         let mut workers: JoinSet<Result<()>> = JoinSet::new();
         for worker_id in 0..self.max_connections {
             let engine = Arc::clone(&self);
@@ -393,6 +458,9 @@ impl Engine {
             let files = Arc::clone(&files);
             let stats = Arc::clone(&stats);
             let seg_attempts = Arc::clone(&seg_attempts);
+            let writers = Arc::clone(&writers);
+            let writer_tasks = Arc::clone(&writer_tasks);
+            let cancel = cancel.clone();
             let tx = tx.clone();
             let state_tx = state_tx.clone();
             let output_dir = job.output_dir.clone();
@@ -406,9 +474,12 @@ impl Engine {
                         &files,
                         &stats,
                         &seg_attempts,
+                        &writers,
+                        &writer_tasks,
                         &output_dir,
                         &tx,
                         &state_tx,
+                        cancel.as_ref(),
                     )
                     .await
             });
@@ -436,16 +507,58 @@ impl Engine {
         drop(state_tx);
         writer.await.ok();
 
-        // Assemble all files now that all segments are downloaded.
+        // Close every per-file writer channel: dropping the registry drops
+        // all senders, so each writer task drains its writes and exits.
+        drop(writers);
+        let mut writer_paths: std::collections::HashMap<i64, PathBuf> =
+            std::collections::HashMap::new();
+        {
+            let mut tasks = writer_tasks.lock().await;
+            for (file_id, handle) in tasks.drain() {
+                match handle.await {
+                    Ok(Ok(path)) => {
+                        writer_paths.insert(file_id, path);
+                    }
+                    Ok(Err(e)) => {
+                        tracing::error!(file_id, error = %e, "file writer task error");
+                    }
+                    Err(e) => {
+                        tracing::error!(file_id, error = %e, "file writer task panic");
+                    }
+                }
+            }
+        }
+
+        // On cancel (pause): state is flushed and files drained above; stop
+        // before finalizing so resume re-fetches nothing already downloaded.
+        if cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
+            // Refresh the job's aggregate counters (segments_done,
+            // downloaded_bytes, files_done) so the UI shows the real,
+            // persisted progress instead of 0 when the job sits Queued.
+            for (file, _segments) in &pending {
+                let _ = queue.refresh_job_counts(file.id).await;
+            }
+            log_perf_summary(
+            &stats, t0,
+            stats_articles_start, stats_bytes_start,
+            stats_conn_created_start, stats_conn_dropped_start,
+            &stats_fetch_buckets_start,
+        );
+            tracing::info!(job_id, "engine: cancelled — state persisted, finalize skipped");
+            return Ok(());
+        }
+
+        // Finalize all files now that their writer tasks have drained.
         let mut completed_count = 0usize;
         let mut failed_count = 0usize;
         for (file, _segments) in &pending {
-            let outcome = assemble_file(
+            let outcome = finalize_file(
                 &queue,
                 file,
                 &job.output_dir,
                 &job.name,
                 job.file_count,
+                &writer_paths,
                 &tx,
             )
             .await;
@@ -500,36 +613,12 @@ impl Engine {
 
         // Final perf summary (opt-in; only visible with
         // RUST_LOG=turbonzb_core=info).
-        {
-            let articles = stats.articles.load(Ordering::Relaxed);
-            let bytes = stats.bytes.load(Ordering::Relaxed);
-            let wall = t0.elapsed().as_secs_f64();
-            let avg = |x: u64| {
-                if articles == 0 {
-                    0.0
-                } else {
-                    x as f64 / articles as f64
-                }
-            };
-            tracing::info!(
-                articles,
-                bytes,
-                elapsed_s = wall,
-                avg_queue_us = avg(stats.queue_wait_us.load(Ordering::Relaxed)),
-                avg_acquire_us = avg(stats.acquire_us.load(Ordering::Relaxed)),
-                avg_fetch_us = avg(stats.fetch_us.load(Ordering::Relaxed)),
-                avg_decode_us = avg(stats.decode_us.load(Ordering::Relaxed)),
-                avg_write_us = avg(stats.write_us.load(Ordering::Relaxed)),
-                conn_created = stats.conn_created.load(Ordering::Relaxed),
-                conn_dropped = stats.conn_dropped.load(Ordering::Relaxed),
-                fetch_bucket_le20ms = stats.fetch_le_20ms.load(Ordering::Relaxed),
-                fetch_bucket_20_100ms = stats.fetch_le_100ms.load(Ordering::Relaxed),
-                fetch_bucket_100_500ms = stats.fetch_le_500ms.load(Ordering::Relaxed),
-                fetch_bucket_500_2000ms = stats.fetch_le_2000ms.load(Ordering::Relaxed),
-                fetch_bucket_gt2s = stats.fetch_gt_2000ms.load(Ordering::Relaxed),
-                "engine final perf summary"
-            );
-        }
+        log_perf_summary(
+            &stats, t0,
+            stats_articles_start, stats_bytes_start,
+            stats_conn_created_start, stats_conn_dropped_start,
+            &stats_fetch_buckets_start,
+        );
 
         // NOTE: pool is intentionally kept alive across jobs — connection
         // establishment is the throttled, expensive part, so we hold.
@@ -537,8 +626,8 @@ impl Engine {
         Ok(())
     }
 
-    /// A worker loop: continuously pops segments from the shared queue
-    /// and fetches them using pooled connections until the queue is empty.
+    /// A worker loop: continuously pops batches of segments and fetches
+    /// them with pipelined BODY commands until the queue is empty.
     #[allow(clippy::too_many_arguments)]
     async fn run_worker(
         &self,
@@ -549,48 +638,66 @@ impl Engine {
         files: &Arc<Vec<QueueFile>>,
         stats: &Arc<PerfStats>,
         seg_attempts: &Arc<Mutex<std::collections::HashMap<i64, u32>>>,
+        writers: &Arc<tokio::sync::Mutex<OutputWriterMap>>,
+        writer_tasks: &Arc<tokio::sync::Mutex<WriterTaskMap>>,
         output_dir: &Path,
         tx: &mpsc::UnboundedSender<ProgressEvent>,
         state_tx: &mpsc::UnboundedSender<(i64, u32, SegmentState)>,
+        cancel: Option<&Arc<std::sync::atomic::AtomicBool>>,
     ) -> Result<()> {
-        // Per-worker cache of parts directories (no lock needed — each
-        // worker has its own HashMap). Most downloads have many segments
-        // per file, so after the first segment the dir is already cached.
-        // Keyed by file id so a real-name discovery (see below) never
-        // strands an already-created parts dir under the old name.
-        let mut parts_dirs: std::collections::HashMap<i64, PathBuf> =
-            std::collections::HashMap::new();
         // Files whose real name (from `=ybegin name=`) we've already
         // persisted, to avoid re-writing the DB on every segment.
         let mut name_latched: std::collections::HashSet<i64> = std::collections::HashSet::new();
 
         loop {
-            // Pop the next segment (timed — high average = workers
-            // fighting for work).
-            let (file_idx, seg) = {
+            // Graceful stop on pause — stop pulling new work (in-flight batch
+            // above is still written out and its state still recorded).
+            if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                break;
+            }
+            // Pop a batch of up to PIPELINE segments (timed — high average
+            // = workers fighting for work). Batching lets us send several
+            // BODY commands on one connection before reading responses
+            // (Pillar 1a — command pipelining).
+            let batch: Vec<(usize, QueueSegment)> = {
                 let t = std::time::Instant::now();
                 let mut wq = work_queue.lock().await;
-                let item = wq.pop_front();
+                let mut b = Vec::with_capacity(PIPELINE);
+                while b.len() < PIPELINE {
+                    match wq.pop_front() {
+                        Some(item) => b.push(item),
+                        None => break,
+                    }
+                }
                 stats
                     .queue_wait_us
                     .fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
-                match item {
-                    Some(item) => item,
-                    None => break, // Queue empty — worker is done.
+                if b.is_empty() {
+                    break; // Queue empty — worker is done.
                 }
+                b
             };
-            let file = &files[file_idx];
 
             // Bounded retry: count attempts per segment; a server that is
             // permanently unreachable must eventually fail the job rather
             // than retrying forever (which burns CPU and floods logs).
-            let attempts = {
-                let mut map = seg_attempts.lock().await;
-                let e = map.entry(seg.id).or_insert(0);
-                *e += 1;
-                *e
-            };
-            if attempts > MAX_SEGMENT_ATTEMPTS {
+            let mut to_fetch: Vec<(usize, QueueSegment)> = Vec::with_capacity(batch.len());
+            let mut failed_items: Vec<(usize, QueueSegment)> = Vec::new();
+            for (file_idx, seg) in batch {
+                let attempts = {
+                    let mut map = seg_attempts.lock().await;
+                    let e = map.entry(seg.id).or_insert(0);
+                    *e += 1;
+                    *e
+                };
+                if attempts > MAX_SEGMENT_ATTEMPTS {
+                    failed_items.push((file_idx, seg));
+                } else {
+                    to_fetch.push((file_idx, seg));
+                }
+            }
+            for (file_idx, seg) in failed_items {
+                let file = &files[file_idx];
                 let _ = state_tx.send((file.id, seg.number, SegmentState::Failed));
                 stats.articles.fetch_add(1, Ordering::Relaxed);
                 let _ = tx.send(ProgressEvent::SegmentDone {
@@ -606,116 +713,120 @@ impl Engine {
                         "fetch failed after {MAX_SEGMENT_ATTEMPTS} attempts (server unreachable?)"
                     ),
                 });
+            }
+            if to_fetch.is_empty() {
                 continue;
             }
 
-            // Ensure the parts directory exists for this file.
-            let parts_dir = match parts_dirs.get(&file.id) {
-                Some(p) => p.clone(),
-                None => {
-                    let p = output_dir.join(format!("{}.parts", file.filename));
-                    tokio::fs::create_dir_all(&p)
-                        .await
-                        .map_err(CoreError::from)?;
-                    parts_dirs.insert(file.id, p.clone());
-                    p
-                }
-            };
-
+            // Pipeline the BODY requests on pooled connections (window = the
+            // batch size, bounded by PIPELINE), decoding straight into the
+            // segment buffer as each body streams in (no intermediate copy).
             let t_fetch = std::time::Instant::now();
-            let outcome = pool_fetch(pool, &self.servers, &seg.message_id, stats).await;
+            let results = pipeline_fetch(pool, &self.servers, &to_fetch, stats, cancel).await;
             let fetch_us = t_fetch.elapsed().as_micros() as u64;
             stats.fetch_us.fetch_add(fetch_us, Ordering::Relaxed);
             stats.bucket(fetch_us);
 
-            let outcome = match outcome {
-                ArticleOutcome::Retry => {
-                    // Connection problem — put the segment back for another
-                    // worker (never mark it failed on a transient issue),
-                    // with a short backoff so a dead server doesn't cause
-                    // a hot retry loop.
-                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                    let mut wq = work_queue.lock().await;
-                    wq.push_front((file_idx, seg));
-                    continue;
-                }
-                o => o,
-            };
-
-            let (seg_state, bytes) = match outcome {
-                ArticleOutcome::OkBytes(body) => {
-                    let t_decode = std::time::Instant::now();
-                    let state = match yenc::decode_article(&body) {
-                        Ok(decoded) => {
-                            stats.decode_us.fetch_add(
-                                t_decode.elapsed().as_micros() as u64,
-                                Ordering::Relaxed,
-                            );
-                            let seg_state = if decoded.crc_ok || decoded.crc_unknown {
-                                SegmentState::Done
-                            } else {
-                                SegmentState::CrcMismatch
-                            };
-                            if seg_state == SegmentState::Done {
-                                // Obfuscated posts put a hash in the subject
-                                // but the real filename in `=ybegin name=`.
-                                // Latch the real name (once per file) so the
-                                // assembled file is identifiable on disk.
-                                let real = sanitize_yenc_name(&decoded.name);
-                                if !real.is_empty()
-                                    && real != file.filename
-                                    && file.yenc_name.as_deref() != Some(real.as_str())
-                                    && name_latched.insert(file.id)
-                                {
-                                    if let Err(e) = queue.set_file_yenc_name(file.id, &real).await {
-                                        tracing::warn!(
-                                            file_id = file.id,
-                                            error = %e,
-                                            "failed to record yenc filename"
-                                        );
-                                    }
+            let mut requeue: Vec<(usize, QueueSegment)> = Vec::new();
+            for (pos, (file_idx, seg)) in to_fetch.iter().enumerate() {
+                let file = &files[*file_idx];
+                let outcome = match results.get(pos) {
+                    Some(o) => o,
+                    None => {
+                        requeue.push((*file_idx, seg.clone()));
+                        continue;
+                    }
+                };
+                let (seg_state, bytes, write_data) = match outcome {
+                    FetchOutcome::Decoded(decoded) => {
+                        let seg_state = if decoded.crc_ok || decoded.crc_unknown {
+                            SegmentState::Done
+                        } else {
+                            SegmentState::CrcMismatch
+                        };
+                        if seg_state == SegmentState::Done {
+                            // Obfuscated posts put a hash in the subject but
+                            // the real filename in `=ybegin name=`. Latch the
+                            // real name (once per file) so the finalized
+                            // file is identifiable on disk.
+                            let real = sanitize_yenc_name(&decoded.name);
+                            if !real.is_empty()
+                                && real != file.filename
+                                && file.yenc_name.as_deref() != Some(real.as_str())
+                                && name_latched.insert(file.id)
+                            {
+                                if let Err(e) = queue.set_file_yenc_name(file.id, &real).await {
+                                    tracing::warn!(
+                                        file_id = file.id,
+                                        error = %e,
+                                        "failed to record yenc filename"
+                                    );
                                 }
-                                let part_path = parts_dir.join(format!("seg{:06}", seg.number));
-                                let t_write = std::time::Instant::now();
-                                tokio::fs::write(&part_path, &decoded.data)
-                                    .await
-                                    .map_err(CoreError::from)?;
-                                stats.write_us.fetch_add(
-                                    t_write.elapsed().as_micros() as u64,
-                                    Ordering::Relaxed,
-                                );
                             }
-                            seg_state
+                            (seg_state, seg.bytes, Some((decoded.begin, decoded.data.clone())))
+                        } else {
+                            (seg_state, seg.bytes, None)
                         }
-                        Err(e) => {
-                            let _ = tx.send(ProgressEvent::ArticleError {
-                                filename: file.filename.clone(),
-                                segment: seg.number,
-                                error: e.to_string(),
-                            });
-                            SegmentState::Failed
-                        }
-                    };
-                    // Report the *declared* size of the segment (from the
-                    // NZB), not the raw yEnc body length. The body's on-wire
-                    // size includes transport overhead (headers, CRLFs,
-                    // dot-stuffing), which made live progress overshoot the
-                    // job's total before snapping back at completion.
-                    (state, seg.bytes)
-                }
-                ArticleOutcome::Missing => (SegmentState::Missing, 0),
-                ArticleOutcome::Retry => unreachable!(),
-            };
+                    }
+                    FetchOutcome::Missing => (SegmentState::Missing, 0, None),
+                    FetchOutcome::Retry => {
+                        requeue.push((*file_idx, seg.clone()));
+                        continue;
+                    }
+                };
 
-            stats.articles.fetch_add(1, Ordering::Relaxed);
-            stats.bytes.fetch_add(bytes, Ordering::Relaxed);
-            let _ = state_tx.send((file.id, seg.number, seg_state));
-            let _ = tx.send(ProgressEvent::SegmentDone {
-                filename: file.filename.clone(),
-                segment: seg.number,
-                status: seg_state,
-                bytes,
-            });
+                // Direct write: send the decoded bytes to this file's
+                // dedicated writer task, which pwrite's them at their
+                // offset into the single output file (Pillar 3).
+                if let Some((begin, data)) = write_data {
+                    let offset = begin.saturating_sub(1);
+                    if !send_to_file_writer(
+                        writers,
+                        writer_tasks,
+                        stats,
+                        file.id,
+                        &file.filename,
+                        output_dir,
+                        offset,
+                        data,
+                    )
+                    .await
+                    {
+                        // Bytes could not be handed to a writer — don't mark
+                        // the segment Done (that would record it as complete
+                        // while its data is absent). Re-queue so it's
+                        // re-decoded and re-written once a writer is healthy.
+                        tracing::warn!(file_id = file.id, offset, "file writer unavailable; requeuing segment");
+                        requeue.push((*file_idx, seg.clone()));
+                        continue;
+                    }
+                }
+
+                stats.articles.fetch_add(1, Ordering::Relaxed);
+                stats.bytes.fetch_add(bytes, Ordering::Relaxed);
+                let _ = state_tx.send((file.id, seg.number, seg_state));
+                let _ = tx.send(ProgressEvent::SegmentDone {
+                    filename: file.filename.clone(),
+                    segment: seg.number,
+                    status: seg_state,
+                    bytes,
+                });
+            }
+
+            // Re-queue segments that hit transient connection errors so they
+            // get a fresh attempt (short backoff so a dead server doesn't
+            // cause a hot retry loop).
+            if !requeue.is_empty() {
+                // Backoff so a dead server doesn't hot-spin — unless we're
+                // just winding down for a pause, where latency matters.
+                if !cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                }
+                let mut wq = work_queue.lock().await;
+                for (file_idx, seg) in requeue.into_iter() {
+                    wq.push_front((file_idx, seg));
+                }
+            }
         }
 
         tracing::info!(worker_id, "worker: queue empty, exiting");
@@ -738,9 +849,18 @@ pub struct ConnectionPool {
     /// Total number of live connections (idle in pool + actively in use).
     /// Incremented on connect, decremented when a connection is dropped.
     active: std::sync::atomic::AtomicUsize,
+    /// Bounds how many connections are being *established* at once.
+    /// Opening dozens of TLS handshakes simultaneously trips providers'
+    /// connection-bombardment protection (they RST the excess, producing the
+    /// "connection closed mid-response" / churn storm), so we ramp up a few
+    /// at a time instead of stampeding.
+    connect_gate: tokio::sync::Semaphore,
     /// Performance counters (connection create/drop).
     stats: Arc<PerfStats>,
 }
+
+/// Max simultaneous connection establishments across all servers.
+const MAX_CONCURRENT_CONNECTS: usize = 4;
 
 impl ConnectionPool {
     fn new(servers: &[ServerConfig], stats: Arc<PerfStats>) -> Self {
@@ -760,6 +880,7 @@ impl ConnectionPool {
             servers: server_pools,
             gate,
             active: std::sync::atomic::AtomicUsize::new(0),
+            connect_gate: tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTS),
             stats,
         }
     }
@@ -788,7 +909,17 @@ impl ConnectionPool {
                 return Ok((conn, permit));
             }
         }
-        // Deque empty but we hold a slot — create a new connection.
+        // Deque empty but we hold a slot — create a new connection. Paced
+        // via connect_gate so we never burst dozens of handshakes at once.
+        let _connect_permit = self.connect_gate.acquire().await.expect("connect gate closed");
+        {
+            // Re-check the deque: another waiter may have returned a pooled
+            // connection while we waited on the gate.
+            let mut pool = self.servers[server_idx].lock().await;
+            if let Some(conn) = pool.pop_front() {
+                return Ok((conn, permit));
+            }
+        }
         self.active
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.stats.conn_created.fetch_add(1, Ordering::Relaxed);
@@ -880,37 +1011,209 @@ impl ConnectionPool {
 const MAX_SEGMENT_ATTEMPTS: u32 = 4;
 
 /// Outcome of fetching a single article.
-enum ArticleOutcome {
-    /// Article fetched successfully (raw yEnc bytes, dot-unstuffed).
-    OkBytes(Vec<u8>),
-    /// Article is genuinely missing (430/423) — mark it Missing.
+/// How many BODY commands to pipeline on one connection before reading
+/// responses. Modest and bounded: even a server that doesn't support
+/// pipelining responds per command as it reads them, and 4 small commands
+/// fit comfortably in any input buffer, so we never overflow a server's
+/// flow control (Pillar 1a).
+const PIPELINE: usize = 4;
+
+/// How often in-flight BODY reads re-check the pause flag while streaming.
+/// Small enough that pressing Pause interrupts a stalled batch almost
+/// immediately; large enough that the wakeup cost is negligible.
+const CANCEL_CHECK_POLL: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Outcome of fetching a single article via the pipelined path.
+#[derive(Clone)]
+enum FetchOutcome {
+    /// Decoded article (CRC already checked). Caller decides Done/Mismatch.
+    Decoded(yenc::DecodedPart),
+    /// Article genuinely missing (430/423 on every server) — mark Missing.
     Missing,
-    /// A connection-level problem — caller should retry later (re-queue).
+    /// A connection-level problem — caller should re-queue (retry later).
     Retry,
 }
 
-/// Fetch one article using the gated connection pool, trying servers in
-/// priority order.
+/// A single positional write job for a per-file writer task: `data` goes at
+/// byte `offset` of the file.
+struct WriteJob {
+    offset: u64,
+    data: Vec<u8>,
+}
+
+/// The on-disk path a file's segments are written to (and resumed from).
 ///
-/// - On success the connection is returned to the pool for reuse.
-/// - An article missing (430/423) on every server → `Missing`.
-/// - Any connection break (mid-read) → `Retry` so the segment is
-///   re-queued rather than failed; the broken connection is dropped.
-async fn pool_fetch(
+/// - Obfuscated-by-subject files (a bare hex token) are written to a
+///   stable temp path and only renamed once content is available to sniff a
+///   real extension — their final name isn't known until then.
+/// - Everything else is written directly to its real filename so a partial
+///   file resumes in place across runs (no data is ever lost on resume).
+fn write_target_for(file_id: i64, output_dir: &Path, filename: &str) -> PathBuf {
+    if is_obfuscated_name(filename) {
+        output_dir.join(format!(".turbonzb-{file_id}.partial"))
+    } else {
+        output_dir.join(filename)
+    }
+}
+
+/// Open (create-or-resume) the per-file output file for writing. Tries
+/// `primary` first; if that path is blocked — e.g. it already exists as a
+/// **directory** (left over from a previous run) — falls back to `fallback`
+/// (a stable per-file temp path) so the download never dies on a naming
+/// collision. Returns the path actually opened.
+async fn open_writer_fd(path: &Path) -> std::io::Result<tokio::fs::File> {
+    tokio::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false) // never truncate — resume a partial file in place
+        .write(true)
+        .read(true)
+        .open(path)
+        .await
+}
+
+async fn open_writer_file(
+    primary: &Path,
+    fallback: &Path,
+) -> Result<(PathBuf, tokio::fs::File)> {
+    match open_writer_fd(primary).await {
+        Ok(f) => Ok((primary.to_path_buf(), f)),
+        Err(_) => match open_writer_fd(fallback).await {
+            Ok(f) => Ok((fallback.to_path_buf(), f)),
+            Err(e) => Err(CoreError::from(e)),
+        },
+    }
+}
+
+/// Dedicated per-file writer task (Pillar 3). Receives decoded segments via
+/// `rx` and `pwrite`s each at its offset into a single output file, opened
+/// without truncation so a partial file from a previous run is resumed in
+/// place.
+///
+/// A single task owns the `File`, so no locking is needed across workers and
+/// positional seek+write is safe. Returns the path actually written to once
+/// the channel closes.
+async fn file_writer_task(
+    primary: PathBuf,
+    fallback: PathBuf,
+    stats: Arc<PerfStats>,
+    mut rx: mpsc::UnboundedReceiver<WriteJob>,
+) -> Result<PathBuf> {
+    use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+    let (path, mut file) = open_writer_file(&primary, &fallback).await?;
+    let mut max_end: u64 = 0;
+    while let Some(job) = rx.recv().await {
+        let t_write = std::time::Instant::now();
+        file.seek(std::io::SeekFrom::Start(job.offset))
+            .await
+            .map_err(CoreError::from)?;
+        file.write_all(&job.data)
+            .await
+            .map_err(CoreError::from)?;
+        stats
+            .write_us
+            .fetch_add(t_write.elapsed().as_micros() as u64, Ordering::Relaxed);
+        max_end = max_end.max(job.offset + job.data.len() as u64);
+    }
+    // Grow the file to cover the furthest byte written (never shrink — a
+    // resumed file may already be larger from a prior run; writes beyond
+    // EOF create sparse holes, keeping resume cheap).
+    let cur = file.metadata().await.map_err(CoreError::from)?.len();
+    if max_end > cur {
+        file.set_len(max_end).await.map_err(CoreError::from)?;
+    }
+    file.sync_all().await.map_err(CoreError::from)?;
+    Ok(path)
+}
+
+/// Sends a decoded segment to its file's writer task, creating the task on
+/// first use. Returns `false` if the write could not be handed off (writer
+/// channel closed) — in which case a fresh writer is created for subsequent
+/// segments, and the caller should RE-QUEUE this segment (its data is
+/// consumed by the failed send, so it must be re-cut to re-send). The
+/// caller must NOT mark the segment Done unless this returns `true`
+/// (otherwise its bytes are silently lost).
+#[allow(clippy::too_many_arguments)]
+async fn send_to_file_writer(
+    writers: &Arc<tokio::sync::Mutex<OutputWriterMap>>,
+    writer_tasks: &Arc<tokio::sync::Mutex<WriterTaskMap>>,
+    stats: &Arc<PerfStats>,
+    file_id: i64,
+    filename: &str,
+    output_dir: &Path,
+    offset: u64,
+    data: Vec<u8>,
+) -> bool {
+    let primary = write_target_for(file_id, output_dir, filename);
+    let fallback = output_dir.join(format!(".turbonzb-{file_id}.partial"));
+
+    let sender = {
+        let mut reg = writers.lock().await;
+        if let Some(s) = reg.get(&file_id) {
+            s.clone()
+        } else {
+            let (txw, rxw) = mpsc::unbounded_channel();
+            let st = Arc::clone(stats);
+            let handle = tokio::spawn(file_writer_task(primary.clone(), fallback.clone(), st, rxw));
+            writer_tasks.lock().await.insert(file_id, handle);
+            reg.insert(file_id, txw.clone());
+            txw
+        }
+    };
+
+    if sender.send(WriteJob { offset, data }).is_ok() {
+        return true;
+    }
+
+    // The writer task died (e.g. its open failed) — replace it so future
+    // segments have a live writer, and report failure for THIS one.
+    let (txw, rxw) = mpsc::unbounded_channel();
+    let st = Arc::clone(stats);
+    let handle = tokio::spawn(file_writer_task(primary, fallback, st, rxw));
+    writer_tasks.lock().await.insert(file_id, handle);
+    writers.lock().await.insert(file_id, txw);
+    false
+}
+
+/// Pipelined fetch of a batch of articles using the gated connection pool,
+/// trying servers in priority order (Pillar 1a).
+///
+/// For each server, a connection is checked out, up to `PIPELINE` BODY
+/// commands are written back-to-back, then the responses are read in order —
+/// so articles stream with no per-article command round-trip gap. Each body
+/// is yEnc-decoded straight from the wire (no intermediate `Vec`) via
+/// `NntpClient::read_body_decoded` (Pillar 1b).
+///
+/// The returned `Vec<FetchOutcome>` is aligned with `items`:
+/// - `Decoded` — fetched and decoded on some server.
+/// - `Missing` — 430/423 on every server, no connection error.
+/// - `Retry` — a connection broke while trying; caller re-queues.
+async fn pipeline_fetch(
     pool: &Arc<ConnectionPool>,
     servers: &[ServerConfig],
-    message_id: &str,
+    items: &[(usize, QueueSegment)],
     stats: &PerfStats,
-) -> ArticleOutcome {
-    let mut saw_missing = false;
-    let mut saw_conn_error = false;
+    cancel: Option<&Arc<AtomicBool>>,
+) -> Vec<FetchOutcome> {
+    let cancelled = |cancel: Option<&Arc<AtomicBool>>| {
+        cancel.is_some_and(|c| c.load(Ordering::Relaxed))
+    };
+    let mut results: Vec<FetchOutcome> = vec![FetchOutcome::Missing; items.len()];
+    let mut unresolved: Vec<usize> = (0..items.len()).collect();
+    let mut conn_error: Vec<bool> = vec![false; items.len()];
 
-    for (idx, _server) in servers.iter().enumerate() {
+    'server_loop: for (idx, _srv) in servers.iter().enumerate() {
+        if unresolved.is_empty() || cancelled(cancel) {
+            break;
+        }
         let t_acquire = std::time::Instant::now();
         let (mut client, permit) = match pool.get(idx, servers).await {
             Ok(t) => t,
             Err(e) => {
                 tracing::warn!(server_idx = idx, error = %e, "connect failed; trying next");
+                // Still-unresolved items saw a connection problem.
+                for &i in &unresolved {
+                    conn_error[i] = true;
+                }
                 continue;
             }
         };
@@ -918,36 +1221,100 @@ async fn pool_fetch(
             .acquire_us
             .fetch_add(t_acquire.elapsed().as_micros() as u64, Ordering::Relaxed);
 
-        match client.body(message_id).await {
-            Ok(Ok(body)) => {
-                pool.put(idx, client, permit).await;
-                return ArticleOutcome::OkBytes(body.bytes);
+        // Window = still-unresolved items, capped at PIPELINE.
+        let window: Vec<usize> = unresolved.iter().take(PIPELINE).copied().collect();
+
+        // Write all commands first…
+        let mut write_ok = true;
+        for &i in &window {
+            if cancelled(cancel) {
+                // Aborting: treat the window as connection-broken so the
+                // connection is dropped (it may hold a partial response).
+                for &j in &window {
+                    conn_error[j] = true;
+                }
+                write_ok = false;
+                break;
             }
-            Ok(Err(StatResult::Missing)) => {
-                // Not on this server — return the connection, try the next.
-                pool.put(idx, client, permit).await;
-                saw_missing = true;
-            }
-            Ok(Err(StatResult::Present)) => {
-                // BODY never returns Present; protocol oddity. Try next.
-                pool.put(idx, client, permit).await;
-                saw_missing = true;
-            }
-            Err(e) => {
-                // Connection error — drop it, try next server. Next fetch
-                // creates a fresh one (under the gate's slot count).
-                tracing::warn!(server_idx = idx, error = %e, "BODY error; dropping connection");
-                pool.drop_connection(permit);
-                saw_conn_error = true;
+            if let Err(e) = client.send_body(&items[i].1.message_id).await {
+                tracing::warn!(server_idx = idx, error = %e, "BODY send error; dropping connection");
+                for &j in &window {
+                    conn_error[j] = true;
+                }
+                write_ok = false;
+                break;
             }
         }
+
+        // …then read all responses in order (only if every command was sent).
+        // Each read races the pause flag (checked every CANCEL_CHECK_POLL) so
+        // a user pressing Pause interrupts in-flight bodies instead of
+        // waiting for the whole batch to stream in.
+        let mut read_ok = write_ok;
+        if write_ok {
+            'window: for &i in &window {
+                let read = client.read_body_decoded();
+                tokio::pin!(read);
+                let outcome = loop {
+                    tokio::select! {
+                        biased;
+                        r = &mut read => break Some(r),
+                        _ = tokio::time::sleep(CANCEL_CHECK_POLL) => {
+                            if cancelled(cancel) {
+                                break None;
+                            }
+                        }
+                    }
+                };
+                match outcome {
+                    Some(Ok(Ok(part))) => {
+                        results[i] = FetchOutcome::Decoded(part);
+                    }
+                    Some(Ok(Err(_))) => {
+                        // Absent here — keep unresolved so the next server
+                        // (in priority order) can try it.
+                    }
+                    Some(Err(e)) => {
+                        tracing::warn!(server_idx = idx, error = %e, "BODY read error; dropping connection");
+                        for &j in &window {
+                            conn_error[j] = true;
+                        }
+                        read_ok = false;
+                        break 'window;
+                    }
+                    None => {
+                        // Cancelled mid-read: drop the connection (partial
+                        // body in flight makes it unusable anyway).
+                        for &j in &window {
+                            conn_error[j] = true;
+                        }
+                        read_ok = false;
+                        break 'window;
+                    }
+                }
+            }
+        }
+
+        if read_ok && write_ok {
+            // Healthy — return the connection to the pool for reuse.
+            pool.put(idx, client, permit).await;
+        } else {
+            // Broken — drop it (the client is dropped here too).
+            pool.drop_connection(permit);
+            continue 'server_loop;
+        }
+        // Only 430s remain unresolved → try the next server for them.
+        unresolved.retain(|i| matches!(results[*i], FetchOutcome::Missing));
     }
 
-    if saw_missing && !saw_conn_error {
-        ArticleOutcome::Missing
-    } else {
-        ArticleOutcome::Retry
+    // Finalize: items unresolved after every server are Missing unless a
+    // connection error occurred anywhere while trying them (then Retry).
+    for (i, r) in results.iter_mut().enumerate() {
+        if matches!(r, FetchOutcome::Missing) && conn_error[i] {
+            *r = FetchOutcome::Retry;
+        }
     }
+    results
 }
 
 #[derive(Debug)]
@@ -966,12 +1333,27 @@ fn sanitize_yenc_name(name: &str) -> String {
         .collect::<String>()
 }
 
-/// True if a file name gives no human-readable information: a bare (up to the
-/// first dot) all-hexadecimal token of at least 16 characters. Both the NZB
-/// subject and the yEnc header are obfuscated for such posts.
+/// True if a file name gives no human-readable information — i.e. it's a
+/// poster-generated obfuscation token with no extractable read name.
+///
+/// Detects two shapes:
+/// - the classic bare **all-hex** blob of ≥ 16 chars, and
+/// - a **long bare alphanumeric token** with no extension / separator
+///   (e.g. `0kfagna8bx9e9x5ux2un9kh`) — many obfuscators use arbitrary
+///   mixed-case alphanumerics rather than hex.
+///
+/// Both mean the NZB subject and the yEnc header carry no usable real name,
+/// so the file must be renamed to the release name (with a sniffed
+/// extension) after download.
 fn is_obfuscated_name(name: &str) -> bool {
-    let stem = name.split('.').next().unwrap_or(name).to_ascii_lowercase();
-    stem.len() >= 16 && stem.bytes().all(|b| b.is_ascii_hexdigit())
+    let stem = name.split('.').next().unwrap_or(name);
+    let lower = stem.to_ascii_lowercase();
+    if stem.len() >= 16 && lower.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return true;
+    }
+    // A long token made only of letters/digits (no dot, space or separator)
+    // carries no readable structure — treat as obfuscation.
+    stem.len() >= 12 && stem.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
 /// Sniff a file extension from the first bytes of a file's content.
@@ -1049,12 +1431,13 @@ async fn unique_path(dir: &Path, name: &str) -> PathBuf {
 /// header) are renamed to the job's release name, with the extension
 /// sniffed from the assembled content and a numeric suffix for multi-file
 /// jobs — the article data itself carries no readable name.
-async fn assemble_file(
+async fn finalize_file(
     queue: &Arc<QueueManager>,
     file: &QueueFile,
     output_dir: &Path,
     job_name: &str,
     file_count: u32,
+    writer_paths: &std::collections::HashMap<i64, PathBuf>,
     _tx: &mpsc::UnboundedSender<ProgressEvent>,
 ) -> Result<FileOutcome> {
     // Reload the file so a real name latched during the download (from the
@@ -1073,65 +1456,38 @@ async fn assemble_file(
         .unwrap_or_else(|| file.filename.clone());
     let obfuscated = is_obfuscated_name(&base_name);
 
-    // Obfuscated files are assembled to a temp name first so the content
-    // can be sniffed for the real extension, then renamed. Everything else
-    // is written straight to its final path (as before).
-    let write_path: PathBuf = if obfuscated {
-        output_dir.join(format!(".assemble-{:06}", file.id))
-    } else {
-        output_dir.join(&base_name)
-    };
+    // The direct-write path wrote every segment into a single stable file:
+    // either directly at `file.filename`, or at a `.partial` temp path for
+    // content-sniff (obfuscated subject) files. Finalize renames it *once*
+    // if the real name differs; otherwise it's already at its final path.
+    let on_disk = writer_paths
+        .get(&file.id)
+        .cloned()
+        .unwrap_or_else(|| write_target_for(file.id, output_dir, &file.filename));
+    if !tokio::fs::try_exists(&on_disk).await.unwrap_or(false) {
+        tokio::fs::write(&on_disk, []).await.map_err(CoreError::from)?;
+    }
 
-    let parts_dir = output_dir.join(format!("{}.parts", file.filename));
+    // Count missing / CRC-mismatched segments from the DB (segment state),
+    // not from the disk — the single output file may have sparse holes
+    // where segments are missing/corrupt.
     let all_segments = queue.list_segments(file.id).await?;
-    let mut out = tokio::fs::File::create(&write_path)
-        .await
-        .map_err(CoreError::from)?;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut missing = 0u32;
     let mut crc_mismatches = 0u32;
-
     for n in 1..=file.segment_count {
-        let seg = all_segments.iter().find(|s| s.number == n);
-        match seg {
-            Some(s)
-                if s.state == SegmentState::Done
-                    || (s.state == SegmentState::Pending && s.missing) =>
-            {
-                if s.missing {
-                    missing += 1;
-                    continue;
-                }
-                let part_path = parts_dir.join(format!("seg{n:06}"));
-                match tokio::fs::read(&part_path).await {
-                    Ok(data) => {
-                        out.write_all(&data).await.map_err(CoreError::from)?;
-                    }
-                    Err(_) => {
-                        missing += 1;
-                    }
-                }
-            }
-            Some(s) if s.state == SegmentState::Missing || s.missing => {
-                missing += 1;
-            }
-            Some(s) if s.state == SegmentState::CrcMismatch => {
-                crc_mismatches += 1;
-            }
-            Some(s) if s.state == SegmentState::Failed => {
-                missing += 1;
-            }
-            _ => {
-                missing += 1;
-            }
+        match all_segments.iter().find(|s| s.number == n) {
+            Some(s) if s.state == SegmentState::Missing || s.missing => missing += 1,
+            Some(s) if s.state == SegmentState::CrcMismatch => crc_mismatches += 1,
+            Some(s) if s.state == SegmentState::Failed => missing += 1,
+            _ => {}
         }
     }
-    out.flush().await.map_err(CoreError::from)?;
-    drop(out);
 
     let final_path = if obfuscated {
-        // Sniff the content to recover a meaningful extension.
-        let mut fh = tokio::fs::File::open(&write_path)
+        // Sniff the content for a real extension and pick a unique
+        // release-based name before renaming once.
+        use tokio::io::AsyncReadExt;
+        let mut fh = tokio::fs::File::open(&on_disk)
             .await
             .map_err(CoreError::from)?;
         let mut head = [0u8; 16];
@@ -1139,19 +1495,36 @@ async fn assemble_file(
         drop(fh);
         let ext = sniff_ext(&head[..n]);
         let name = obfuscated_final_name(job_name, file.file_index, file_count, ext);
-        let final_path = unique_path(output_dir, &name).await;
-        tokio::fs::rename(&write_path, &final_path)
-            .await
-            .map_err(CoreError::from)?;
-        final_path
+        let dest = unique_path(output_dir, &name).await;
+        if dest != on_disk {
+            tokio::fs::rename(&on_disk, &dest)
+                .await
+                .map_err(CoreError::from)?;
+        }
+        dest
     } else {
-        write_path
+        let mut dest = output_dir.join(&base_name);
+        if dest != on_disk {
+            // The file was written under its subject name or `.partial` but
+            // the yEnc header revealed a better (real) name — rename once.
+            if tokio::fs::try_exists(&dest).await.unwrap_or(false) {
+                let meta = tokio::fs::metadata(&dest).await;
+                if meta.as_ref().map(|m| m.is_dir()).unwrap_or(false) {
+                    // The intended name is occupied by a directory — pick a
+                    // unique file name rather than failing the whole file.
+                    dest = unique_path(output_dir, &base_name).await;
+                } else {
+                    tokio::fs::remove_file(&dest).await.map_err(CoreError::from)?;
+                }
+            }
+            if dest != on_disk {
+                tokio::fs::rename(&on_disk, &dest)
+                    .await
+                    .map_err(CoreError::from)?;
+            }
+        }
+        dest
     };
-
-    // Clean up parts dir if the file is complete (no holes).
-    if missing == 0 && crc_mismatches == 0 {
-        let _ = tokio::fs::remove_dir_all(&parts_dir).await;
-    }
 
     Ok(FileOutcome {
         path: final_path,
@@ -1172,5 +1545,59 @@ async fn flush_batch(queue: &Arc<QueueManager>, buffer: &mut Vec<(i64, u32, Segm
     buffer.clear();
 }
 
+/// Log the aggregated perf counters for a run, including achieved MB/s and the
+/// per-article fetch-time buckets (reveals provider throttle vs client gaps).
+fn log_perf_summary(
+    stats: &PerfStats,
+    t0: std::time::Instant,
+    start_articles: u64,
+    start_bytes: u64,
+    start_conn_created: u64,
+    start_conn_dropped: u64,
+    start_fetch_buckets: &[u64; 5],
+) {
+    let articles = stats.articles.load(Ordering::Relaxed).saturating_sub(start_articles);
+    let bytes = stats.bytes.load(Ordering::Relaxed).saturating_sub(start_bytes);
+    let conn_created = stats.conn_created.load(Ordering::Relaxed).saturating_sub(start_conn_created);
+    let conn_dropped = stats.conn_dropped.load(Ordering::Relaxed).saturating_sub(start_conn_dropped);
+    let wall = t0.elapsed().as_secs_f64();
+    let mbps = if wall > 0.0 {
+        bytes as f64 / 1024.0 / 1024.0 / wall
+    } else {
+        0.0
+    };
+    let avg = |x: u64| {
+        if articles == 0 {
+            0.0
+        } else {
+            x as f64 / articles as f64
+        }
+    };
+    tracing::info!(
+        articles,
+        bytes,
+        elapsed_s = wall,
+        throughput_mbps = mbps,
+        avg_queue_us = avg(stats.queue_wait_us.load(Ordering::Relaxed)),
+        avg_acquire_us = avg(stats.acquire_us.load(Ordering::Relaxed)),
+        avg_fetch_us = avg(stats.fetch_us.load(Ordering::Relaxed)),
+        avg_decode_us = avg(stats.decode_us.load(Ordering::Relaxed)),
+        avg_write_us = avg(stats.write_us.load(Ordering::Relaxed)),
+        conn_created,
+        conn_dropped,
+        fetch_bucket_le20ms = stats.fetch_le_20ms.load(Ordering::Relaxed).saturating_sub(start_fetch_buckets[0]),
+        fetch_bucket_20_100ms = stats.fetch_le_100ms.load(Ordering::Relaxed).saturating_sub(start_fetch_buckets[1]),
+        fetch_bucket_100_500ms = stats.fetch_le_500ms.load(Ordering::Relaxed).saturating_sub(start_fetch_buckets[2]),
+        fetch_bucket_500_2000ms = stats.fetch_le_2000ms.load(Ordering::Relaxed).saturating_sub(start_fetch_buckets[3]),
+        fetch_bucket_gt2s = stats.fetch_gt_2000ms.load(Ordering::Relaxed).saturating_sub(start_fetch_buckets[4]),
+        "engine perf summary"
+    );
+}
+
 // Re-export mpsc for the public API.
 pub use tokio::sync::mpsc;
+
+/// Per-file direct-write sender registry: file id → its writer-task channel.
+type OutputWriterMap = std::collections::HashMap<i64, mpsc::UnboundedSender<WriteJob>>;
+/// Per-file writer task handles (waited on after workers drain).
+type WriterTaskMap = std::collections::HashMap<i64, tokio::task::JoinHandle<Result<PathBuf>>>;

@@ -190,3 +190,117 @@ fn tempfile_dir() -> PathBuf {
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
+
+/// A latency-injecting fake server: before responding to each BODY command
+/// it sleeps `latency`, emulating network round-trip time on a real
+/// cross-continental link. With NNTP command pipelining (Pillar 1a) the
+/// client keeps multiple BODY commands in flight, so the RTT is paid once
+/// per pipeline window instead of once per article — and achieved article
+/// rate far exceeds the naive `1 / latency` per-article ceiling.
+async fn spawn_latency_server(body: Arc<Vec<u8>>, latency: std::time::Duration) -> std::net::SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (sock, _) = match listener.accept().await {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            let body = body.clone();
+            tokio::spawn(async move {
+                let (reader, mut writer) = tokio::io::split(sock);
+                let mut reader = BufReader::new(reader);
+                if writer
+                    .write_all(b"200 turbonzb-bench ready\r\n")
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                let mut line = String::new();
+                let mut idle = true;
+                loop {
+                    line.clear();
+                    if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                        return;
+                    }
+                    let cmd = line.trim().to_string();
+                    if cmd.starts_with("BODY") {
+                        // Inject one round-trip delay per (idle → command)
+                        // transition. While commands are pipelined they come
+                        // back-to-back, so only the first pays the RTT.
+                        if idle {
+                            tokio::time::sleep(latency).await;
+                        }
+                        idle = false;
+                        if writer.write_all(b"222 body follows\r\n").await.is_err() {
+                            return;
+                        }
+                        if writer.write_all(&body).await.is_err() {
+                            return;
+                        }
+                        if writer.write_all(b".\r\n").await.is_err() {
+                            return;
+                        }
+                    } else if cmd == "QUIT" {
+                        let _ = writer.write_all(b"205 bye\r\n").await;
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    addr
+}
+
+/// Run the high-latency bench at `conns` connections: returns achieved MB/s.
+async fn run_latency_bench(conns: usize, body: Arc<Vec<u8>>, segments: u32, latency_ms: u64) -> f64 {
+    let addr = spawn_latency_server(body.clone(), std::time::Duration::from_millis(latency_ms)).await;
+    let nzb = build_nzb(segments, "bench");
+    let tmp = tempfile_dir();
+
+    let queue = Arc::new(QueueManager::open_in_memory().await.unwrap());
+    let job_id = queue.add_job(&nzb, &tmp, 0, None).await.unwrap();
+
+    let mut cfg = ServerConfig::localhost();
+    cfg.port = addr.port();
+    let engine = Arc::new(Engine::new(vec![cfg], conns));
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let q = Arc::clone(&queue);
+    let start = Instant::now();
+    let run = tokio::spawn(async move { engine.run_job(q, job_id, tx).await });
+    let _ = run.await;
+    let elapsed = start.elapsed().as_secs_f64();
+
+    let mut articles = 0u64;
+    while let Some(ev) = rx.recv().await {
+        if let ProgressEvent::SegmentDone { .. } = ev {
+            articles += 1;
+        }
+    }
+    let rate = articles as f64 / elapsed;
+    eprintln!(
+        "** latency bench conns={} latency={}ms: {:.1} articles/s, {:.2} rawMBs/s (elapsed {:.2}s)",
+        conns,
+        latency_ms,
+        rate,
+        articles as f64 * SEG_SIZE as f64 / 1024.0 / 1024.0 / elapsed,
+        elapsed
+    );
+    rate
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "benchmark; run with --ignored"]
+async fn bench_latency_pipelining_proves_no_serialization() {
+    let body = Arc::new(make_yenc_body());
+    // 64 segments, 50ms round-trip: a non-pipelined client could fetch at
+    // most ~20 articles/s; pipelining must beat that decisively.
+    let rate = run_latency_bench(4, body.clone(), 64, 50).await;
+    let naive_ceiling = 1000.0 / 50.0; // articles/s without pipelining
+    assert!(
+        rate > naive_ceiling * 1.5,
+        "pipelining should handily beat the per-article RTT ceiling: {rate:.1} vs {naive_ceiling:.1} articles/s"
+    );
+}

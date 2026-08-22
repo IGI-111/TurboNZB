@@ -1020,6 +1020,35 @@ impl QueueManager {
         Ok(())
     }
 
+    /// Count segments per state for a job (resume diagnostics). Returns
+    /// (done, missing, pending, crc_mismatch, failed).
+    pub async fn segment_state_counts(
+        &self,
+        job_id: i64,
+    ) -> Result<(u64, u64, u64, u64, u64)> {
+        let row = sqlx::query(
+            r#"SELECT
+                   COUNT(*) FILTER (WHERE s.state='done') AS done,
+                   COUNT(*) FILTER (WHERE s.state='missing') AS miss,
+                   COUNT(*) FILTER (WHERE s.state='pending') AS pend,
+                   COUNT(*) FILTER (WHERE s.state='crc_mismatch') AS crc,
+                   COUNT(*) FILTER (WHERE s.state='failed') AS failed
+               FROM segments s JOIN files f ON s.file_id = f.id
+               WHERE f.job_id = ?1"#,
+        )
+        .bind(job_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| CoreError::Other(anyhow::anyhow!("segment state counts: {e}")))?;
+        Ok((
+            row.get::<i64, _>("done").max(0) as u64,
+            row.get::<i64, _>("miss").max(0) as u64,
+            row.get::<i64, _>("pend").max(0) as u64,
+            row.get::<i64, _>("crc").max(0) as u64,
+            row.get::<i64, _>("failed").max(0) as u64,
+        ))
+    }
+
     /// Check if a file has any pending (non-missing) segments left.
     pub async fn file_has_pending(&self, file_id: i64) -> Result<bool> {
         let count: i64 = sqlx::query(

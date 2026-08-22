@@ -29,7 +29,7 @@ use turbonzb_core::engine::{Engine, ProgressEvent};
 use turbonzb_core::nntp::ServerConfig;
 use turbonzb_core::nzb;
 use turbonzb_core::postprocess::{
-    PostProcessConfig, PostProcessReport, PostProcessStatus, post_process,
+    PostProcessConfig, PostProcessReport, PostProcessStatus, post_process, post_process_with_progress,
 };
 use turbonzb_core::queue::{JobState, QueueJob, QueueManager};
 use turbonzb_index::types::{IndexerConfig, SearchQuery};
@@ -146,6 +146,8 @@ pub enum BackendEvent {
     },
     /// Post-processing started (PAR2 verify + unpack).
     PostProcessStarted { job_id: i64 },
+    /// PAR2 verification progress as (done, total) bytes.
+    PostProcessProgress { job_id: i64, done: u64, total: u64 },
     /// Post-processing completed.
     PostProcessDone {
         job_id: Option<i64>,
@@ -220,9 +222,18 @@ struct SpeedTracker {
 
 impl SpeedTracker {
     const HISTORY_CAP: usize = 240; // ~24s at 100ms intervals
-    /// EMA smoothing factor. Lower = smoother but more lag.
-    /// 0.3 means new sample contributes 30%, history contributes 70%.
-    const EMA_ALPHA: f64 = 0.3;
+    /// Time constant (seconds) of the smoothing. The per-sample weight is
+    /// derived from the ACTUAL elapsed time of each sample (`alpha =
+    /// 1 - e^(-elapsed/tau)`), so irregular sampling (UI busy / runtime
+    /// stutter) can't distort the average — a sample covering a long,
+    /// sparse window or a short burst is weighted by how long it really
+    /// took, not by a fixed step assumption.
+    const TAU: f64 = 0.35;
+    /// Cap on how much real elapsed time a single sample may represent. If
+    /// the sampling task was starved (CPU busy elsewhere) for longer than
+    /// this, treat it as this ceiling so a giant accumulated byte-count
+    /// over a huge window doesn't spike the curve.
+    const MAX_SAMPLE_SECS: f64 = 5.0;
 
     fn new() -> Self {
         Self {
@@ -235,12 +246,14 @@ impl SpeedTracker {
         }
     }
 
-    fn start(&mut self, total: u64) {
+    fn start(&mut self, total: u64, initial_downloaded: u64) {
         self.history.clear();
         self.last_time = Instant::now();
         self.last_bytes = 0;
         self.current_bps = 0.0;
-        self.downloaded = 0;
+        // Seed with bytes already persisted for this job so the progress bar
+        // is cumulative across pause/resume instead of resetting to 0.
+        self.downloaded = initial_downloaded;
         self.total = total;
     }
 
@@ -249,17 +262,24 @@ impl SpeedTracker {
     }
 
     fn tick(&mut self) -> (f64, u64) {
-        let elapsed = self.last_time.elapsed().as_secs_f64().max(0.001);
+        // Actual wall-clock time since the previous sample, bounded so a
+        // starved sampling task can't produce a pathological value.
+        let elapsed = self
+            .last_time
+            .elapsed()
+            .as_secs_f64()
+            .clamp(0.001, Self::MAX_SAMPLE_SECS);
         let raw_bps = self.last_bytes as f64 / elapsed;
 
-        // Exponential moving average to smooth out spikes from per-tick
-        // timing jitter (article arrives just before/after the tick).
+        // Time-weighted EMA: the smoothing factor reflects how much real
+        // time this sample spans, so irregular scheduling can't spike it.
+        let alpha = 1.0 - (-elapsed / Self::TAU).exp();
         if self.current_bps == 0.0 {
-            // First sample — initialize directly.
-            self.current_bps = raw_bps;
+            // First sample — but still bounded below by elapsed so an
+            // instant burst right after start can't explode.
+            self.current_bps = raw_bps.min(self.last_bytes as f64 / 0.25);
         } else {
-            self.current_bps =
-                Self::EMA_ALPHA * raw_bps + (1.0 - Self::EMA_ALPHA) * self.current_bps;
+            self.current_bps = self.current_bps * (1.0 - alpha) + raw_bps * alpha;
         }
 
         self.downloaded += self.last_bytes;
@@ -1380,17 +1400,16 @@ fn spawn_engine_task(
 ) {
     tracing::info!(job_id, "spawning engine task");
     tokio::spawn(async move {
-        let total_bytes = queue
-            .get_job(job_id)
-            .await
-            .ok()
-            .map(|j| j.total_bytes)
-            .unwrap_or(0);
+        let job0 = queue.get_job(job_id).await.ok();
+        let total_bytes = job0.as_ref().map(|j| j.total_bytes).unwrap_or(0);
+        let initial_downloaded = job0.as_ref().map(|j| j.downloaded_bytes).unwrap_or(0);
 
-        // Initialize the speed tracker for this job.
+        // Initialize the speed tracker for this job, carrying over already-
+        // downloaded bytes so resume (after a pause) continues the progress
+        // bar from where it was instead of starting back at 0.
         {
             let mut speed = speed_tracker.lock().expect("speed lock");
-            speed.start(total_bytes);
+            speed.start(total_bytes, initial_downloaded);
         }
 
         let fwd_engine = Arc::clone(&engine);
@@ -1466,13 +1485,23 @@ fn spawn_engine_task(
             }
         });
 
-        let result = tokio::select! {
-            r = engine.run_job(queue.clone(), job_id, tx) => r,
-            _ = cancel_token.cancelled() => {
-                tracing::info!(job_id, "engine: cancelled by pause");
-                Ok(())
-            }
-        };
+        // Graceful cancellation: translate the CancellationToken into an
+        // atomic flag the engine observes. The engine then stops pulling new
+        // work, flushes completed segments' state (and lets already-written
+        // bytes reach the file), and returns BEFORE finalizing — so nothing
+        // already downloaded is re-fetched when the job is resumed.
+        let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let flag = Arc::clone(&cancel_flag);
+            let token = cancel_token.clone();
+            tokio::spawn(async move {
+                token.cancelled().await;
+                flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            });
+        }
+        let result = engine
+            .run_job_cancellable(queue.clone(), job_id, tx, cancel_flag)
+            .await;
         tracing::info!(job_id, "engine: run_job returned");
         forwarder.await.ok();
 
@@ -1535,6 +1564,23 @@ fn spawn_engine_task(
                                 skip_verify: pp_defaults.skip_verify,
                             };
                             emit(BackendEvent::PostProcessStarted { job_id });
+                            // PAR2 verify is CPU-bound (MD5 hashing) and
+                            // would block the async runtime, so it runs on a
+                            // blocking thread. Verify progress is relayed to
+                            // the UI via an mpsc channel fed by the callback.
+                            let (pp_tx, mut pp_rx) =
+                                tokio::sync::mpsc::unbounded_channel::<(u64, u64)>();
+                            let emit_pp = event_tx.clone();
+                            let pp_job_id = job_id;
+                            let pp_forwarder = tokio::spawn(async move {
+                                while let Some((done, total)) = pp_rx.recv().await {
+                                    let _ = emit_pp.send(BackendEvent::PostProcessProgress {
+                                        job_id: pp_job_id,
+                                        done,
+                                        total,
+                                    });
+                                }
+                            });
                             // Run post-processing on a blocking thread —
                             // PAR2 verify is CPU-bound (MD5 hashing) and
                             // would block the async runtime.
@@ -1542,9 +1588,15 @@ fn spawn_engine_task(
                                 // post_process is async only because of file
                                 // I/O; we can run it synchronously on the
                                 // blocking thread.
-                                futures::executor::block_on(post_process(pp_config))
+                                futures::executor::block_on(post_process_with_progress(
+                                    pp_config,
+                                    Some(Box::new(move |done, total| {
+                                        let _ = pp_tx.send((done, total));
+                                    })),
+                                ))
                             })
                             .await;
+                            pp_forwarder.await.ok();
                             match pp_result {
                                 Ok(Ok(report)) => {
                                     // Persist a human-readable failure so the
@@ -1635,7 +1687,7 @@ fn spawn_engine_task(
         // Reset the speed tracker.
         {
             let mut speed = speed_tracker.lock().expect("speed lock");
-            speed.start(0);
+            speed.start(0, 0);
         }
 
         // Emit a zero-speed event so the GUI knows the download stopped.

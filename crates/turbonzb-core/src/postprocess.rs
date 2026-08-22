@@ -63,34 +63,103 @@ pub enum PostProcessStatus {
 
 /// Run the full post-processing pipeline on a downloaded job directory.
 pub async fn post_process(config: PostProcessConfig) -> Result<PostProcessReport> {
+    post_process_with_progress(config, None).await
+}
+
+/// Like [`post_process`], but reports PAR2 **verification** progress as
+/// `(done, total)` bytes to `on_verify` (called on a blocking worker).
+/// Useful so the UI can show a verify progress bar instead of an
+/// indefinite spinner. Pass `None` to run silently.
+pub async fn post_process_with_progress(
+    config: PostProcessConfig,
+    mut on_verify: Option<Box<dyn FnMut(u64, u64) + Send>>,
+) -> Result<PostProcessReport> {
     let download_dir = &config.download_dir;
 
     // Step 1: Find PAR2 files and verify.
     let par2_files = find_par2_files(download_dir);
-    let verify_report = if config.skip_verify || par2_files.is_empty() {
+    let mut par2_set: Option<par2::Par2File> = None;
+    let mut verify_report = if config.skip_verify || par2_files.is_empty() {
         debug!("skipping PAR2 verification (no PAR2 files or skip_verify)");
         None
     } else {
         info!(count = par2_files.len(), "verifying PAR2");
-        let par2 = par2::parse_par2_files(&par2_files)
+        let set = par2::parse_par2_files(&par2_files)
             .map_err(|e| CoreError::Other(anyhow::anyhow!("PAR2 parse: {e}")))?;
-        let report = par2::verify(&par2, download_dir);
+
+        // Fast ParRename (Pillar 2b): restore real names using only the
+        // 16 kB MD5 + length — seconds, not minutes — so full verification
+        // below runs against correctly-named files.
+        match par2::fast_rename_to_par2_names(&set, download_dir) {
+            Ok(renamed) => {
+                if renamed > 0 {
+                    info!(renamed, "PAR2 fast-rename applied");
+                }
+            }
+            Err(e) => {
+                debug!(error = %e, "PAR2 fast-rename failed (continuing)");
+            }
+        }
+
+        let report = match on_verify.as_mut() {
+            Some(f) => par2::verify_with_progress(&set, download_dir, Some(f.as_mut())),
+            None => par2::verify(&set, download_dir),
+        };
         info!(
             healthy = report.healthy,
             damaged = report.damaged,
             missing = report.missing,
             "PAR2 verify done"
         );
+        par2_set = Some(set);
         Some(report)
     };
 
-    // Step 2: Check if we can proceed to unpack.
+    // Step 2: if verification reports damage or missing files, attempt
+    // auto-repair (Pillar 2a) using the recovery slices *before* giving up.
+    if let Some(ref vr) = verify_report {
+        if vr.damaged > 0 || vr.missing > 0 {
+            if let Some(set) = par2_set.as_ref() {
+                info!(
+                    damaged = vr.damaged,
+                    missing = vr.missing,
+                    recovery_slices = vr.recovery_slices,
+                    "attempting PAR2 repair"
+                );
+                match par2::repair(set, download_dir) {
+                    Ok(rep) if rep.total_slices_repaired > 0 => {
+                        info!(
+                            repaired_slices = rep.total_slices_repaired,
+                            "PAR2 repair: reconstructing bad slices"
+                        );
+                        // Re-verify after repair.
+                        let re = par2::verify(set, download_dir);
+                        info!(
+                            healthy = re.healthy,
+                            damaged = re.damaged,
+                            missing = re.missing,
+                            "PAR2 re-verify after repair"
+                        );
+                        verify_report = Some(re);
+                    }
+                    Ok(rep) => {
+                        warn!(repaired = rep.total_slices_repaired, "PAR2 repair produced no repair");
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "PAR2 repair failed");
+                    }
+                }
+            }
+        }
+    }
+
+    // Step 2b: if files are still damaged after repair, skip unpack.
     if let Some(ref vr) = verify_report {
         if vr.damaged > 0 || vr.missing > 0 {
             warn!(
                 damaged = vr.damaged,
                 missing = vr.missing,
-                "files damaged/missing — skipping unpack (repair deferred to v2)"
+                "files damaged/missing — unpack skipped"
             );
             return Ok(PostProcessReport {
                 verify: verify_report.clone(),
@@ -636,6 +705,53 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().to_string())
             .collect();
         assert!(leftovers.is_empty(), "leftovers: {leftovers:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&completed);
+    }
+    #[test]
+    fn damaged_file_auto_repaired_during_post_process() {
+        // A download with PAR2 recovery files but a corrupted data file must be
+        // auto-repaired by post_process (Pillar 2a) and then unpacked/moved —
+        // not marked "damaged, manual repair needed".
+        let original = (0u8..=255).cycle().take(40_000).collect::<Vec<_>>();
+        let filename = "Movie.2025.1080p.mkv";
+        // > 16k so the actual (padded) slices carry recovery data.
+        let par2_bytes = crate::par2::build_par2_set(&[(original.as_slice(), filename)]);
+
+        let dir = tempfile_dir();
+        let completed = tempfile_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&completed).unwrap();
+
+        // Corrupt the download partway through.
+        let mut damaged = original.clone();
+        for b in &mut damaged[20_000..] {
+            *b ^= 0xFF;
+        }
+        std::fs::write(dir.join(filename), &damaged).unwrap();
+        std::fs::write(dir.join("Movie.2025.1080p.par2"), &par2_bytes).unwrap();
+
+        let cfg = PostProcessConfig {
+            download_dir: dir.clone(),
+            completed_dir: completed.clone(),
+            category: None,
+            cleanup_archives: true,
+            archive_password: None,
+            skip_verify: false,
+        };
+        let report = futures::executor::block_on(post_process(cfg)).unwrap();
+        assert!(
+            matches!(report.status, PostProcessStatus::Complete),
+            "auto-repair should let post-processing complete, got {:?}",
+            report.status
+        );
+        // The repaired file must be byte-identical and moved to completed.
+        assert_eq!(
+            std::fs::read(completed.join(filename)).unwrap(),
+            original,
+            "repaired file must be byte-for-byte original"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&completed);

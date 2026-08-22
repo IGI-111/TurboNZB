@@ -368,6 +368,11 @@ pub fn run() -> Result<()> {
         .with_min_inner_size([800.0, 500.0]);
     let native_options = eframe::NativeOptions {
         viewport,
+        // Disable vsync: on Wayland a vsync'd eglSwapBuffers waits for
+        // compositor frame callbacks, which stop when the window is
+        // occluded/unfocused. The GUI thread then blocks in swap and the
+        // compositor reports the app as "not responding".
+        vsync: false,
         ..Default::default()
     };
 

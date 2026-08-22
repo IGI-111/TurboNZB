@@ -58,6 +58,8 @@ pub struct QueueState {
     pub pp_reports: Vec<(Option<i64>, PostProcessReport)>,
     /// Jobs currently being post-processed (show "Verifying..." status).
     pub pp_in_progress: std::collections::HashSet<i64>,
+    /// Latest PAR2 verification progress (done, total bytes) per job.
+    pub pp_progress: std::collections::HashMap<i64, (u64, u64)>,
     /// Which sub-tab is active in the bottom details pane.
     pub details_tab: DetailsTab,
 }
@@ -139,12 +141,17 @@ impl QueueState {
                         self.job_details = files.clone();
                     }
                 }
+                BackendEvent::PostProcessProgress { job_id, done, total } => {
+                    self.pp_progress.insert(*job_id, (*done, *total));
+                }
                 BackendEvent::PostProcessStarted { job_id } => {
                     self.pp_in_progress.insert(*job_id);
+                    self.pp_progress.insert(*job_id, (0, 0));
                 }
                 BackendEvent::PostProcessDone { job_id, report } => {
                     if let Some(id) = job_id {
                         self.pp_in_progress.remove(id);
+                        self.pp_progress.remove(id);
                     }
                     self.pp_reports.push((*job_id, report.clone()));
                 }
@@ -330,8 +337,25 @@ fn job_list_pane(
                             }
                         });
                         row.col(ui, |ui| {
+                            // While verifying, show a real PAR2 progress bar.
                             if state.pp_in_progress.contains(&job.id) {
-                                ui.colored_label(Color32::from_rgb(80, 180, 80), "Verifying...");
+                                let (done, total) = state
+                                    .pp_progress
+                                    .get(&job.id)
+                                    .copied()
+                                    .unwrap_or((0, 0));
+                                let p = if total > 0 {
+                                    (done as f64 / total as f64).min(1.0) as f32
+                                } else {
+                                    0.0
+                                };
+                                ui.add(
+                                    Win95ProgressBar::new(p).text(if total > 0 {
+                                        format!("Verifying… {} / {}", format_size(done), format_size(total))
+                                    } else {
+                                        "Verifying…".into()
+                                    }),
+                                );
                             } else if let Some(err) = &job.error {
                                 // Salient error state — red "Error" with the
                                 // reason on hover.
@@ -683,6 +707,17 @@ fn general_pane(ui: &mut egui::Ui, state: &QueueState) {
             ui.colored_label(Color32::from_rgb(80, 180, 80), "Verifying + unpacking...");
             ui.spinner();
         });
+        if let Some((done, total)) = state.pp_progress.get(&job.id).copied() {
+            if total > 0 {
+                let p = (done as f64 / total as f64).min(1.0) as f32;
+                ui.add(Win95ProgressBar::new(p).text(format!(
+                    "PAR2 verify: {} / {} ({}%)",
+                    format_size(done),
+                    format_size(total),
+                    (p * 100.0) as u32
+                )));
+            }
+        }
     } else if let Some((_, report)) = state
         .pp_reports
         .iter()

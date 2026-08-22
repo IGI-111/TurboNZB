@@ -12,6 +12,7 @@ use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
 use crate::error::{CoreError, Result};
+use crate::yenc;
 
 /// Configuration for a single NNTP server.
 #[derive(Debug, Clone)]
@@ -247,6 +248,59 @@ impl NntpClient {
         }
     }
 
+    /// Read the response to a previously issued `BODY` command, decoding the
+    /// article straight into a yEnc [`crate::yenc::DecodedPart`] as the dot
+    /// body streams in — no intermediate encoded-body `Vec` is ever built
+    /// (single-copy path, Pillar 1b).
+    ///
+    /// `222` → return the decoded part; `423`/`430` → `Missing`; anything
+    /// else is an error.
+    pub async fn read_body_decoded(
+        &mut self,
+    ) -> Result<std::result::Result<yenc::DecodedPart, StatResult>> {
+        let status = self.read_response_line().await?;
+        let code = ResponseCode::parse(&status)
+            .ok_or_else(|| CoreError::Nntp(format!("bad response: {status}")))?;
+        match code.0 {
+            222 => {
+                let mut dec = yenc::Decoder::new();
+                loop {
+                    self.line_buf.clear();
+                    let n = self
+                        .reader
+                        .read_until(b'\n', &mut self.line_buf)
+                        .await
+                        .map_err(CoreError::from)?;
+                    if n == 0 {
+                        return Err(CoreError::Nntp("connection closed mid-body".into()));
+                    }
+                    // Terminator: a line of just `.` (optionally with CRLF).
+                    let trimmed = self
+                        .line_buf
+                        .strip_suffix(b"\r\n")
+                        .or_else(|| self.line_buf.strip_suffix(b"\n"))
+                        .unwrap_or(&self.line_buf);
+                    if trimmed == b"." {
+                        break;
+                    }
+                    // Dot-unstuffing: a leading `..` collapses to `.`.
+                    let line = if let Some(rest) = trimmed.strip_prefix(b"..") {
+                        let mut buf = Vec::with_capacity(rest.len() + 1);
+                        buf.push(b'.');
+                        buf.extend_from_slice(rest);
+                        buf
+                    } else {
+                        trimmed.to_vec()
+                    };
+                    dec.push_line(&line)?;
+                }
+                Ok(Ok(dec.finish()?))
+            }
+            423 | 430 => Ok(Err(StatResult::Missing)),
+            _ => Err(CoreError::Nntp(format!("BODY failed: {status}"))),
+        }
+    }
+
     /// Check article presence via `STAT <id>` (cheaper than BODY: no payload).
     pub async fn stat(&mut self, message_id: &str) -> Result<StatResult> {
         self.send_cmd(&format!("STAT <{message_id}>")).await?;
@@ -474,12 +528,12 @@ mod tests {
                     if cmd.contains("missing@x") {
                         writer.write_all(b"430 no such article\r\n").await.unwrap();
                     } else if cmd.contains("dotted@x") {
+                        // A dot-stuffed yEnc article: payload byte 4 encodes
+                        // to '.' which is doubled on the wire as '..'.
                         writer.write_all(b"222 body follows\r\n").await.unwrap();
-                        writer
-                            .write_all(b"=ybegin size=3 name=t\r\n")
-                            .await
-                            .unwrap();
-                        writer.write_all(b"..xyz\r\n").await.unwrap();
+                        writer.write_all(b"=ybegin size=1 name=t\r\n").await.unwrap();
+                        writer.write_all(b"..\r\n").await.unwrap();
+                        writer.write_all(b"=yend size=1\r\n").await.unwrap();
                         writer.write_all(b".\r\n").await.unwrap();
                     } else {
                         writer.write_all(b"222 body follows\r\n").await.unwrap();
@@ -537,10 +591,27 @@ mod tests {
         let body = c.body("dotted@x").await.unwrap().unwrap();
         let s = String::from_utf8_lossy(&body.bytes);
         assert!(
-            s.contains(".xyz"),
-            "dot-unstuffing should produce .xyz, got: {s}"
+            s.contains("."),
+            "dot-unstuffing should produce a single dot, got: {s}"
         );
-        assert!(!s.contains("..xyz"));
+        assert!(!s.contains(".."));
+    }
+
+    #[tokio::test]
+    async fn read_body_decoded_unstuffs_and_decodes() {
+        // `dotted@x` returns a dot-stuffed yEnc article: the payload byte 4
+        // encodes to '.' which is doubled on the wire as `..` → must be
+        // unstuffed to a single byte before decode.
+        let addr = spawn_fake_nntp().await;
+        let mut cfg = ServerConfig::localhost();
+        cfg.port = addr.port();
+        let mut c = NntpClient::connect(&cfg).await.unwrap();
+        c.send_body("dotted@x").await.unwrap();
+        let part = c.read_body_decoded().await.unwrap().unwrap();
+        // The unstuffed `..` → `.` decodes (wrapping) to byte 4.
+        assert_eq!(part.data, vec![4u8], "dot must be unstuffed exactly once");
+        assert_eq!(part.end, 1);
+        assert!(part.crc_unknown);
     }
 
     #[tokio::test]
