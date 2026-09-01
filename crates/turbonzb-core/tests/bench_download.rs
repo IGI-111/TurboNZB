@@ -197,7 +197,10 @@ fn tempfile_dir() -> PathBuf {
 /// client keeps multiple BODY commands in flight, so the RTT is paid once
 /// per pipeline window instead of once per article — and achieved article
 /// rate far exceeds the naive `1 / latency` per-article ceiling.
-async fn spawn_latency_server(body: Arc<Vec<u8>>, latency: std::time::Duration) -> std::net::SocketAddr {
+async fn spawn_latency_server(
+    body: Arc<Vec<u8>>,
+    latency: std::time::Duration,
+) -> std::net::SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -254,8 +257,14 @@ async fn spawn_latency_server(body: Arc<Vec<u8>>, latency: std::time::Duration) 
 }
 
 /// Run the high-latency bench at `conns` connections: returns achieved MB/s.
-async fn run_latency_bench(conns: usize, body: Arc<Vec<u8>>, segments: u32, latency_ms: u64) -> f64 {
-    let addr = spawn_latency_server(body.clone(), std::time::Duration::from_millis(latency_ms)).await;
+async fn run_latency_bench(
+    conns: usize,
+    body: Arc<Vec<u8>>,
+    segments: u32,
+    latency_ms: u64,
+) -> f64 {
+    let addr =
+        spawn_latency_server(body.clone(), std::time::Duration::from_millis(latency_ms)).await;
     let nzb = build_nzb(segments, "bench");
     let tmp = tempfile_dir();
 

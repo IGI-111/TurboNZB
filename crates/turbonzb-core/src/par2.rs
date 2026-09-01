@@ -333,11 +333,7 @@ pub fn verify_with_progress(
     verify_impl(par2, dir, progress.unwrap_or(&mut |_, _| {}))
 }
 
-fn verify_impl(
-    par2: &Par2File,
-    dir: &Path,
-    progress: &mut dyn FnMut(u64, u64),
-) -> VerifyReport {
+fn verify_impl(par2: &Par2File, dir: &Path, progress: &mut dyn FnMut(u64, u64)) -> VerifyReport {
     let mut candidates = gather_candidates(dir);
     let total: u64 = candidates.iter().map(|c| c.len).sum();
     let mut hashed: u64 = 0;
@@ -490,7 +486,12 @@ pub fn fast_rename_to_par2_names(par2: &Par2File, dir: &Path) -> Result<usize, P
             Some(d) => d,
             None => continue,
         };
-        let real = desc.filename.rsplit('/').next().unwrap_or(&desc.filename).to_string();
+        let real = desc
+            .filename
+            .rsplit('/')
+            .next()
+            .unwrap_or(&desc.filename)
+            .to_string();
         let real = real.trim().to_string();
         if real.is_empty() {
             continue;
@@ -505,9 +506,7 @@ pub fn fast_rename_to_par2_names(par2: &Par2File, dir: &Path) -> Result<usize, P
             if cand.md5_16k.is_none() {
                 // A file shorter than 16k still hashes fully for the
                 // first-16k comparison.
-                cand.md5_16k = std::fs::read(&cand.path)
-                    .ok()
-                    .map(|d| md5_16k(&d));
+                cand.md5_16k = std::fs::read(&cand.path).ok().map(|d| md5_16k(&d));
             }
             if cand.md5_16k == Some(desc.md5_16k) {
                 cand.used = true;
@@ -751,7 +750,6 @@ pub enum ParseError {
     Truncated(&'static str),
 }
 
-
 /// ===== GF(2^16) Reed-Solomon for PAR2 repair (Pillar 2a) =====
 ///
 /// PAR2 computes recovery data over the Galois field GF(2^16) with the
@@ -954,9 +952,16 @@ pub fn repair(par2: &Par2File, dir: &Path) -> Result<RepairReport, ParseError> {
     let need = bad.len() as u32;
     if par2.recovery_slices.len() < bad.len() {
         for &bj in &bad {
-            set_status(&mut report, &block_file[bj].1, RepairStatus::Unrepairable { repaired: 0, need });
+            set_status(
+                &mut report,
+                &block_file[bj].1,
+                RepairStatus::Unrepairable { repaired: 0, need },
+            );
         }
-        return Ok(RepairReport { files: report, total_slices_repaired: 0 });
+        return Ok(RepairReport {
+            files: report,
+            total_slices_repaired: 0,
+        });
     }
 
     // Select one recovery slice per missing column.
@@ -985,14 +990,25 @@ pub fn repair(par2: &Par2File, dir: &Path) -> Result<RepairReport, ParseError> {
             }
         }
         rhs.push(row);
-        mat.push(bad.iter().map(|&bj| gf.pow_logbase(logbases[bj], *e)).collect());
+        mat.push(
+            bad.iter()
+                .map(|&bj| gf.pow_logbase(logbases[bj], *e))
+                .collect(),
+        );
     }
 
     if !gauss_jordan(&gf, &mut mat, &mut rhs) {
         for &bj in &bad {
-            set_status(&mut report, &block_file[bj].1, RepairStatus::Unrepairable { repaired: 0, need });
+            set_status(
+                &mut report,
+                &block_file[bj].1,
+                RepairStatus::Unrepairable { repaired: 0, need },
+            );
         }
-        return Ok(RepairReport { files: report, total_slices_repaired: 0 });
+        return Ok(RepairReport {
+            files: report,
+            total_slices_repaired: 0,
+        });
     }
 
     // Recombine solved word slices into bytes and overlay them at their slice
@@ -1024,16 +1040,15 @@ pub fn repair(par2: &Par2File, dir: &Path) -> Result<RepairReport, ParseError> {
         total += slices.len() as u32;
     }
 
-    Ok(RepairReport { files: report, total_slices_repaired: total })
+    Ok(RepairReport {
+        files: report,
+        total_slices_repaired: total,
+    })
 }
 
 /// Basename for on-disk use (strip any PAR2 subdirectory component).
 fn par2_basename(name: &str) -> String {
-    name.rsplit('/')
-        .next()
-        .unwrap_or(name)
-        .trim()
-        .to_string()
+    name.rsplit('/').next().unwrap_or(name).trim().to_string()
 }
 
 fn set_status(report: &mut [(String, RepairStatus)], name: &str, st: RepairStatus) {
@@ -1214,8 +1229,14 @@ pub(crate) mod tests {
 
         let par2_data = build_par2_set(&[(original.as_slice(), filename)]);
         let par2 = parse_par2_bytes(&par2_data).unwrap();
-        assert!(par2.recovery_slices.len() >= 1, "must carry recovery slices");
-        assert!(par2.slice_checksums.contains_key(&par2.recovery_file_ids[0]));
+        assert!(
+            !par2.recovery_slices.is_empty(),
+            "must carry recovery slices"
+        );
+        assert!(
+            par2.slice_checksums
+                .contains_key(&par2.recovery_file_ids[0])
+        );
 
         let tmp = std::env::temp_dir().join(format!("turbonzb-par2-repair-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
@@ -1233,15 +1254,24 @@ pub(crate) mod tests {
 
         // Repair.
         let rep = repair(&par2, &tmp).unwrap();
-        assert!(rep.total_slices_repaired >= 1, "should reconstruct at least one slice");
+        assert!(
+            rep.total_slices_repaired >= 1,
+            "should reconstruct at least one slice"
+        );
         assert_eq!(
-            rep.files.iter().find(|(n, _)| n == filename).map(|(_, st)| st),
+            rep.files
+                .iter()
+                .find(|(n, _)| n == filename)
+                .map(|(_, st)| st),
             Some(&RepairStatus::Repaired)
         );
 
         // After repair the file must be intact and verify clean.
         let after_data = std::fs::read(tmp.join(filename)).unwrap();
-        assert_eq!(after_data, original, "file must be byte-for-byte original after repair");
+        assert_eq!(
+            after_data, original,
+            "file must be byte-for-byte original after repair"
+        );
         let after = verify(&par2, &tmp);
         assert_eq!(after.healthy, 1);
         assert_eq!(after.damaged, 0);
@@ -1263,7 +1293,10 @@ pub(crate) mod tests {
 
         let rep = repair(&par2, &tmp).unwrap();
         assert_eq!(
-            rep.files.iter().find(|(n, _)| n == filename).map(|(_, st)| st),
+            rep.files
+                .iter()
+                .find(|(n, _)| n == filename)
+                .map(|(_, st)| st),
             Some(&RepairStatus::Repaired)
         );
         let after_data = std::fs::read(tmp.join(filename)).unwrap();

@@ -141,7 +141,11 @@ impl QueueState {
                         self.job_details = files.clone();
                     }
                 }
-                BackendEvent::PostProcessProgress { job_id, done, total } => {
+                BackendEvent::PostProcessProgress {
+                    job_id,
+                    done,
+                    total,
+                } => {
                     self.pp_progress.insert(*job_id, (*done, *total));
                 }
                 BackendEvent::PostProcessStarted { job_id } => {
@@ -339,23 +343,22 @@ fn job_list_pane(
                         row.col(ui, |ui| {
                             // While verifying, show a real PAR2 progress bar.
                             if state.pp_in_progress.contains(&job.id) {
-                                let (done, total) = state
-                                    .pp_progress
-                                    .get(&job.id)
-                                    .copied()
-                                    .unwrap_or((0, 0));
+                                let (done, total) =
+                                    state.pp_progress.get(&job.id).copied().unwrap_or((0, 0));
                                 let p = if total > 0 {
                                     (done as f64 / total as f64).min(1.0) as f32
                                 } else {
                                     0.0
                                 };
-                                ui.add(
-                                    Win95ProgressBar::new(p).text(if total > 0 {
-                                        format!("Verifying… {} / {}", format_size(done), format_size(total))
-                                    } else {
-                                        "Verifying…".into()
-                                    }),
-                                );
+                                ui.add(Win95ProgressBar::new(p).text(if total > 0 {
+                                    format!(
+                                        "Verifying… {} / {}",
+                                        format_size(done),
+                                        format_size(total)
+                                    )
+                                } else {
+                                    "Verifying…".into()
+                                }));
                             } else if let Some(err) = &job.error {
                                 // Salient error state — red "Error" with the
                                 // reason on hover.

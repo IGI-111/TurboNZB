@@ -143,7 +143,10 @@ pub async fn post_process_with_progress(
                         verify_report = Some(re);
                     }
                     Ok(rep) => {
-                        warn!(repaired = rep.total_slices_repaired, "PAR2 repair produced no repair");
+                        warn!(
+                            repaired = rep.total_slices_repaired,
+                            "PAR2 repair produced no repair"
+                        );
                     }
                     Err(e) => {
                         warn!(error = %e, "PAR2 repair failed");

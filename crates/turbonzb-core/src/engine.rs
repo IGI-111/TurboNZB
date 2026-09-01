@@ -327,7 +327,9 @@ impl Engine {
 
         // Get all files with pending segments.
         let pending = queue.pending_segments(job_id).await?;
-        if let Ok((done, missing, pending_here, crc, failed)) = queue.segment_state_counts(job_id).await {
+        if let Ok((done, missing, pending_here, crc, failed)) =
+            queue.segment_state_counts(job_id).await
+        {
             tracing::info!(
                 pending = pending_here,
                 done,
@@ -539,12 +541,18 @@ impl Engine {
                 let _ = queue.refresh_job_counts(file.id).await;
             }
             log_perf_summary(
-            &stats, t0,
-            stats_articles_start, stats_bytes_start,
-            stats_conn_created_start, stats_conn_dropped_start,
-            &stats_fetch_buckets_start,
-        );
-            tracing::info!(job_id, "engine: cancelled — state persisted, finalize skipped");
+                &stats,
+                t0,
+                stats_articles_start,
+                stats_bytes_start,
+                stats_conn_created_start,
+                stats_conn_dropped_start,
+                &stats_fetch_buckets_start,
+            );
+            tracing::info!(
+                job_id,
+                "engine: cancelled — state persisted, finalize skipped"
+            );
             return Ok(());
         }
 
@@ -614,9 +622,12 @@ impl Engine {
         // Final perf summary (opt-in; only visible with
         // RUST_LOG=turbonzb_core=info).
         log_perf_summary(
-            &stats, t0,
-            stats_articles_start, stats_bytes_start,
-            stats_conn_created_start, stats_conn_dropped_start,
+            &stats,
+            t0,
+            stats_articles_start,
+            stats_bytes_start,
+            stats_conn_created_start,
+            stats_conn_dropped_start,
             &stats_fetch_buckets_start,
         );
 
@@ -763,7 +774,11 @@ impl Engine {
                                     );
                                 }
                             }
-                            (seg_state, seg.bytes, Some((decoded.begin, decoded.data.clone())))
+                            (
+                                seg_state,
+                                seg.bytes,
+                                Some((decoded.begin, decoded.data.clone())),
+                            )
                         } else {
                             (seg_state, seg.bytes, None)
                         }
@@ -796,7 +811,11 @@ impl Engine {
                         // the segment Done (that would record it as complete
                         // while its data is absent). Re-queue so it's
                         // re-decoded and re-written once a writer is healthy.
-                        tracing::warn!(file_id = file.id, offset, "file writer unavailable; requeuing segment");
+                        tracing::warn!(
+                            file_id = file.id,
+                            offset,
+                            "file writer unavailable; requeuing segment"
+                        );
                         requeue.push((*file_idx, seg.clone()));
                         continue;
                     }
@@ -911,7 +930,11 @@ impl ConnectionPool {
         }
         // Deque empty but we hold a slot — create a new connection. Paced
         // via connect_gate so we never burst dozens of handshakes at once.
-        let _connect_permit = self.connect_gate.acquire().await.expect("connect gate closed");
+        let _connect_permit = self
+            .connect_gate
+            .acquire()
+            .await
+            .expect("connect gate closed");
         {
             // Re-check the deque: another waiter may have returned a pooled
             // connection while we waited on the gate.
@@ -1071,10 +1094,7 @@ async fn open_writer_fd(path: &Path) -> std::io::Result<tokio::fs::File> {
         .await
 }
 
-async fn open_writer_file(
-    primary: &Path,
-    fallback: &Path,
-) -> Result<(PathBuf, tokio::fs::File)> {
+async fn open_writer_file(primary: &Path, fallback: &Path) -> Result<(PathBuf, tokio::fs::File)> {
     match open_writer_fd(primary).await {
         Ok(f) => Ok((primary.to_path_buf(), f)),
         Err(_) => match open_writer_fd(fallback).await {
@@ -1106,9 +1126,7 @@ async fn file_writer_task(
         file.seek(std::io::SeekFrom::Start(job.offset))
             .await
             .map_err(CoreError::from)?;
-        file.write_all(&job.data)
-            .await
-            .map_err(CoreError::from)?;
+        file.write_all(&job.data).await.map_err(CoreError::from)?;
         stats
             .write_us
             .fetch_add(t_write.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -1194,9 +1212,8 @@ async fn pipeline_fetch(
     stats: &PerfStats,
     cancel: Option<&Arc<AtomicBool>>,
 ) -> Vec<FetchOutcome> {
-    let cancelled = |cancel: Option<&Arc<AtomicBool>>| {
-        cancel.is_some_and(|c| c.load(Ordering::Relaxed))
-    };
+    let cancelled =
+        |cancel: Option<&Arc<AtomicBool>>| cancel.is_some_and(|c| c.load(Ordering::Relaxed));
     let mut results: Vec<FetchOutcome> = vec![FetchOutcome::Missing; items.len()];
     let mut unresolved: Vec<usize> = (0..items.len()).collect();
     let mut conn_error: Vec<bool> = vec![false; items.len()];
@@ -1465,7 +1482,9 @@ async fn finalize_file(
         .cloned()
         .unwrap_or_else(|| write_target_for(file.id, output_dir, &file.filename));
     if !tokio::fs::try_exists(&on_disk).await.unwrap_or(false) {
-        tokio::fs::write(&on_disk, []).await.map_err(CoreError::from)?;
+        tokio::fs::write(&on_disk, [])
+            .await
+            .map_err(CoreError::from)?;
     }
 
     // Count missing / CRC-mismatched segments from the DB (segment state),
@@ -1514,7 +1533,9 @@ async fn finalize_file(
                     // unique file name rather than failing the whole file.
                     dest = unique_path(output_dir, &base_name).await;
                 } else {
-                    tokio::fs::remove_file(&dest).await.map_err(CoreError::from)?;
+                    tokio::fs::remove_file(&dest)
+                        .await
+                        .map_err(CoreError::from)?;
                 }
             }
             if dest != on_disk {
@@ -1556,10 +1577,22 @@ fn log_perf_summary(
     start_conn_dropped: u64,
     start_fetch_buckets: &[u64; 5],
 ) {
-    let articles = stats.articles.load(Ordering::Relaxed).saturating_sub(start_articles);
-    let bytes = stats.bytes.load(Ordering::Relaxed).saturating_sub(start_bytes);
-    let conn_created = stats.conn_created.load(Ordering::Relaxed).saturating_sub(start_conn_created);
-    let conn_dropped = stats.conn_dropped.load(Ordering::Relaxed).saturating_sub(start_conn_dropped);
+    let articles = stats
+        .articles
+        .load(Ordering::Relaxed)
+        .saturating_sub(start_articles);
+    let bytes = stats
+        .bytes
+        .load(Ordering::Relaxed)
+        .saturating_sub(start_bytes);
+    let conn_created = stats
+        .conn_created
+        .load(Ordering::Relaxed)
+        .saturating_sub(start_conn_created);
+    let conn_dropped = stats
+        .conn_dropped
+        .load(Ordering::Relaxed)
+        .saturating_sub(start_conn_dropped);
     let wall = t0.elapsed().as_secs_f64();
     let mbps = if wall > 0.0 {
         bytes as f64 / 1024.0 / 1024.0 / wall
@@ -1585,11 +1618,26 @@ fn log_perf_summary(
         avg_write_us = avg(stats.write_us.load(Ordering::Relaxed)),
         conn_created,
         conn_dropped,
-        fetch_bucket_le20ms = stats.fetch_le_20ms.load(Ordering::Relaxed).saturating_sub(start_fetch_buckets[0]),
-        fetch_bucket_20_100ms = stats.fetch_le_100ms.load(Ordering::Relaxed).saturating_sub(start_fetch_buckets[1]),
-        fetch_bucket_100_500ms = stats.fetch_le_500ms.load(Ordering::Relaxed).saturating_sub(start_fetch_buckets[2]),
-        fetch_bucket_500_2000ms = stats.fetch_le_2000ms.load(Ordering::Relaxed).saturating_sub(start_fetch_buckets[3]),
-        fetch_bucket_gt2s = stats.fetch_gt_2000ms.load(Ordering::Relaxed).saturating_sub(start_fetch_buckets[4]),
+        fetch_bucket_le20ms = stats
+            .fetch_le_20ms
+            .load(Ordering::Relaxed)
+            .saturating_sub(start_fetch_buckets[0]),
+        fetch_bucket_20_100ms = stats
+            .fetch_le_100ms
+            .load(Ordering::Relaxed)
+            .saturating_sub(start_fetch_buckets[1]),
+        fetch_bucket_100_500ms = stats
+            .fetch_le_500ms
+            .load(Ordering::Relaxed)
+            .saturating_sub(start_fetch_buckets[2]),
+        fetch_bucket_500_2000ms = stats
+            .fetch_le_2000ms
+            .load(Ordering::Relaxed)
+            .saturating_sub(start_fetch_buckets[3]),
+        fetch_bucket_gt2s = stats
+            .fetch_gt_2000ms
+            .load(Ordering::Relaxed)
+            .saturating_sub(start_fetch_buckets[4]),
         "engine perf summary"
     );
 }

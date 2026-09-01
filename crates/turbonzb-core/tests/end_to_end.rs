@@ -40,9 +40,18 @@ fn yenc_article_part(payload: &[u8], name: &str, begin: u64, end: u64, total: u6
     out.extend_from_slice(b"\r\n");
     let crc_val = crc.finalize();
     // Multi-part posts carry pcrc32, single-part carries crc32.
-    let crc_kind = if begin != 1 || end != total { "pcrc32" } else { "crc32" };
+    let crc_kind = if begin != 1 || end != total {
+        "pcrc32"
+    } else {
+        "crc32"
+    };
     out.extend_from_slice(
-        format!("=yend size={} {crc_kind}={:08x}\r\n", payload.len(), crc_val).as_bytes(),
+        format!(
+            "=yend size={} {crc_kind}={:08x}\r\n",
+            payload.len(),
+            crc_val
+        )
+        .as_bytes(),
     );
     out
 }
@@ -456,12 +465,16 @@ async fn alphanumeric_obfuscated_file_named_after_release() {
 
     let (tx, mut rx) = mpsc::unbounded_channel();
     let q = Arc::clone(&queue);
-    let runner = tokio::spawn(async move { engine.run_job(q, job_id, tx).await });
+    let runner = tokio::spawn(async move { engine.run_job(q, job_id, tx).await.unwrap() });
     runner.await.unwrap();
     let events = collect_events(&mut rx).await;
     assert!(events.iter().any(|e| matches!(
         e,
-        ProgressEvent::FileCompleted { missing: 0, crc_mismatches: 0, .. }
+        ProgressEvent::FileCompleted {
+            missing: 0,
+            crc_mismatches: 0,
+            ..
+        }
     )));
 
     let expected = tmp.join(format!("{release}.mkv"));
@@ -472,7 +485,6 @@ async fn alphanumeric_obfuscated_file_named_after_release() {
         "raw obfuscated token must not remain as the file name"
     );
 }
-
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fully_obfuscated_file_named_after_release() {
@@ -578,13 +590,15 @@ async fn direct_write_survives_directory_name_collision() {
 
     let (tx, mut rx) = mpsc::unbounded_channel();
     let q = Arc::clone(&queue);
-    let runner = tokio::spawn(async move { engine.run_job(q, job_id, tx).await });
+    let runner = tokio::spawn(async move { engine.run_job(q, job_id, tx).await.unwrap() });
 
     runner.await.unwrap();
 
     let events = collect_events(&mut rx).await;
     assert!(
-        events.iter().any(|e| matches!(e, ProgressEvent::FileCompleted { .. })),
+        events
+            .iter()
+            .any(|e| matches!(e, ProgressEvent::FileCompleted { .. })),
         "file must still complete even with a directory-name collision"
     );
 
@@ -665,8 +679,14 @@ async fn pause_persists_completed_and_resume_skips_them() {
 
     let files = queue.list_files(job_id).await.unwrap();
     let segs = queue.list_segments(files[0].id).await.unwrap();
-    let done_after_pause = segs.iter().filter(|s| s.state == SegmentState::Done).count();
-    assert!(done_after_pause >= 1, "pause run must persist at least 1 completed segment");
+    let done_after_pause = segs
+        .iter()
+        .filter(|s| s.state == SegmentState::Done)
+        .count();
+    assert!(
+        done_after_pause >= 1,
+        "pause run must persist at least 1 completed segment"
+    );
 
     // The job's aggregate counters must be refreshed on pause so the queued
     // job shows real progress (not 0) in the queue list.
@@ -764,7 +784,10 @@ async fn heavy_pause_resume_does_not_full_redownload() {
 
     let files = queue.list_files(job_id).await.unwrap();
     let segs = queue.list_segments(files[0].id).await.unwrap();
-    let done_after_pause = segs.iter().filter(|s| s.state == SegmentState::Done).count();
+    let done_after_pause = segs
+        .iter()
+        .filter(|s| s.state == SegmentState::Done)
+        .count();
     assert!(done_after_pause >= 3);
 
     queue.set_job_state(job_id, JobState::Queued).await.unwrap();

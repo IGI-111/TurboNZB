@@ -1022,10 +1022,7 @@ impl QueueManager {
 
     /// Count segments per state for a job (resume diagnostics). Returns
     /// (done, missing, pending, crc_mismatch, failed).
-    pub async fn segment_state_counts(
-        &self,
-        job_id: i64,
-    ) -> Result<(u64, u64, u64, u64, u64)> {
+    pub async fn segment_state_counts(&self, job_id: i64) -> Result<(u64, u64, u64, u64, u64)> {
         let row = sqlx::query(
             r#"SELECT
                    COUNT(*) FILTER (WHERE s.state='done') AS done,

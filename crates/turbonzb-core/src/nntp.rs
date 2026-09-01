@@ -531,7 +531,10 @@ mod tests {
                         // A dot-stuffed yEnc article: payload byte 4 encodes
                         // to '.' which is doubled on the wire as '..'.
                         writer.write_all(b"222 body follows\r\n").await.unwrap();
-                        writer.write_all(b"=ybegin size=1 name=t\r\n").await.unwrap();
+                        writer
+                            .write_all(b"=ybegin size=1 name=t\r\n")
+                            .await
+                            .unwrap();
                         writer.write_all(b"..\r\n").await.unwrap();
                         writer.write_all(b"=yend size=1\r\n").await.unwrap();
                         writer.write_all(b".\r\n").await.unwrap();

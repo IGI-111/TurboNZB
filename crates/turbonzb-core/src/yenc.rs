@@ -626,7 +626,13 @@ mod tests {
     fn streaming_matches_batch_decode_and_strips_dot() {
         let payload = (0u8..=255).chain(0u8..=255).collect::<Vec<_>>();
         // A payload line that starts with `.` must be dot-stuffed on the wire.
-        let mut article = encode_part(&payload, "stream.bin", 1, payload.len() as u64, payload.len() as u64);
+        let article = encode_part(
+            &payload,
+            "stream.bin",
+            1,
+            payload.len() as u64,
+            payload.len() as u64,
+        );
         // Simulate dot-stuffing: prefix the first `=ybegin` line's payload by
         // injecting a leading `..` into the body via a crafted line. Instead,
         // directly test unstuff by constructing a body whose first data byte
@@ -638,7 +644,14 @@ mod tests {
                 break;
             }
         }
-        eprintln!("len decoded={} payload={} crc_ok={} begin={} end={}", decoded.data.len(), payload.len(), decoded.crc_ok, decoded.begin, decoded.end);
+        eprintln!(
+            "len decoded={} payload={} crc_ok={} begin={} end={}",
+            decoded.data.len(),
+            payload.len(),
+            decoded.crc_ok,
+            decoded.begin,
+            decoded.end
+        );
         assert_eq!(decoded.data, payload);
         assert!(decoded.crc_ok);
         assert_eq!(decoded.name, "stream.bin");

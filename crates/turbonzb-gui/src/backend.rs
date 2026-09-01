@@ -29,7 +29,8 @@ use turbonzb_core::engine::{Engine, ProgressEvent};
 use turbonzb_core::nntp::ServerConfig;
 use turbonzb_core::nzb;
 use turbonzb_core::postprocess::{
-    PostProcessConfig, PostProcessReport, PostProcessStatus, post_process, post_process_with_progress,
+    PostProcessConfig, PostProcessReport, PostProcessStatus, post_process,
+    post_process_with_progress,
 };
 use turbonzb_core::queue::{JobState, QueueJob, QueueManager};
 use turbonzb_index::types::{IndexerConfig, SearchQuery};
