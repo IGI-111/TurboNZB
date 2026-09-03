@@ -14,6 +14,9 @@ use tokio_rustls::TlsConnector;
 use crate::error::{CoreError, Result};
 use crate::yenc;
 
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Configuration for a single NNTP server.
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -71,17 +74,56 @@ enum Transport {
 }
 
 impl Transport {
+    /// Bound every transport operation. A NAT box or server that wedges a
+    /// connection mid-article would otherwise park the read forever —
+    /// with N workers this stalls the whole job with no error. On
+    /// timeout the io error propagates, the caller drops the connection
+    /// and requeues the segment.
     async fn read_until(&mut self, byte: u8, buf: &mut Vec<u8>) -> std::io::Result<usize> {
+        const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+        let timed_out = |_scope| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "NNTP read timed out (connection wedged?)",
+            )
+        };
         match self {
-            Transport::Plain(r) => r.read_until(byte, buf).await,
-            Transport::Tls(r) => r.read_until(byte, buf).await,
+            Transport::Plain(r) => {
+                match tokio::time::timeout(READ_TIMEOUT, r.read_until(byte, buf)).await {
+                    Ok(result) => result,
+                    Err(_) => Err(timed_out(())),
+                }
+            }
+            Transport::Tls(r) => {
+                match tokio::time::timeout(READ_TIMEOUT, r.read_until(byte, buf)).await {
+                    Ok(result) => result,
+                    Err(_) => Err(timed_out(())),
+                }
+            }
         }
     }
 
     async fn write_all(&mut self, data: &[u8]) -> std::io::Result<()> {
+        const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+        let timed_out = |_scope| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "NNTP write timed out (connection wedged?)",
+            )
+        };
         match self {
-            Transport::Plain(r) => r.get_mut().write_all(data).await,
-            Transport::Tls(r) => r.get_mut().write_all(data).await,
+            Transport::Plain(r) => {
+                match tokio::time::timeout(WRITE_TIMEOUT, r.get_mut().write_all(data)).await {
+                    Ok(result) => result,
+                    Err(_) => Err(timed_out(())),
+                }
+            }
+            Transport::Tls(r) => {
+                match tokio::time::timeout(WRITE_TIMEOUT, r.get_mut().write_all(data)).await {
+                    Ok(result) => result,
+                    Err(_) => Err(timed_out(())),
+                }
+            }
         }
     }
 
@@ -132,9 +174,18 @@ impl NntpClient {
     /// Open a new connection to `cfg` and perform the greeting + AUTHINFO
     /// handshake.
     pub async fn connect(cfg: &ServerConfig) -> Result<Self> {
-        let stream = TcpStream::connect((cfg.host.as_str(), cfg.port))
-            .await
-            .map_err(|e| CoreError::NntpConnect(format!("{}: {e}", cfg.host)))?;
+        let connect = TcpStream::connect((cfg.host.as_str(), cfg.port));
+        let stream = match tokio::time::timeout(CONNECT_TIMEOUT, connect).await {
+            Ok(result) => {
+                result.map_err(|e| CoreError::NntpConnect(format!("{}: {e}", cfg.host)))?
+            }
+            Err(_) => {
+                return Err(CoreError::NntpConnect(format!(
+                    "{}: connect timed out",
+                    cfg.host
+                )));
+            }
+        };
         // Disable Nagle's algorithm — NNTP is request/response and each
         // command is small. Without TCP_NODELAY, the OS buffers the tiny
         // `BODY <id>\r\n` command behind Nagle, adding up to 40ms latency
@@ -151,10 +202,15 @@ impl NntpClient {
             let connector = build_tls_connector()?;
             let server_name = ServerName::try_from(cfg.host.clone())
                 .map_err(|e| CoreError::NntpConnect(format!("bad host: {e}")))?;
-            let tls_stream = connector
-                .connect(server_name, stream)
-                .await
-                .map_err(|e| CoreError::NntpConnect(format!("TLS: {e}")))?;
+            let handshake = connector.connect(server_name, stream);
+            let tls_stream = match tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake).await {
+                Ok(result) => result.map_err(|e| CoreError::NntpConnect(format!("TLS: {e}")))?,
+                Err(_) => {
+                    return Err(CoreError::NntpConnect(
+                        "TLS handshake timed out".to_string(),
+                    ));
+                }
+            };
             Transport::Tls(Box::new(BufReader::with_capacity(READ_BUF, tls_stream)))
         } else {
             Transport::Plain(BufReader::with_capacity(READ_BUF, stream))
@@ -486,6 +542,31 @@ impl rustls::client::danger::ServerCertVerifier for NoVerify {
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test(start_paused = true)]
+    async fn silent_server_times_out_instead_of_hanging() {
+        // A server that accepts but never sends anything used to park the
+        // greeting read forever (wedged NAT/server at scale = whole job
+        // stalled with no error). Now it must fail fast with a timeout.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            // Accept and deliberately never respond.
+            let (_socket, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let mut cfg = ServerConfig::localhost();
+        cfg.port = addr.port();
+        let start = tokio::time::Instant::now();
+        let err = NntpClient::connect(&cfg).await.expect_err("must time out");
+        assert!(
+            err.to_string().to_lowercase().contains("timed out"),
+            "got: {err}"
+        );
+        assert!(start.elapsed() >= std::time::Duration::from_secs(120));
+    }
+
     use super::*;
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
