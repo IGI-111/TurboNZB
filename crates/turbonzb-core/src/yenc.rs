@@ -114,21 +114,13 @@ impl Decoder {
             self.line_size = param(params, "line")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0);
-            // A corrupt (or hostile) `size=` must not become a giant
-            // allocation: Rust aborts the whole process on failed alloc,
-            // bypassing every panic hook — one bad article killed the
-            // engine mid-download. Treat absurd sizes as corruption
-            // (the engine retries/marks the segment, PAR2 can repair),
-            // and cap the pre-allocation to something article-shaped.
-            const MAX_ARTICLE_BYTES: u64 = 128 * 1024 * 1024;
+            // `size=` is the size of the whole FILE, not this article —
+            // a 54 GB file legitimately carries it in every article, so it
+            // must never be rejected and must never drive an allocation
+            // (the old with_capacity(size) tried to reserve tens of GB and
+            // Rust aborted the process on failure — no panic hook, no log).
+            // Pre-allocate something article-shaped and let it grow.
             const PREALLOC_CAP: usize = 2 * 1024 * 1024;
-            if self.total_size > MAX_ARTICLE_BYTES {
-                return Err(CoreError::Yenc(
-                    "implausible article size (corrupt =ybegin header)".into(),
-                ));
-            }
-            // Pre-size the output buffer to the declared size so the payload
-            // decode has no reallocations (single-copy path).
             let cap = if self.total_size > 0 {
                 (self.total_size as usize).min(PREALLOC_CAP)
             } else {
@@ -247,15 +239,6 @@ pub fn decode_article(input: &[u8]) -> Result<DecodedPart> {
     let line_size: usize = param(ybegin_str, "line")
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
-    // Corrupt articles carry garbage sizes; reject the absurd ones as
-    // corruption instead of propagating nonsense downstream (offsets,
-    // pre-allocations).
-    const MAX_ARTICLE_BYTES: u64 = 128 * 1024 * 1024;
-    if total_size > MAX_ARTICLE_BYTES {
-        return Err(CoreError::Yenc(
-            "implausible article size (corrupt =ybegin header)".into(),
-        ));
-    }
 
     let (begin, end) = if let Some(p) = ypart_str {
         let b: u64 = param(p, "begin").and_then(|s| s.parse().ok()).unwrap_or(1);
@@ -505,24 +488,41 @@ fn parse_hex_u32(s: &str) -> Option<u32> {
 mod tests {
 
     #[test]
-    fn absurd_ybegin_size_is_rejected_not_allocated() {
-        // One corrupt article in the wild carried size=58358840436 — the
-        // old code with_capacity'd it, the allocation failed, and Rust
-        // aborted the entire engine process mid-download (no panic hook,
-        // no logs — it looked like a mystery hang). Now: Yenc error.
-        let body = b"=ybegin line=128 size=58358840436 name=x\r\n=ypart begin=1 end=58358840436\r\n..\r\n=yend size=58358840436 crc32=deadbeef\r\n";
-        let err = decode_article(body).expect_err("must reject absurd size");
-        assert!(
-            err.to_string().contains("implausible article size"),
-            "got: {err}"
-        );
-    }
+    fn huge_file_size_header_decodes_without_huge_allocation() {
+        // A 54 GB file legitimately carries size=58358840436 in EVERY one
+        // of its ~100,000 articles (yEnc: size= means FILE size, not
+        // article size). The old code fed it to Vec::with_capacity —
+        // tens of GB requested per article; under strict overcommit the
+        // alloc failed and Rust aborted the engine process instantly, no
+        // panic hook, no log — the "dies at the same point every time"
+        // mystery. It must just decode, with a small pre-alloc.
+        const LEGIT_FILE_SIZE: u64 = 58_358_840_436;
+        let payload: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+        let article = encode_part(&payload, "movie.mkv", 3_000_001, 3_004_096, LEGIT_FILE_SIZE);
+        let decoded = decode_article(&article).expect("legit big-file article must decode");
+        assert_eq!(decoded.data, payload);
+        assert_eq!(decoded.begin, 3_000_001);
+        assert_eq!(decoded.end, 3_004_096);
+        assert_eq!(decoded.total_size, LEGIT_FILE_SIZE);
+        assert!(decoded.crc_ok);
 
-    #[test]
-    fn streaming_decoder_rejects_absurd_ybegin_size() {
+        // Same through the streaming decoder (the actual download path) —
+        // split raw bytes; the encoded payload is not UTF-8.
         let mut dec = Decoder::new();
-        let res = dec.push_line(b"=ybegin line=128 size=58358840436 name=x");
-        assert!(res.is_err(), "streaming decoder must reject absurd size");
+        for chunk in article.split(|b| *b == b'\n') {
+            let line = chunk.strip_suffix(b"\r").unwrap_or(chunk);
+            if line.is_empty() {
+                continue;
+            }
+            dec.push_line(line).expect("push_line");
+        }
+        let part = dec.finish().expect("streaming finish");
+        assert_eq!(part.data, payload);
+        assert_eq!(part.begin, 3_000_001);
+        assert_eq!(part.end, 3_004_096);
+        // The out buffer must have the article-sized payload, never the
+        // FILE-sized reservation that aborted the process.
+        assert!(part.data.capacity() < LEGIT_FILE_SIZE as usize / 10);
     }
 
     #[test]
