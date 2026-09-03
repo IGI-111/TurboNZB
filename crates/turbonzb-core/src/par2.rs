@@ -182,7 +182,13 @@ fn parse_packets(
 
         let packet_len = u64::from_le_bytes(data[pos + 8..pos + 16].try_into().unwrap()) as usize;
 
-        if packet_len < 64 || pos + packet_len > data.len() {
+        // Checked arithmetic: a corrupt length field near usize::MAX must
+        // not overflow the `pos + packet_len` bounds test.
+        if packet_len < 64
+            || pos
+                .checked_add(packet_len)
+                .is_none_or(|end| end > data.len())
+        {
             // Damaged packet — skip forward past the magic.
             pos += 8;
             continue;
@@ -435,15 +441,12 @@ fn match_file(
         if cand.len != desc.length {
             continue;
         }
-        // Read (once) and hash this candidate.
+        // Hash this candidate — streamed, never reading the whole file
+        // into memory (releases can be tens of GB).
         if cand.full_md5.is_none() {
-            if let Ok(data) = std::fs::read(&cand.path) {
-                cand.full_md5 = Some(md5_full(&data));
-                cand.md5_16k = if data.len() >= 16 * 1024 {
-                    Some(md5_16k(&data))
-                } else {
-                    None
-                };
+            if let Some(full) = md5_full_of_path(&cand.path) {
+                cand.full_md5 = Some(full);
+                cand.md5_16k = md5_16k_of_path(&cand.path);
             }
             on_hash(cand.len);
         }
@@ -456,7 +459,7 @@ fn match_file(
             return (VerifyStatus::Ok, Some(cand.path.clone()));
         }
         // Damaged: same length and leading data, but full MD5 differs.
-        if cand.md5_16k == Some(desc.md5_16k) {
+        if cand.md5_16k.is_some_and(|m| m == desc.md5_16k) {
             cand.used = true;
             return (VerifyStatus::Damaged, Some(cand.path.clone()));
         }
@@ -504,9 +507,9 @@ pub fn fast_rename_to_par2_names(par2: &Par2File, dir: &Path) -> Result<usize, P
                 continue;
             }
             if cand.md5_16k.is_none() {
-                // A file shorter than 16k still hashes fully for the
-                // first-16k comparison.
-                cand.md5_16k = std::fs::read(&cand.path).ok().map(|d| md5_16k(&d));
+                // Streams at most 16 kB; short files hash fully, same
+                // semantics without reading the whole file into memory.
+                cand.md5_16k = md5_head_of_path(&cand.path);
             }
             if cand.md5_16k == Some(desc.md5_16k) {
                 cand.used = true;
@@ -565,6 +568,65 @@ fn md5_full(data: &[u8]) -> [u8; 16] {
     let mut hasher = Md5::new();
     hasher.update(data);
     hasher.finalize().into()
+}
+
+/// MD5 of the first 16 kB of the file at `path`, read from disk without
+/// loading the whole file. `None` if the file is shorter than 16 kB or
+/// unreadable (matching the old in-memory semantics).
+fn md5_16k_of_path(path: &Path) -> Option<[u8; 16]> {
+    use std::io::Read as _;
+
+    const SIXTEEN_K: usize = 16 * 1024;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut head = vec![0u8; SIXTEEN_K];
+    let mut filled = 0;
+    while filled < SIXTEEN_K {
+        let n = file.read(&mut head[filled..]).ok()?;
+        if n == 0 {
+            return None; // shorter than 16 kB
+        }
+        filled += n;
+    }
+    Some(md5_16k(&head))
+}
+
+/// MD5 of the first up-to-16 kB of the file — a streaming version of
+/// `md5_16k(&fs::read(path))` that preserves short-file semantics
+/// (hashes whatever is there). `None` on any read failure.
+fn md5_head_of_path(path: &Path) -> Option<[u8; 16]> {
+    use std::io::Read as _;
+
+    const SIXTEEN_K: usize = 16 * 1024;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut head = vec![0u8; SIXTEEN_K];
+    let mut filled = 0;
+    while filled < SIXTEEN_K {
+        let n = file.read(&mut head[filled..]).ok()?;
+        if n == 0 {
+            break;
+        }
+        filled += n;
+    }
+    Some(md5_16k(&head[..filled]))
+}
+
+/// Full-file MD5, streamed in 1 MiB chunks — never holds the file in
+/// memory. `None` on any read failure.
+fn md5_full_of_path(path: &Path) -> Option<[u8; 16]> {
+    use std::io::Read as _;
+
+    const CHUNK: usize = 1024 * 1024;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut hasher = Md5::new();
+    let mut buf = vec![0u8; CHUNK];
+    loop {
+        let n = file.read(&mut buf).ok()?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Some(hasher.finalize().into())
 }
 
 /// Write a single PAR2 packet with correct MD5 and padding.
@@ -846,14 +908,6 @@ fn words_to_bytes(words: &[u16]) -> Vec<u8> {
 }
 
 /// A single input block (slice) of the recovery set.
-struct Block {
-    slice_index: usize,
-    /// Data as little-endian GF(2^16) words (zero-padded to slice size).
-    data: Vec<u16>,
-    good: bool,
-    file_len: usize,
-}
-
 /// Per-file repair outcome.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RepairStatus {
@@ -874,9 +928,6 @@ pub struct RepairReport {
     pub total_slices_repaired: u32,
 }
 
-/// (basename, file length) -> reconstructed slices, for the write-back pass.
-type SliceMap = std::collections::BTreeMap<(String, usize), Vec<(usize, Vec<u8>)>>;
-
 /// Repair damaged/missing files in `dir` using the PAR2 recovery set.
 ///
 /// Slices whose per-slice checksum (IFSC) doesn't match on disk (or whose
@@ -885,50 +936,88 @@ type SliceMap = std::collections::BTreeMap<(String, usize), Vec<(usize, Vec<u8>)
 /// their slice offsets — filling the sparse holes the direct-write engine
 /// leaves for missing segments (Pillar 3 integration).
 pub fn repair(par2: &Par2File, dir: &Path) -> Result<RepairReport, ParseError> {
+    use std::io::{Read as _, Seek, SeekFrom, Write as _};
+
+    const MAX_SLICE_SIZE: u64 = 64 * 1024 * 1024;
     let gf = Gf16::new();
-    let slice_size = par2.slice_size.max(1) as usize;
+    let slice_size = par2.slice_size.max(1);
+    if slice_size > MAX_SLICE_SIZE {
+        // A corrupt main packet can claim an absurd slice size; refuse
+        // instead of attempting a giant allocation.
+        return Err(ParseError::Truncated("implausible slice size"));
+    }
+    let slice_size = slice_size as usize;
     if par2.recovery_slices.is_empty() {
         return Ok(RepairReport::default());
     }
 
-    // Build the ordered input-block list and read on-disk content.
-    let mut blocks: Vec<Block> = Vec::new();
-    // (fi, on-disk-name) for each global input block.
-    let mut block_file: Vec<(usize, String)> = Vec::new();
+    // Inventory pass: which (file, slice) blocks are good? Bounded memory:
+    // one slice buffer, never whole files. Blocks are identified by
+    // index; slice data is re-read on demand during the solve.
+    struct BlockInfo {
+        file_index: usize,
+        slice_index: usize,
+        good: bool,
+        file_len: u64,
+    }
+    let mut blocks: Vec<BlockInfo> = Vec::new();
     let mut names: Vec<String> = Vec::new();
+    // Open files once for repeated slice reads.
+    let mut open_files: Vec<Option<std::fs::File>> = Vec::new();
 
     for (fi, file_id) in par2.recovery_file_ids.iter().enumerate() {
         let Some(desc) = par2.file_descriptions.get(file_id) else {
             continue;
         };
         let name = par2_basename(&desc.filename);
-        if names.len() <= fi {
-            names.resize(fi + 1, String::new());
+        while names.len() <= fi {
+            names.push(String::new());
+            open_files.push(None);
         }
         names[fi] = name.clone();
 
         let slice_count = desc.length.div_ceil(slice_size as u64) as usize;
-        let on_disk = std::fs::read(dir.join(&name)).ok();
+        let file = std::fs::File::open(dir.join(&name)).ok();
+        open_files[fi] = file;
         let ifsc = par2.slice_checksums.get(file_id).cloned();
+        let mut buf = vec![0u8; slice_size];
         for s in 0..slice_count {
-            let start = s * slice_size;
-            let mut slice = vec![0u8; slice_size];
-            let mut good = false;
-            if let Some(content) = &on_disk {
-                let take = content.len().saturating_sub(start).min(slice_size);
-                slice[..take].copy_from_slice(&content[start..start + take]);
-                good = ifsc
-                    .as_ref()
-                    .map(|v| slice_matches(v, s, &slice))
-                    .unwrap_or(true);
-            }
-            blocks.push(Block {
+            let good = match open_files[fi].as_mut() {
+                Some(file) => {
+                    let start = (s as u64) * slice_size as u64;
+                    if file.seek(SeekFrom::Start(start)).is_err() {
+                        false
+                    } else {
+                        buf.fill(0);
+                        let mut filled = 0;
+                        let mut broken = false;
+                        while filled < slice_size {
+                            match file.read(&mut buf[filled..]) {
+                                Ok(0) => break,
+                                Ok(n) => filled += n,
+                                Err(_) => {
+                                    broken = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if broken {
+                            false
+                        } else {
+                            ifsc.as_ref()
+                                .map(|v| slice_matches(v, s, &buf))
+                                .unwrap_or(true)
+                        }
+                    }
+                }
+                None => false,
+            };
+            blocks.push(BlockInfo {
+                file_index: fi,
                 slice_index: s,
-                data: bytes_to_words(&slice),
                 good,
-                file_len: desc.length as usize,
+                file_len: desc.length,
             });
-            block_file.push((fi, name.clone()));
         }
     }
 
@@ -954,7 +1043,7 @@ pub fn repair(par2: &Par2File, dir: &Path) -> Result<RepairReport, ParseError> {
         for &bj in &bad {
             set_status(
                 &mut report,
-                &block_file[bj].1,
+                &names[blocks[bj].file_index],
                 RepairStatus::Unrepairable { repaired: 0, need },
             );
         }
@@ -972,10 +1061,34 @@ pub fn repair(par2: &Par2File, dir: &Path) -> Result<RepairReport, ParseError> {
         .map(|r| (r.exponent, &r.data))
         .collect();
 
+    // Read one slice from a good block on demand (bounded memory).
+    let mut slice_buf = vec![0u8; slice_size];
+    let mut read_block_words = |block: &BlockInfo, out: &mut Vec<u16>| -> bool {
+        let Some(file) = open_files[block.file_index].as_mut() else {
+            return false;
+        };
+        let start = (block.slice_index as u64) * slice_size as u64;
+        if file.seek(SeekFrom::Start(start)).is_err() {
+            return false;
+        }
+        slice_buf.fill(0);
+        let mut filled = 0;
+        while filled < slice_size {
+            match file.read(&mut slice_buf[filled..]) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(_) => return false,
+            }
+        }
+        *out = bytes_to_words(&slice_buf);
+        true
+    };
+
     // For each selected recovery slice: R'_e = R_e XOR (sum over good
     // blocks g of good_g * base_g^e). Leaves only the bad-blocks' terms.
     let mut mat: Vec<Vec<u16>> = Vec::with_capacity(bad.len());
     let mut rhs: Vec<Vec<u16>> = Vec::with_capacity(bad.len());
+    let mut block_words: Vec<u16> = Vec::new();
     for (e, rdata) in &used {
         let mut row = bytes_to_words(rdata);
         for (i, b) in blocks.iter().enumerate() {
@@ -984,8 +1097,10 @@ pub fn repair(par2: &Par2File, dir: &Path) -> Result<RepairReport, ParseError> {
                 if coeff == 0 {
                     continue;
                 }
-                for (x, d) in row.iter_mut().zip(b.data.iter()) {
-                    *x ^= gf.mul(*d, coeff);
+                if read_block_words(b, &mut block_words) {
+                    for (x, d) in row.iter_mut().zip(block_words.iter()) {
+                        *x ^= gf.mul(*d, coeff);
+                    }
                 }
             }
         }
@@ -1001,7 +1116,7 @@ pub fn repair(par2: &Par2File, dir: &Path) -> Result<RepairReport, ParseError> {
         for &bj in &bad {
             set_status(
                 &mut report,
-                &block_file[bj].1,
+                &names[blocks[bj].file_index],
                 RepairStatus::Unrepairable { repaired: 0, need },
             );
         }
@@ -1011,33 +1126,52 @@ pub fn repair(par2: &Par2File, dir: &Path) -> Result<RepairReport, ParseError> {
         });
     }
 
-    // Recombine solved word slices into bytes and overlay them at their slice
-    // offsets (filling sparse holes left by missing segments).
-    let mut by_file: SliceMap = std::collections::BTreeMap::new();
+    // Write solved slices back at their offsets. Existing files keep
+    // their content outside repaired slices; missing files are created
+    // sparsely and grown to the recorded length.
+    struct SliceWrite {
+        slice_index: usize,
+        data: Vec<u8>,
+    }
+    let mut by_file: std::collections::BTreeMap<(String, u64), Vec<SliceWrite>> =
+        std::collections::BTreeMap::new();
     for (c, &bj) in bad.iter().enumerate() {
-        let (name, file_len) = (block_file[bj].1.clone(), blocks[bj].file_len);
+        let b = &blocks[bj];
         by_file
-            .entry((name, file_len))
+            .entry((names[b.file_index].clone(), b.file_len))
             .or_default()
-            .push((blocks[bj].slice_index, words_to_bytes(&rhs[c])));
+            .push(SliceWrite {
+                slice_index: b.slice_index,
+                data: words_to_bytes(&rhs[c]),
+            });
     }
 
     let mut total = 0u32;
-    for ((name, file_len), slices) in by_file {
+    for ((name, file_len), writes) in by_file {
         let path = dir.join(&name);
-        let mut content = std::fs::read(&path).unwrap_or_else(|_| vec![0u8; file_len]);
-        if content.len() < file_len {
-            content.resize(file_len, 0);
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(ParseError::Io)?;
+        for w in &writes {
+            let start = (w.slice_index as u64) * slice_size as u64;
+            file.seek(SeekFrom::Start(start)).map_err(ParseError::Io)?;
+            let n = file_len
+                .saturating_sub(start)
+                .min(slice_size as u64)
+                .min(w.data.len() as u64) as usize;
+            file.write_all(&w.data[..n]).map_err(ParseError::Io)?;
         }
-        for (s, data) in &slices {
-            let start = s * slice_size;
-            let n = file_len.saturating_sub(start).min(slice_size);
-            let take = n.min(slice_size.min(data.len()));
-            content[start..start + take].copy_from_slice(&data[..take]);
+        // Grow to the recorded length (sparse holes for unrepaired
+        // regions of missing files).
+        if file.metadata().map_err(ParseError::Io)?.len() < file_len {
+            file.set_len(file_len).map_err(ParseError::Io)?;
         }
-        std::fs::write(&path, &content).map_err(ParseError::Io)?;
         set_status(&mut report, &name, RepairStatus::Repaired);
-        total += slices.len() as u32;
+        total += writes.len() as u32;
     }
 
     Ok(RepairReport {
@@ -1217,6 +1351,53 @@ pub(crate) mod tests {
         assert_eq!(report.healthy, 0);
         assert_eq!(report.files[0].1, VerifyStatus::Damaged);
 
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn parser_never_panics_on_truncated_data() {
+        // Scene PAR2 sets are routinely truncated mid-transfer. The parser
+        // must return Ok/Err, never panic — a panic kills the whole engine
+        // process (post-processing runs in-process).
+        let valid = build_par2_set(&[(b"hello world, this is recovery data", "a.bin")]);
+        for cut in (0..valid.len()).step_by(7) {
+            let _ = parse_par2_bytes(&valid[..cut]); // must not panic
+        }
+        for cut in [0, 1, 7, 8, 15, 16, 31, 32, 47, 48, 63, 64, 65, 100] {
+            if cut < valid.len() {
+                let _ = parse_par2_bytes(&valid[..cut]);
+            }
+        }
+        let _ = parse_par2_bytes(b"");
+        let _ = parse_par2_bytes(b"PAR2\0PKT");
+        let _ = parse_par2_bytes(b"PAR2\0PKTgarbage");
+    }
+
+    #[test]
+    fn parser_never_panics_on_corrupted_headers() {
+        let valid = build_par2_set(&[(b"hello world, this is recovery data", "a.bin")]);
+        // Flip every byte in the first 600 (header + first packets).
+        for i in 0..valid.len().min(600) {
+            let mut data = valid.clone();
+            data[i] ^= 0xff;
+            let _ = parse_par2_bytes(&data); // must not panic
+        }
+    }
+
+    #[test]
+    fn repair_refuses_implausible_slice_size() {
+        let par2 = Par2File {
+            slice_size: u32::MAX as u64, // corrupt main packet
+            recovery_slices: vec![RecoverySlice {
+                exponent: 0,
+                data: vec![0u8; 16],
+            }],
+            ..Default::default()
+        };
+        let tmp = std::env::temp_dir().join(format!("turbonzb-par2-sanity-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let result = repair(&par2, &tmp);
+        assert!(result.is_err(), "implausible slice size must be refused");
         std::fs::remove_dir_all(&tmp).unwrap();
     }
 
