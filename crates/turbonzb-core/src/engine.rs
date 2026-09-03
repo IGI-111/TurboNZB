@@ -794,6 +794,23 @@ impl Engine {
                 // dedicated writer task, which pwrite's them at their
                 // offset into the single output file (Pillar 3).
                 if let Some((begin, data)) = write_data {
+                    // =ypart begin= is header-derived; a corrupt header
+                    // with a huge begin would seek a sparse write far
+                    // beyond the file. Bound it to 2^48 (256 TB of
+                    // positional offset is still nonsense for a release
+                    // file, but the yenc layer already rejects absurd
+                    // ranges — this is defense in depth).
+                    const MAX_WRITE_OFFSET: u64 = 1 << 48;
+                    if begin > MAX_WRITE_OFFSET {
+                        tracing::warn!(begin, "implausible write offset — dropping segment");
+                        let _ = state_tx.send((file.id, seg.number, SegmentState::CrcMismatch));
+                        let _ = tx.send(ProgressEvent::ArticleError {
+                            filename: file.filename.clone(),
+                            segment: seg.number,
+                            error: "implausible write offset (corrupt article header)".into(),
+                        });
+                        continue;
+                    }
                     let offset = begin.saturating_sub(1);
                     if !send_to_file_writer(
                         writers,

@@ -114,10 +114,23 @@ impl Decoder {
             self.line_size = param(params, "line")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0);
+            // A corrupt (or hostile) `size=` must not become a giant
+            // allocation: Rust aborts the whole process on failed alloc,
+            // bypassing every panic hook — one bad article killed the
+            // engine mid-download. Treat absurd sizes as corruption
+            // (the engine retries/marks the segment, PAR2 can repair),
+            // and cap the pre-allocation to something article-shaped.
+            const MAX_ARTICLE_BYTES: u64 = 128 * 1024 * 1024;
+            const PREALLOC_CAP: usize = 2 * 1024 * 1024;
+            if self.total_size > MAX_ARTICLE_BYTES {
+                return Err(CoreError::Yenc(
+                    "implausible article size (corrupt =ybegin header)".into(),
+                ));
+            }
             // Pre-size the output buffer to the declared size so the payload
             // decode has no reallocations (single-copy path).
             let cap = if self.total_size > 0 {
-                self.total_size as usize
+                (self.total_size as usize).min(PREALLOC_CAP)
             } else {
                 512 * 1024
             };
@@ -132,9 +145,19 @@ impl Decoder {
             self.begin = param(params, "begin")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(self.begin);
+            // Corrupt =ypart headers produce nonsense positional offsets;
+            // validate the range the moment both values are known (only
+            // when the article declared its size).
             self.end = param(params, "end")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(self.end);
+            if self.total_size > 0
+                && (self.end < self.begin || self.end.saturating_sub(self.begin) > self.total_size)
+            {
+                return Err(CoreError::Yenc(
+                    "implausible part range (corrupt =ypart header)".into(),
+                ));
+            }
             return Ok(());
         }
         if line.starts_with(b"=yend") {
@@ -224,6 +247,15 @@ pub fn decode_article(input: &[u8]) -> Result<DecodedPart> {
     let line_size: usize = param(ybegin_str, "line")
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
+    // Corrupt articles carry garbage sizes; reject the absurd ones as
+    // corruption instead of propagating nonsense downstream (offsets,
+    // pre-allocations).
+    const MAX_ARTICLE_BYTES: u64 = 128 * 1024 * 1024;
+    if total_size > MAX_ARTICLE_BYTES {
+        return Err(CoreError::Yenc(
+            "implausible article size (corrupt =ybegin header)".into(),
+        ));
+    }
 
     let (begin, end) = if let Some(p) = ypart_str {
         let b: u64 = param(p, "begin").and_then(|s| s.parse().ok()).unwrap_or(1);
@@ -471,6 +503,39 @@ fn parse_hex_u32(s: &str) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn absurd_ybegin_size_is_rejected_not_allocated() {
+        // One corrupt article in the wild carried size=58358840436 — the
+        // old code with_capacity'd it, the allocation failed, and Rust
+        // aborted the entire engine process mid-download (no panic hook,
+        // no logs — it looked like a mystery hang). Now: Yenc error.
+        let body = b"=ybegin line=128 size=58358840436 name=x\r\n=ypart begin=1 end=58358840436\r\n..\r\n=yend size=58358840436 crc32=deadbeef\r\n";
+        let err = decode_article(body).expect_err("must reject absurd size");
+        assert!(
+            err.to_string().contains("implausible article size"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn streaming_decoder_rejects_absurd_ybegin_size() {
+        let mut dec = Decoder::new();
+        let res = dec.push_line(b"=ybegin line=128 size=58358840436 name=x");
+        assert!(res.is_err(), "streaming decoder must reject absurd size");
+    }
+
+    #[test]
+    fn streaming_decoder_rejects_implausible_ypart_range() {
+        let mut dec = Decoder::new();
+        assert!(dec.push_line(b"=ybegin line=128 size=1000 name=x").is_ok());
+        // end wildly beyond the declared size:
+        assert!(
+            dec.push_line(b"=ypart begin=1 end=999999999999").is_err(),
+            "implausible part range must be rejected"
+        );
+    }
+
     use super::*;
 
     /// Build a yEnc article body with the given payload bytes.
