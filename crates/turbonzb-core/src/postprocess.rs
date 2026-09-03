@@ -469,7 +469,13 @@ fn rename_to_par2_names(dir: &Path, report: &VerifyReport) -> Result<()> {
             continue;
         }
         if src.exists() {
-            std::fs::rename(src, &dest).map_err(CoreError::from)?;
+            std::fs::rename(src, &dest).map_err(|e| {
+                CoreError::Other(anyhow::anyhow!(
+                    "renaming {} -> {}: {e}",
+                    src.display(),
+                    dest.display()
+                ))
+            })?;
             debug!(from = %src.display(), to = %dest.display(), "renamed to PAR2 name");
         }
     }
@@ -541,10 +547,36 @@ fn move_files(source_dir: &Path, dest_dir: &Path) -> Result<()> {
             continue;
         }
 
-        if dest.exists() {
-            std::fs::remove_file(&dest).map_err(CoreError::from)?;
+        // Self-move: when source_dir == dest_dir (in-place post-processing)
+        // dest IS path. The old remove-then-rename sequence deleted the
+        // file itself and then failed "No such file or directory" —
+        // destroying the downloaded payload. Guard on canonical identity:
+        // `path == dest` alone misses symlinks / trailing components.
+        if path == dest {
+            continue;
         }
-        std::fs::rename(&path, &dest).map_err(CoreError::from)?;
+        if path.exists() && dest.exists() {
+            let same = std::fs::canonicalize(&path).ok() == std::fs::canonicalize(&dest).ok();
+            if same {
+                continue;
+            }
+        }
+
+        if dest.exists() {
+            std::fs::remove_file(&dest).map_err(|e| {
+                CoreError::Other(anyhow::anyhow!(
+                    "removing existing dest {}: {e}",
+                    dest.display()
+                ))
+            })?;
+        }
+        std::fs::rename(&path, &dest).map_err(|e| {
+            CoreError::Other(anyhow::anyhow!(
+                "moving {} -> {}: {e}",
+                path.display(),
+                dest.display()
+            ))
+        })?;
         debug!(from = %path.display(), to = %dest.display(), "moved file");
     }
 
@@ -576,6 +608,31 @@ fn cleanup_temp_files(dir: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod self_move_tests {
+    use super::move_files;
+
+    #[test]
+    fn in_place_move_is_a_noop_and_preserves_files() {
+        // Regression: with source_dir == dest_dir (nzbkodi post-processes
+        // in place), remove-then-rename deleted the payload itself and
+        // failed "No such file or directory" — the 57 GB Ghost in the
+        // Shell mkv was destroyed this way.
+        let tmp = std::env::temp_dir().join("turbonzb-move-in-place-test");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let movie = tmp.join("movie.mkv");
+        std::fs::write(&movie, b"payload").unwrap();
+        std::fs::write(tmp.join("set.par2"), b"par2").unwrap();
+
+        move_files(&tmp, &tmp).expect("in-place move must succeed");
+
+        assert_eq!(std::fs::read(&movie).unwrap(), b"payload");
+        assert!(tmp.join("set.par2").exists());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }
 
 #[cfg(test)]
