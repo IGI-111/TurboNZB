@@ -323,6 +323,11 @@ fn is_archive_or_par2(name: &str) -> bool {
 
 /// Find all archive files (.rar, .7z, .7z.001) in a directory.
 ///
+/// Candidates are verified by *content*: zero-byte files are skipped and
+/// RAR/7z extensions without the matching magic bytes are ignored —
+/// download dirs can contain stale, cloaked, or misnamed leftovers from
+/// other jobs sharing the directory.
+///
 /// Multi-volume RAR sets are collapsed to their first volume, which the
 /// unrar library then follows by conventional volume naming:
 ///   - `foo.part01.rar` … `foo.partNN.rar` → only `foo.part01.rar`
@@ -344,7 +349,7 @@ fn find_archives(dir: &Path) -> Vec<PathBuf> {
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if !path.is_file() {
+            if !path.is_file() || entry.metadata().map(|m| m.len() == 0).unwrap_or(true) {
                 continue;
             }
             let name = path.to_string_lossy().to_lowercase();
@@ -356,20 +361,26 @@ fn find_archives(dir: &Path) -> Vec<PathBuf> {
 
             // Split 7z: only keep .7z.001, skip other parts
             if is_split_7z_first(&name) {
-                sevenz.push(path);
+                if crate::unpack::is_7z_data(&path) {
+                    sevenz.push(path);
+                }
                 continue;
             }
             if is_split_archive_part(&name) {
                 continue;
             }
             if name.ends_with(".7z") {
-                sevenz.push(path);
+                if crate::unpack::is_7z_data(&path) {
+                    sevenz.push(path);
+                }
                 continue;
             }
 
             // `.partNN.rar` multi-volume naming.
             if let Some((base, num)) = parse_part_rar(&name) {
-                part_volumes.push((base, num, path));
+                if crate::unpack::is_rar_data(&path) {
+                    part_volumes.push((base, num, path));
+                }
                 continue;
             }
             // `.rNN` continuation volumes.
@@ -378,8 +389,10 @@ fn find_archives(dir: &Path) -> Vec<PathBuf> {
                 continue;
             }
             if name.ends_with(".rar") {
-                let base = name.strip_suffix(".rar").unwrap_or(&name).to_string();
-                rar_mains.push((base, path));
+                if crate::unpack::is_rar_data(&path) {
+                    let base = name.strip_suffix(".rar").unwrap_or(&name).to_string();
+                    rar_mains.push((base, path));
+                }
             }
         }
     }
@@ -647,13 +660,21 @@ mod tests {
         std::env::temp_dir().join(format!("turbonzb-pp-test-{}-{n}", std::process::id()))
     }
 
+    fn write_rar(dir: &Path, name: &str) {
+        std::fs::write(dir.join(name), b"Rar!\x1a\x07\x00pad").unwrap();
+    }
+
+    fn write_7z(dir: &Path, name: &str) {
+        std::fs::write(dir.join(name), b"7z\xbc\xaf\x27\x1cpad").unwrap();
+    }
+
     #[test]
     fn find_archives_collapses_part_rar_sets() {
         // `.partNN.rar` multi-volume sets → only the first part is unpacked.
         let dir = tempfile_dir();
         std::fs::create_dir_all(&dir).unwrap();
         for n in 1..=5 {
-            std::fs::write(dir.join(format!("Show.1080p.part{n:02}.rar")), b"x").unwrap();
+            write_rar(&dir, &format!("Show.1080p.part{n:02}.rar"));
         }
         let archives = find_archives(&dir);
         assert_eq!(
@@ -668,8 +689,8 @@ mod tests {
     fn find_archives_keeps_independent_rars() {
         let dir = tempfile_dir();
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("Episode1.rar"), b"x").unwrap();
-        std::fs::write(dir.join("Episode2.rar"), b"x").unwrap();
+        write_rar(&dir, "Episode1.rar");
+        write_rar(&dir, "Episode2.rar");
         std::fs::write(dir.join("notes.txt"), b"x").unwrap();
         let archives = find_archives(&dir);
         // Sorted, both independent archives kept, non-archive ignored.
@@ -684,9 +705,9 @@ mod tests {
     fn find_archives_keeps_only_main_of_rn_set() {
         let dir = tempfile_dir();
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("Set.rar"), b"x").unwrap();
-        std::fs::write(dir.join("Set.r00"), b"x").unwrap();
-        std::fs::write(dir.join("Set.r01"), b"x").unwrap();
+        write_rar(&dir, "Set.rar");
+        write_rar(&dir, "Set.r00");
+        write_rar(&dir, "Set.r01");
         let archives = find_archives(&dir);
         assert_eq!(archives, vec![dir.join("Set.rar")]);
         std::fs::remove_dir_all(&dir).unwrap();
@@ -696,13 +717,35 @@ mod tests {
     fn find_archives_mixes_independent_and_part_set() {
         let dir = tempfile_dir();
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("Movie.part01.rar"), b"x").unwrap();
-        std::fs::write(dir.join("Movie.part02.rar"), b"x").unwrap();
-        std::fs::write(dir.join("sample.rar"), b"x").unwrap();
+        write_rar(&dir, "Movie.part01.rar");
+        write_rar(&dir, "Movie.part02.rar");
+        write_rar(&dir, "sample.rar");
         let archives = find_archives(&dir);
         assert_eq!(
             archives,
             vec![dir.join("Movie.part01.rar"), dir.join("sample.rar")]
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn find_archives_ignores_non_rar_and_empty_files() {
+        // Leftovers from dead jobs sharing the output dir (0-byte .rar
+        // stubs, cloaked payloads) must not be treated as archives.
+        let dir = tempfile_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("dead.part01.rar"), b"").unwrap();
+        std::fs::write(dir.join("dead.rar"), b"").unwrap();
+        std::fs::write(dir.join("cloaked.rar"), b"not an archive at all").unwrap();
+        std::fs::write(dir.join("fake.7z"), b"not a 7z payload").unwrap();
+        write_rar(&dir, "Movie.part01.rar");
+        write_rar(&dir, "Movie.part02.rar");
+        write_7z(&dir, "Extras.7z.001");
+        std::fs::write(dir.join("Extras.7z.002"), b"7z\xbc\xaf\x27\x1c").unwrap();
+        let archives = find_archives(&dir);
+        assert_eq!(
+            archives,
+            vec![dir.join("Extras.7z.001"), dir.join("Movie.part01.rar")]
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }

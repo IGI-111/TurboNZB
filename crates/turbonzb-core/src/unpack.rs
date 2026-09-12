@@ -92,6 +92,35 @@ pub fn unpack(
     }
 }
 
+/// RAR volume magic: `Rar!\x1A\x07\x00` (RAR4) or `Rar!\x1A\x07\x01\x00`
+/// (RAR5). Download dirs accumulate zero-byte or non-RAR files carrying
+/// `.rar` names (cloak obfuscation, leftovers from failed jobs) — an
+/// extension is not evidence; check the bytes before invoking unrar.
+pub fn is_rar_data(path: &Path) -> bool {
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut magic = [0u8; 8];
+    let n = std::io::Read::read(&mut file, &mut magic).unwrap_or(0);
+    (n >= 7 && magic[..7] == *b"Rar!\x1a\x07\x00")
+        || (n == 8 && magic[..8] == *b"Rar!\x1a\x07\x01\x00")
+}
+
+/// 7z magic: `37 7A BC AF 27 1C`. Same rationale as [`is_rar_data`].
+pub fn is_7z_data(path: &Path) -> bool {
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut magic = [0u8; 6];
+    let n = std::io::Read::read(&mut file, &mut magic).unwrap_or(0);
+    n == 6 && magic == *b"7z\xbc\xaf\x27\x1c"
+}
+
+/// Any recognized archive payload (RAR or 7z), by content.
+pub fn is_archive_data(path: &Path) -> bool {
+    is_rar_data(path) || is_7z_data(path)
+}
+
 /// True if a filename is a RAR volume part following the conventional
 /// `file.r00`, `file.r01`, … scheme.
 pub fn is_rar_part_name(name: &str) -> bool {
