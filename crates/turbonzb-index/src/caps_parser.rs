@@ -147,9 +147,19 @@ pub fn parse_caps(xml: &str) -> quick_xml::Result<IndexerCaps> {
                 }
                 in_subcats = false;
             }
+            // A self-closing category has no End event to flush it on.
+            if e.name().as_ref() == b"category" {
+                if let Some(cat) = current_category.take() {
+                    caps.categories.push(cat);
+                }
+            }
         }
 
         if matches!(event, Event::Eof) {
+            // Flush a category left open by an unterminated document.
+            if let Some(cat) = current_category.take() {
+                caps.categories.push(cat);
+            }
             break;
         }
         buf.clear();

@@ -26,16 +26,22 @@ normal `cargo test`:
 - §4.2 yEnc roundtrip+fuzz → `tests/yenc_property.rs` (`garbage_input_never_panics`, 500–2000 iterations)
 - §5.4 NZB fuzz → `tests/nzb_robustness.rs` (`large_and_deep_documents_parse`)
 
-### Remaining automated work (next tranche)
+### Automated coverage as of this tranche
 
-- §7.5 PAR2 golden interop with `par2cmdline` (external tool, not yet automated)
-- §8 ZIP support (not yet a format the app handles) and an explicit decompression-bomb size guard
-- §6 queue migration path (legacy DB upgrades)
-- §10 Newznab outbut/rate-limit/aggregation edge tests
-- §11 GUI backend command round-trips
-- §13 criterion benchmarks
-- §12.4 logging assertions (no secrets in logs), §12.6 upgrade test
-- CI YAML (3-OS matrix) for the gates now green in-repo
+| Plan | Where |
+|------|-------|
+| §7.5 PAR2 spec/interop golden | `crates/turbonzb-core/tests/par2_golden.rs` |
+| §6 legacy schema migration, reopen, slot exclusivity, interrupted-state recovery, bulk ordering | `crates/turbonzb-core/tests/queue_migration.rs` |
+| §8 split volumes, volume-name detection, format sniffing, ZIP policy, bomb ratio | `unpack_zip.rs`, `unpack_robustness.rs`, `rar_volumes.rs` |
+| §10 Newznab attrs/entities, caps-driven limits, pagination, 429 + `<error>`, malformed XML, aggregation | `crates/turbonzb-index/tests/newznab_edge_cases.rs` |
+| §11 backend command round-trips + queue-tab state reduce + settings fallback | `crates/turbonzb-gui/tests/backend_roundtrip.rs` |
+| §12.4 logging carries job id and reason, credentials stay out | `crates/turbonzb-core/tests/logging_hygiene.rs` |
+| §13.1 throughput guards (yEnc whole/streaming, PAR2 verify) | `crates/turbonzb-core/tests/bench_throughput.rs` |
+| §12.3/§12.5 CI gates on linux/windows/macos | `.github/workflows/ci.yml` |
+
+Still open: §12.6 upgrade test (needs two released binaries), §13.2 SABnzbd/NZBGet
+comparison and §11.2–§11.5, §11.7–§11.8 (all **[M]**/manual), and cargo-fuzz
+targets for the four parsers (§2.11, 4.2, 5.4, 7.6, 10.6).
 
 ---
 
