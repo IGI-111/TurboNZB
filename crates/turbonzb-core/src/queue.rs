@@ -183,8 +183,17 @@ impl QueueManager {
     }
 
     /// Open an in-memory database (for tests).
+    ///
+    /// `sqlite::memory:` is parsed into a uniquely named shared-cache
+    /// in-memory database: the connections of this pool share one database,
+    /// while other managers keep their own. A plain `:memory:` filename would
+    /// instead give every pooled connection its own empty database.
     pub async fn open_in_memory() -> Result<Self> {
-        let pool = SqlitePool::connect("sqlite::memory:")
+        let opts = SqliteConnectOptions::from_str("sqlite::memory:")
+            .map_err(|e| CoreError::Other(anyhow::anyhow!("sqlite options: {e}")))?;
+        let pool = SqlitePoolOptions::new()
+            .max_connections(4)
+            .connect_with(opts)
             .await
             .map_err(|e| CoreError::Other(anyhow::anyhow!("sqlite connect: {e}")))?;
         let mgr = Self { pool };
@@ -435,15 +444,9 @@ impl QueueManager {
             .or_else(|| nzb.files.first().map(|f| f.filename()))
             .unwrap_or_else(|| "turbonzb-download".into());
 
-        let conn = self
-            .pool
-            .acquire()
-            .await
-            .map_err(|e| CoreError::Other(anyhow::anyhow!("acquire conn: {e}")))?;
-
-        // Begin a transaction — inserting 2000+ segments one-by-one
-        // without a transaction is extremely slow (each INSERT is its
-        // own implicit transaction + fsync).
+        // Begin a transaction on a single pooled connection — inserting
+        // 2000+ segments one-by-one without a transaction is extremely slow
+        // (each INSERT is its own implicit transaction + fsync).
         let mut tx = self
             .pool
             .begin()
@@ -514,7 +517,6 @@ impl QueueManager {
         tx.commit()
             .await
             .map_err(|e| CoreError::Other(anyhow::anyhow!("commit tx: {e}")))?;
-        drop(conn);
 
         debug!(job_id, "job added to queue");
         Ok(job_id)
@@ -628,7 +630,9 @@ impl QueueManager {
     /// held by another job or the job is not in a claimable state (queued
     /// or paused). The partial unique index `idx_one_downloading`
     /// guarantees that at most one job can ever be in the 'downloading'
-    /// state — a concurrent claim is rejected by SQLite.
+    /// state — a concurrent claim is rejected by SQLite. A rejected claim is
+    /// a normal outcome (another job holds the slot), so it is reported as
+    /// `false` rather than as an error.
     pub async fn claim_download_slot(&self, job_id: i64) -> Result<bool> {
         let result = sqlx::query(
             r#"UPDATE jobs SET state = 'downloading'
@@ -636,9 +640,17 @@ impl QueueManager {
         )
         .bind(job_id)
         .execute(&self.pool)
-        .await
-        .map_err(|e| CoreError::Other(anyhow::anyhow!("claim download slot: {e}")))?;
-        Ok(result.rows_affected() > 0)
+        .await;
+
+        match result {
+            Ok(r) => Ok(r.rows_affected() > 0),
+            // The partial unique index rejects a claim while another job is
+            // downloading. That is the documented "slot busy" answer.
+            Err(e) if e.to_string().contains("UNIQUE constraint failed") => Ok(false),
+            Err(e) => Err(CoreError::Other(anyhow::anyhow!(
+                "claim download slot: {e}"
+            ))),
+        }
     }
 
     /// Release the download slot, setting the job to `new_state`. Only

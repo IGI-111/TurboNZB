@@ -388,11 +388,9 @@ fn find_archives(dir: &Path) -> Vec<PathBuf> {
                 rnn_parts.push((base, path));
                 continue;
             }
-            if name.ends_with(".rar") {
-                if crate::unpack::is_rar_data(&path) {
-                    let base = name.strip_suffix(".rar").unwrap_or(&name).to_string();
-                    rar_mains.push((base, path));
-                }
+            if name.ends_with(".rar") && crate::unpack::is_rar_data(&path) {
+                let base = name.strip_suffix(".rar").unwrap_or(&name).to_string();
+                rar_mains.push((base, path));
             }
         }
     }
